@@ -6,11 +6,13 @@ import pytest
 
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError
 
+_UNSET = object()
+
 
 class FakeGateway:
-    def __init__(self, ready: bool = True, result: dict[str, pd.DataFrame] | None = None):
+    def __init__(self, ready: bool = True, result: dict[str, pd.DataFrame] | None = _UNSET):
         self._ready = ready
-        self._result = result if result is not None else {}
+        self._result = result if result is not _UNSET else {}
         self._logged_in = ready
         self.login_called = 0
         self.logout_called = 0
