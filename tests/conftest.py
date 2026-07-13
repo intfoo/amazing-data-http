@@ -48,7 +48,6 @@ def make_daily_df(code: str = "000001.SZ", rows: int = 1) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "code": [code] * rows,
-            "trade_time": dates,
             "open": [10.2] * rows,
             "high": [10.45] * rows,
             "low": [10.1] * rows,
