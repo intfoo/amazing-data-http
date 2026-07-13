@@ -31,9 +31,9 @@
   - `tgw-1.0.8.7-py3-none-any.whl`
   - `AmazingData-1.1.7-cp314-none-any.whl`
 
-## 快速验证（无需 SDK 凭据）
+## 验证方式一：单元测试（无需 SDK、无需 Docker）
 
-本地无 Docker / 无凭据时，可先验证代码逻辑（单元测试，45 个用例）：
+验证所有业务逻辑（日期转换、序列化、展平、路由、错误处理），45 个用例全部使用 FakeGateway，不依赖真实 SDK：
 
 ```bash
 pip install fastapi uvicorn pandas numpy pytest httpx
@@ -42,9 +42,77 @@ python -m pytest -v
 
 预期输出：`45 passed`。
 
-## 完整链路验证（需要凭据 + Docker）
+## 验证方式二：本地真实 SDK（需要 Python 3.14 + 凭据，无需 Docker）
 
-### 第 1 步：配置凭据
+SDK wheel 标记为 `cp314`，必须用 CPython 3.14 运行。本地系统若没有 3.14，需先安装（[python.org](https://www.python.org/downloads/) 下载）。
+
+> 当前环境只有 Python 3.12 / 3.13，无法直接安装 SDK wheel。若不想安装 3.14，请跳到[验证方式三](#验证方式三docker-完整链路需要-docker--凭据)。
+
+### 第 1 步：安装 Python 3.14 + 依赖
+
+```bash
+# 确认 Python 3.14 可用
+py -3.14 --version
+# 预期: Python 3.14.x
+
+# 安装 SDK wheel + 服务依赖
+py -3.14 -m pip install ./tgw-1.0.8.7-py3-none-any.whl
+py -3.14 -m pip install ./AmazingData-1.1.7-cp314-none-any.whl
+py -3.14 -m pip install fastapi "uvicorn[standard]" pandas numpy
+```
+
+### 第 2 步：配置凭据环境变量
+
+PowerShell：
+
+```powershell
+$env:AMAZINGDATA_USERNAME = "你的账号"
+$env:AMAZINGDATA_PASSWORD = "你的密码"
+$env:AMAZINGDATA_IP = "服务器IP"
+$env:AMAZINGDATA_PORT = "服务器端口"
+```
+
+或创建 `.env` 文件后用 `Get-Content .env | ForEach-Object { ... }` 加载。
+
+### 第 3 步：SDK 探测（spec §5.2 门禁，首次必做）
+
+```bash
+py -3.14 scripts/probe_sdk.py > docs/probe-report.json
+```
+
+打开 `docs/probe-report.json`，确认 `login_ok: true`、`query_ok: true`、`df_columns` 等字段。详见[探测报告核对表](#探测报告核对表)。
+
+### 第 4 步：启动服务
+
+```bash
+py -3.14 -m uvicorn app.http_app:app --host 0.0.0.0 --port 3021
+```
+
+日志应显示：`gateway login succeeded on startup`
+
+### 第 5 步：验证接口
+
+```bash
+# 健康检查
+curl http://localhost:3021/health
+
+# 日 K 查询
+curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d "{\"symbols\":[\"000001.SZ\"],\"start_time\":\"2024-01-02\",\"end_time\":\"2024-01-31\"}"
+
+# 空结果（非交易日）
+curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d "{\"symbols\":[\"000001.SZ\"],\"start_time\":\"2024-02-10\",\"end_time\":\"2024-02-10\"}"
+
+# 错误场景：反向日期
+curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d "{\"symbols\":[\"000001.SZ\"],\"start_time\":\"2024-12-31\",\"end_time\":\"2024-01-01\"}"
+```
+
+### 第 6 步：主项目集成
+
+在主项目 YAML 中配置 `url: http://localhost:3021/daily`（本地）或 `http://amazingdata-http:3021/daily`（Docker 网络），执行试拉测试。详见[主项目集成配置](#主项目集成配置)。
+
+## 验证方式三：Docker 完整链路（需要 Docker + 凭据）
+
+### Docker 第 1 步：配置凭据
 
 创建 `.env` 文件（**不要提交到 git**）：
 
@@ -62,7 +130,7 @@ HTTP_HOST=0.0.0.0
 HTTP_PORT=3021
 ```
 
-### 第 2 步：构建 Docker 镜像
+### Docker 第 2 步：构建镜像
 
 ```bash
 docker build --platform linux/amd64 -t amazingdata-http:probe .
@@ -70,7 +138,7 @@ docker build --platform linux/amd64 -t amazingdata-http:probe .
 
 **如果构建失败**：`numba`/`scipy` 可能没有 Python 3.14 的 wheel。这是 spec §5.1 的已知风险，需要补充兼容 wheel 或退回兼容 SDK 版本。
 
-### 第 3 步：SDK 探测（spec §5.2 强制门禁）
+### Docker 第 3 步：SDK 探测（spec §5.2 强制门禁）
 
 在正式启动服务前，先运行探测脚本，确认 SDK API 与代码假设一致：
 
@@ -78,7 +146,9 @@ docker build --platform linux/amd64 -t amazingdata-http:probe .
 docker run --rm --env-file .env --platform linux/amd64 amazingdata-http:probe python scripts/probe_sdk.py > docs/probe-report.json
 ```
 
-打开 `docs/probe-report.json`，确认以下关键字段：
+### 探测报告核对表
+
+打开 `docs/probe-report.json`，确认以下关键字段（本地和 Docker 方式通用）：
 
 | 字段 | 预期值 | 若不一致 |
 |------|--------|----------|
@@ -89,7 +159,7 @@ docker run --rm --env-file .env --platform linux/amd64 amazingdata-http:probe py
 | `df_index_name` | 索引名（如 `trade_time`） | 影响 `serialize_dataframe` 的索引重置行为 |
 | `period_values.day` | 整数值 | 确认 `Period.day.value` 可正常获取 |
 
-### 第 4 步：启动服务
+### Docker 第 4 步：启动服务
 
 ```bash
 docker compose up -d
@@ -103,7 +173,7 @@ docker compose logs amazingdata-http | Select-String "login"
 
 预期看到：`gateway login succeeded on startup`
 
-### 第 5 步：验证健康检查
+### Docker 第 5 步：验证健康检查
 
 ```bash
 curl http://localhost:3021/health
@@ -117,7 +187,7 @@ HTTP 状态码 `200`。
 
 **若返回 503**：检查 `.env` 凭据是否正确、SDK 是否能连接服务器。响应不含密码，可安全查看。
 
-### 第 6 步：验证日 K 查询
+### Docker 第 6 步：验证日 K 查询
 
 ```bash
 curl -X POST http://localhost:3021/daily ^
@@ -155,7 +225,7 @@ curl -X POST http://localhost:3021/daily ^
 
 预期：HTTP `200`，`{"data": []}`（空结果不是错误）。
 
-### 第 7 步：验证错误场景
+### Docker 第 7 步：验证错误场景
 
 **反向日期**（start > end）：
 ```bash
@@ -183,7 +253,7 @@ curl -X POST http://localhost:3021/daily ^
 
 每个错误响应都包含 `request_id`，可在 `docker compose logs` 中搜索该 ID 定位完整上下文。
 
-### 第 8 步：主项目集成验证
+### 主项目集成配置
 
 在主项目的自定义数据源 YAML 中配置：
 
