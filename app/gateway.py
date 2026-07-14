@@ -110,7 +110,7 @@ class AmazingDataGateway:
             ad.login(
                 username=self._config.username,
                 password=self._config.password,
-                ip=self._config.ip,
+                host=self._config.ip,
                 port=self._config.port,
             )
             base = ad.BaseData()
@@ -133,7 +133,7 @@ class AmazingDataGateway:
         if self._ad is None:
             return
         try:
-            self._ad.logout()
+            self._ad.logout(username=self._config.username)
         except Exception as e:
             logger.warning("logout error (ignored): %s: %s", type(e).__name__, e)
         self._ready = False
@@ -161,7 +161,7 @@ class AmazingDataGateway:
         if sdk_period_name is None:
             raise GatewayQueryError(f"unsupported period: {period}")
         try:
-            from AmazingData.constant import Period
+            from AmazingData.utils.constant import Period
             sdk_period_value = getattr(Period, sdk_period_name).value
         except Exception as e:
             raise GatewayQueryError(f"period mapping failed: {e}") from e

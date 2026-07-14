@@ -21,15 +21,16 @@
   tgw 原生数据服务
 ```
 
-**职责边界**：适配服务保留 SDK 原始字段名（`code`、`trade_time`、`open`…），不重命名、不换算单位、不复权。字段映射由主项目 YAML 的 `field_map` 完成。
+**职责边界**：适配服务保留 SDK 原始字段名（`code`、`kline_time`、`open`…），不重命名、不换算单位、不复权。字段映射由主项目 YAML 的 `field_map` 完成。
 
 ## 前置条件
 
 - Docker（支持 `linux/amd64` 平台）
 - AmazingData 账号凭据（用户名、密码、服务器 IP、端口）
-- 两个本地 wheel 文件（已包含在项目根目录）：
-  - `tgw-1.0.8.7-py3-none-any.whl`
-  - `AmazingData-1.1.7-cp314-none-any.whl`
+- 本地 wheel 文件（已包含在项目根目录，按 Python 版本选用）：
+  - `tgw-1.0.8.7-py3-none-any.whl`（tgw 原生库，纯 Python，3.13/3.14 通用）
+  - `AmazingData-1.1.7-cp313-none-any.whl`（Python 3.13 用）
+  - `AmazingData-1.1.7-cp314-none-any.whl`（Python 3.14 用）
 
 ## 验证方式一：单元测试（无需 SDK、无需 Docker）
 
@@ -42,23 +43,24 @@ python -m pytest -v
 
 预期输出：`45 passed`。
 
-## 验证方式二：本地真实 SDK（需要 Python 3.14 + 凭据，无需 Docker）
+## 验证方式二：本地真实 SDK（需要 Python 3.13 或 3.14 + 凭据，无需 Docker）
 
-SDK wheel 标记为 `cp314`，必须用 CPython 3.14 运行。本地系统若没有 3.14，需先安装（[python.org](https://www.python.org/downloads/) 下载）。
+SDK 的 AmazingData wheel 按解释器版本分 `cp313` 与 `cp314` 两个标记，必须安装与本机 CPython 主版本一致的那个，否则安装失败。本机若两者都没有，先装 3.13 或 3.14（[python.org](https://www.python.org/downloads/) 下载）。
 
-> 当前环境只有 Python 3.12 / 3.13，无法直接安装 SDK wheel。若不想安装 3.14，请跳到[验证方式三](#验证方式三docker-完整链路需要-docker--凭据)。
+> 若不想本地装 SDK，可跳到[验证方式三](#验证方式三docker-完整链路需要-docker--凭据)用 Docker 跑完整链路。
 
-### 第 1 步：安装 Python 3.14 + 依赖
+### 第 1 步：安装 SDK wheel + 依赖
+
+以 Python 3.13 为例；用 3.14 则把命令里的 `3.13` 换成 `3.14`、wheel 换成 `cp314` 那个。
 
 ```bash
-# 确认 Python 3.14 可用
-py -3.14 --version
-# 预期: Python 3.14.x
+# 确认可用版本（3.13 或 3.14 二选一）
+py -3.13 --version
 
-# 安装 SDK wheel + 服务依赖
-py -3.14 -m pip install ./tgw-1.0.8.7-py3-none-any.whl
-py -3.14 -m pip install ./AmazingData-1.1.7-cp314-none-any.whl
-py -3.14 -m pip install fastapi "uvicorn[standard]" pandas numpy
+# 安装 SDK wheel（wheel 的 cp 标记须与上面版本一致）+ 服务依赖
+py -3.13 -m pip install ./tgw-1.0.8.7-py3-none-any.whl
+py -3.13 -m pip install ./AmazingData-1.1.7-cp313-none-any.whl
+py -3.13 -m pip install fastapi "uvicorn[standard]" pandas numpy
 ```
 
 ### 第 2 步：配置凭据环境变量
@@ -66,10 +68,10 @@ py -3.14 -m pip install fastapi "uvicorn[standard]" pandas numpy
 PowerShell：
 
 ```powershell
-$env:AMAZINGDATA_USERNAME = "你的账号"
+$env:AMAZINGDATA_USERNAME = "45800038126"
 $env:AMAZINGDATA_PASSWORD = "你的密码"
-$env:AMAZINGDATA_IP = "服务器IP"
-$env:AMAZINGDATA_PORT = "服务器端口"
+$env:AMAZINGDATA_IP = "101.230.159.234"
+$env:AMAZINGDATA_PORT = "8600"
 ```
 
 或创建 `.env` 文件后用 `Get-Content .env | ForEach-Object { ... }` 加载。
@@ -77,7 +79,7 @@ $env:AMAZINGDATA_PORT = "服务器端口"
 ### 第 3 步：SDK 探测（spec §5.2 门禁，首次必做）
 
 ```bash
-py -3.14 scripts/probe_sdk.py > docs/probe-report.json
+py -3.13 scripts/probe_sdk.py > docs/probe-report.json
 ```
 
 打开 `docs/probe-report.json`，确认 `login_ok: true`、`query_ok: true`、`df_columns` 等字段。详见[探测报告核对表](#探测报告核对表)。
@@ -85,7 +87,7 @@ py -3.14 scripts/probe_sdk.py > docs/probe-report.json
 ### 第 4 步：启动服务
 
 ```bash
-py -3.14 -m uvicorn app.http_app:app --host 0.0.0.0 --port 3021
+py -3.13 -m uvicorn app.http_app:app --host 0.0.0.0 --port 3021
 ```
 
 日志应显示：`gateway login succeeded on startup`
@@ -122,10 +124,10 @@ cp .env.example .env
 ```
 
 ```text
-AMAZINGDATA_USERNAME=你的账号
+AMAZINGDATA_USERNAME=45800038126
 AMAZINGDATA_PASSWORD=你的密码
-AMAZINGDATA_IP=服务器IP
-AMAZINGDATA_PORT=服务器端口
+AMAZINGDATA_IP=101.230.159.234
+AMAZINGDATA_PORT=8600
 HTTP_HOST=0.0.0.0
 HTTP_PORT=3021
 ```
@@ -153,10 +155,10 @@ docker run --rm --env-file .env --platform linux/amd64 amazingdata-http:probe py
 | 字段 | 预期值 | 若不一致 |
 |------|--------|----------|
 | `login_ok` | `true` | 检查凭据和网络 |
-| `login_params.port` | 参数名 `port` | 若为 `host`，修改 `app/gateway.py` 的 `ad.login(...)` 调用 |
+| `login_params.host` / `login_params.port` | 参数名 `host`、`port`（非 `ip`） | 若为 `ip`，修改 `app/gateway.py` 与 `scripts/probe_sdk.py` 的 `ad.login(...)` 调用 |
 | `query_ok` | `true` | 检查 SDK 查询参数 |
-| `df_columns` | 含 `code, trade_time, open, high, low, close, volume, amount` | 调整主项目 `field_map` |
-| `df_index_name` | 索引名（如 `trade_time`） | 影响 `serialize_dataframe` 的索引重置行为 |
+| `df_columns` | 含 `code, kline_time, open, high, low, close, volume, amount` | 调整主项目 `field_map` |
+| `df_index_name` | `None`（无命名索引，RangeIndex） | 若有命名索引，`serialize_dataframe` 会 reset_index 将其变为列 |
 | `period_values.day` | 整数值 | 确认 `Period.day.value` 可正常获取 |
 
 ### Docker 第 4 步：启动服务
@@ -201,7 +203,7 @@ curl -X POST http://localhost:3021/daily ^
   "data": [
     {
       "code": "000001.SZ",
-      "trade_time": "2024-01-02T00:00:00",
+      "kline_time": "2024-01-02T00:00:00",
       "open": 10.2,
       "high": 10.45,
       "low": 10.1,
@@ -269,7 +271,7 @@ rpm: 200                     # 每分钟最多 200 次请求
 # 字段映射：upstream_field → internal_field
 field_map:
   code: symbol               # SDK 的 code → 主项目的 symbol
-  trade_time: date           # SDK 的 trade_time → 主项目的 date
+  kline_time: date           # SDK 的 kline_time → 主项目的 date
   open: open
   high: high
   low: low
@@ -286,7 +288,7 @@ transforms:
 
 在主项目中执行"试拉测试"，确认：
 1. 能解析 `response_path: data` 指向的数组
-2. 字段映射正确（`code→symbol`、`trade_time→date`…）
+2. 字段映射正确（`code→symbol`、`kline_time→date`…）
 3. 日期列能被 `parse_date` 正确解析
 4. 数据行数 > 0（在交易日区间内）
 
@@ -313,7 +315,7 @@ transforms:
 
 **成功响应**（HTTP 200）：
 ```json
-{"data": [{"code": "000001.SZ", "trade_time": "...", "open": ..., ...}]}
+{"data": [{"code": "000001.SZ", "kline_time": "...", "open": ..., ...}]}
 ```
 
 **空结果**（HTTP 200）：`{"data": []}`

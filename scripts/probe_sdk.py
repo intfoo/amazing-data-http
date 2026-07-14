@@ -37,7 +37,7 @@ def probe():
 
     # 2. Period 枚举
     try:
-        from AmazingData.constant import Period
+        from AmazingData.utils.constant import Period
         period_names = ["day", "min1", "min3", "min5", "min10", "min15",
                         "min30", "min60", "min120", "week", "month", "season", "year"]
         report["period_values"] = {
@@ -60,7 +60,7 @@ def probe():
         return
 
     try:
-        ad.login(username=username, password=password, ip=ip, port=port)
+        ad.login(username=username, password=password, host=ip, port=port)
         report["login_ok"] = True
     except Exception as e:
         report["login_ok"] = False
@@ -150,7 +150,8 @@ def probe():
 
 def _safe_logout(ad, report):
     try:
-        ad.logout()
+        username = os.environ.get("AMAZINGDATA_USERNAME", "")
+        ad.logout(username=username)
         report["logout_ok"] = True
     except Exception as e:
         report["logout_ok"] = False
