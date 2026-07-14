@@ -17,6 +17,10 @@ class FakeGateway:
         self.login_called = 0
         self.logout_called = 0
         self.query_calls: list[dict] = []
+        self._code_list = ["000001.SZ", "600000.SH"]
+        self.sub_start_called = 0
+        self.sub_stop_called = 0
+        self._sub_code_list = None
 
     def login(self) -> None:
         self.login_called += 1
@@ -43,6 +47,16 @@ class FakeGateway:
         if self._result is None:
             raise GatewayQueryError("fake query failed")
         return self._result
+
+    def get_code_list(self, security_type: str = "EXTRA_STOCK_A"):
+        return list(self._code_list)
+
+    def start_snapshot_subscription(self, code_list, on_data, on_error=None):
+        self.sub_start_called += 1
+        self._sub_code_list = code_list
+
+    def stop_subscription(self):
+        self.sub_stop_called += 1
 
 
 def make_daily_df(code: str = "000001.SZ", rows: int = 1) -> pd.DataFrame:

@@ -53,6 +53,11 @@ class Gateway(Protocol):
         end_date: int | None,
         period: str,
     ) -> dict[str, pd.DataFrame]: ...
+    def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]: ...
+    def start_snapshot_subscription(
+        self, code_list: list[str], on_data, on_error=None
+    ) -> None: ...
+    def stop_subscription(self) -> None: ...
 
 
 class GatewayError(Exception):
@@ -84,6 +89,9 @@ class AmazingDataGateway:
         self._ad = None           # AmazingData 模块引用
         self._market_data = None  # ad.MarketData 实例（含交易日历）
         self._ready = False       # 是否已登录且 MarketData 就绪
+        self._base_data = None      # ad.BaseData 实例（供 get_code_list）
+        self._subscribe_data = None  # ad.SubscribeData 实例
+        self._sub_thread = None      # 订阅 daemon 线程
 
     def login(self) -> None:
         """线程安全的登录入口。"""
@@ -120,6 +128,7 @@ class AmazingDataGateway:
             )
             sdk_logged_in = True
             base = ad.BaseData()
+            self._base_data = base
             calendar = base.get_calendar()
             self._market_data = ad.MarketData(calendar)
             self._ready = True
@@ -147,10 +156,21 @@ class AmazingDataGateway:
             logger.warning("logout error (ignored): %s: %s", type(e).__name__, e)
         self._ready = False
         self._market_data = None
+        self._base_data = None
 
     def is_ready(self) -> bool:
         """SDK 是否已登录且 MarketData 已初始化。"""
         return self._ready
+
+    def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]:
+        """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。"""
+        if not self._ready or self._base_data is None:
+            raise GatewayNotReadyError("gateway not ready")
+        try:
+            return self._base_data.get_code_list(security_type=security_type)
+        except Exception as e:
+            logger.error("get_code_list failed: %s: %s", type(e).__name__, e)
+            raise GatewayQueryError(f"get_code_list failed: {e}") from e
 
     def query_kline(
         self,
@@ -198,3 +218,59 @@ class AmazingDataGateway:
                     period,
                 )
                 raise GatewayQueryError(f"query failed: {e}") from e
+
+    def start_snapshot_subscription(
+        self, code_list: list[str], on_data, on_error=None
+    ) -> None:
+        """启动 level-1 快照订阅。在独立 daemon 线程跑 SubscribeData.run()。
+
+        code_list: 订阅的证券代码列表（全市场，启动时固定）。
+        on_data: 快照回调，签名 on_data(snapshot_obj)，由调用方处理缓存写入。
+        on_error: 订阅线程异常退出时的回调，签名 on_error(exc)，用于通知调用方降级。
+        Period 用 from AmazingData.utils.constant import Period（与 query_kline 一致）。
+        """
+        if not self._ready or self._ad is None:
+            raise GatewayNotReadyError("gateway not ready for subscription")
+        try:
+            from AmazingData.utils.constant import Period
+            sdk_period_value = Period.snapshot.value
+        except Exception as e:
+            raise GatewayQueryError(f"snapshot period mapping failed: {e}") from e
+
+        sub = self._ad.SubscribeData()
+
+        @sub.register(code_list=code_list, period=sdk_period_value)
+        def _on_snapshot(data, period):
+            try:
+                on_data(data)
+            except Exception as e:
+                logger.warning("snapshot callback error: %s: %s", type(e).__name__, e)
+
+        self._subscribe_data = sub
+
+        def _run():
+            try:
+                sub.run()
+            except Exception as e:
+                logger.error("subscription thread crashed: %s: %s", type(e).__name__, e)
+                if on_error:
+                    try:
+                        on_error(e)
+                    except Exception:
+                        pass
+
+        self._sub_thread = threading.Thread(target=_run, daemon=True, name="snapshot-sub")
+        self._sub_thread.start()
+        logger.info("snapshot subscription started: %d symbols", len(code_list))
+
+    def stop_subscription(self) -> None:
+        """停止订阅。SDK 若有 stop() 则调用，daemon 线程随进程退出。清理引用。"""
+        if self._subscribe_data is not None:
+            try:
+                stop = getattr(self._subscribe_data, "stop", None)
+                if stop:
+                    stop()
+            except Exception as e:
+                logger.warning("stop subscription error (ignored): %s: %s", type(e).__name__, e)
+        self._subscribe_data = None
+        self._sub_thread = None
