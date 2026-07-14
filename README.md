@@ -44,7 +44,7 @@ pip install fastapi uvicorn pandas numpy pytest httpx
 python -m pytest -v
 ```
 
-预期输出：`102 passed`。
+预期输出：`106 passed`。
 
 ## 验证方式二：本地真实 SDK（需要 Python 3.13 或 3.14 + 凭据，无需 Docker）
 
@@ -155,7 +155,7 @@ app/
 └── http_app.py      # FastAPI 应用（/daily + /minute + /realtime + /health 路由）
 scripts/
 └── probe_sdk.py     # SDK 探测脚本（spec §5.2 门禁）
-tests/               # 单元测试（102 个）
+tests/               # 单元测试（106 个）
 Dockerfile           # python:3.14 + SDK wheel
 docker-compose.yml   # 部署编排
 ```
