@@ -84,13 +84,15 @@
 
 ## GET /realtime
 
-返回实时行情快照。数据来自后台 SDK 订阅的内存缓存（每个 code 保留最新一笔快照，覆盖语义）。
+返回实时行情快照。**优先读订阅缓存**（盘中 SDK 实时推送，每个 code 保留最新一笔），**缓存空时 fallback 查当日历史快照**（`query_snapshot` 取收盘快照，覆盖非交易时段）。
+
+> 订阅推送只在交易时段生效；非交易时段缓存为空，自动 fallback 到 `query_snapshot` 查当日快照（取每只股票最后一行）。fallback 结果带 60 秒 TTL 缓存。
 
 **查询参数**：
 
 | 参数 | 类型 | 约束 |
 |------|------|------|
-| `symbols` | string | 可选。逗号分隔的代码列表，如 `?symbols=000001.SZ,600000.SH`。不传返回全市场快照；传入则从全市场缓存中过滤返回指定代码的快照。不触发额外订阅 |
+| `symbols` | string | 可选。逗号分隔的代码列表，如 `?symbols=000001.SZ,600000.SH`。不传返回全市场快照；传入则过滤返回指定代码。不触发额外订阅 |
 
 **示例**：
 ```
@@ -130,10 +132,10 @@ GET /realtime?symbols=000001.SZ,600000.SH   # 多个代码
 
 > `NaN`/缺失值序列化为 `null`。SDK `Snapshot` 不含 `name`（证券简称）、`change_pct`、`change_amount`、`amplitude`、`turnover_rate` 等衍生字段，由主项目 pipeline 回算。
 
-**缓存状态**：
-- 订阅运行中且已收到数据：返回最新快照列表（非交易时段返回最后一笔快照，可能略过时）
-- 订阅刚启动未收到数据：返回 `200 {"data": []}`（空缓存）
-- 订阅未启动/已崩溃：HTTP 503
+**数据来源**：
+- 交易时段：订阅缓存（SDK 实时推送的最新快照）
+- 非交易时段/订阅未推送：fallback `query_snapshot` 查当日历史快照（取每只股票最后一行 = 收盘快照），结果带 60 秒 TTL 缓存
+- SDK 未就绪（未登录）：HTTP 503 `SDK_NOT_READY`
 
 ## GET /health
 
@@ -177,4 +179,4 @@ GET /realtime?symbols=000001.SZ,600000.SH   # 多个代码
 | `SDK_QUERY_FAILED` | 502 | 上游 SDK 查询失败 |
 | `SERIALIZATION_FAILED` | 502 | 返回值无法安全序列化 |
 | `INTERNAL_ERROR` | 500 | 未分类的内部错误 |
-| `REALTIME_SUBSCRIPTION_FAILED` | 503 | 实时订阅未启动或已崩溃；`/daily`、`/minute` 不受影响 |
+| `REALTIME_SUBSCRIPTION_FAILED` | 503 | （保留）实时订阅降级标记；`/realtime` 当前改用 fallback 查询 + `SDK_NOT_READY`，不再返回此码 |

@@ -11,10 +11,14 @@
 import dataclasses
 import logging
 import threading
+import time
 
-from app.serializer import serialize_value
+from app.gateway import GatewayNotReadyError
+from app.serializer import serialize_dataframe, serialize_value
 
 logger = logging.getLogger("amazingdata.realtime")
+
+FALLBACK_TTL = 60  # 秒，fallback query_snapshot 缓存有效期（全市场查询较慢，避免每次请求都查）
 
 
 class RealtimeService:
@@ -23,6 +27,8 @@ class RealtimeService:
         self._cache: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._active = False
+        self._fallback_cache: list[dict] | None = None  # query_snapshot fallback 缓存
+        self._fallback_time: float = 0
 
     def on_snapshot(self, data) -> None:
         """订阅回调：Snapshot → dict → 缓存覆盖。异常吞掉，不影响订阅线程。"""
@@ -58,6 +64,44 @@ class RealtimeService:
 
     def set_active(self, active: bool) -> None:
         self._active = active
+
+    def fallback_snapshot(self, symbols: list[str] | None = None) -> list[dict]:
+        """订阅缓存为空时的 fallback：用 query_snapshot 查当日历史快照。
+
+        取每只股票的最后一行（最新/收盘快照）序列化返回。
+        结果带 FALLBACK_TTL 秒缓存，避免每次请求都查 SDK（全市场查询较慢）。
+        symbols 过滤在缓存结果上应用。查询失败返回空列表（不抛异常，让 /realtime 返回空）。
+        """
+        now = time.time()
+        if self._fallback_cache is None or now - self._fallback_time > FALLBACK_TTL:
+            try:
+                code_list = symbols if symbols else self._gw.get_code_list()
+            except GatewayNotReadyError:
+                raise  # SDK 未就绪，传播给路由转 503
+            except Exception as e:
+                logger.warning("fallback get_code_list failed: %s: %s", type(e).__name__, e)
+                return []
+            try:
+                result = self._gw.query_snapshot(code_list)
+            except GatewayNotReadyError:
+                raise
+            except Exception as e:
+                logger.warning("fallback query_snapshot failed: %s: %s", type(e).__name__, e)
+                return []
+            records: list[dict] = []
+            for code, df in result.items():
+                if df is None or df.empty:
+                    continue
+                # 取最后一行（最新快照），用 serialize_dataframe 序列化
+                records.extend(serialize_dataframe(df.tail(1)))
+            self._fallback_cache = records
+            self._fallback_time = now
+            logger.info("fallback query_snapshot: %d records cached", len(records))
+        # 在缓存上按 symbols 过滤
+        if symbols:
+            wanted = set(symbols)
+            return [r for r in self._fallback_cache if r.get("code") in wanted]
+        return list(self._fallback_cache)
 
     @staticmethod
     def _snapshot_to_dict(data) -> dict:

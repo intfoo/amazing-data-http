@@ -218,13 +218,22 @@ def test_minute_empty_symbols():
     assert resp.status_code == 422
 
 
-def test_realtime_not_active_returns_503():
-    """订阅未激活时 /realtime 返回 503。"""
-    gw = FakeGateway(ready=True)
+def test_realtime_sdk_not_ready_returns_503():
+    """SDK 未就绪时 /realtime fallback 也失败，返回 503 SDK_NOT_READY。"""
+    gw = FakeGateway(ready=False)
     client = make_test_app(gateway=gw)
     resp = client.get("/realtime")
     assert resp.status_code == 503
-    assert resp.json()["error"]["code"] == "REALTIME_SUBSCRIPTION_FAILED"
+    assert resp.json()["error"]["code"] == "SDK_NOT_READY"
+
+
+def test_realtime_fallback_empty_when_cache_empty():
+    """缓存空 + fallback 也无数据时返回 200 {"data": []}（非 503）。"""
+    gw = FakeGateway(ready=True)
+    client = make_test_app(gateway=gw)
+    resp = client.get("/realtime")
+    assert resp.status_code == 200
+    assert resp.json() == {"data": []}
 
 
 def test_realtime_active_returns_data():
@@ -332,9 +341,9 @@ def test_realtime_startup_activates_subscription():
 
 
 def test_realtime_not_active_after_startup_failure():
-    """若 startup 中订阅启动抛异常（FakeGateway 模拟），is_active 应保持 False，/realtime 返回 503。"""
+    """startup 中订阅启动抛异常时 is_active=False，但 SDK 就绪，/realtime fallback 返回空（200）。"""
     gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
-    # 让 get_code_list 抛异常模拟订阅启动失败
+    # 让 get_code_list 抛异常模拟订阅启动失败（fallback 也会失败）
     def _boom(security_type="EXTRA_STOCK_A"):
         raise RuntimeError("simulated failure")
     gw.get_code_list = _boom
@@ -343,6 +352,7 @@ def test_realtime_not_active_after_startup_failure():
     with TestClient(app) as client:
         # startup 中 get_code_list 抛异常被 try/except 捕获，is_active 保持 False
         assert app.state.realtime_service.is_active() is False
+        # /realtime fallback：get_code_list 抛 RuntimeError（非 GatewayNotReadyError）→ 返回空
         resp = client.get("/realtime")
-        assert resp.status_code == 503
-        assert resp.json()["error"]["code"] == "REALTIME_SUBSCRIPTION_FAILED"
+        assert resp.status_code == 200
+        assert resp.json() == {"data": []}

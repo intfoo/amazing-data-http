@@ -246,16 +246,24 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
 
     @app.get("/realtime")
     async def realtime(request: Request, symbols: str | None = None):
-        """实时行情快照。可选 symbols 过滤，不传返回全市场。订阅未就绪返回 503。
+        """实时行情快照。优先读订阅缓存（盘中实时），缓存空时 fallback 查当日历史快照。
 
         symbols 为逗号分隔的代码字符串（如 ?symbols=000001.SZ,600000.SH），
         从全市场缓存中过滤返回；不传则返回全市场。
         """
         logger.info("request_id=%s /realtime symbols=%s", get_request_id(request), symbols or "(all)")
-        if not realtime_service.is_active():
-            raise AppError(REALTIME_SUBSCRIPTION_FAILED, "realtime subscription not active", 503)
         sym_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else None
+        # 优先读订阅缓存（盘中实时推送的数据）
         data = realtime_service.snapshot(sym_list)
+        if not data:
+            # 缓存空（非交易时段/订阅未推送），fallback 查当日历史快照
+            try:
+                data = realtime_service.fallback_snapshot(sym_list)
+            except GatewayNotReadyError as e:
+                raise AppError(SDK_NOT_READY, str(e), 503)
+            except Exception as e:
+                logger.warning("realtime fallback failed: %s: %s", type(e).__name__, e)
+                data = []
         return {"data": data}
 
     @app.exception_handler(AppError)

@@ -54,6 +54,9 @@ class Gateway(Protocol):
         period: str,
     ) -> dict[str, pd.DataFrame]: ...
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]: ...
+    def query_snapshot(
+        self, symbols: list[str], trade_date: int | None = None
+    ) -> dict[str, pd.DataFrame]: ...
     def start_snapshot_subscription(
         self, code_list: list[str], on_data, on_error=None
     ) -> None: ...
@@ -90,6 +93,7 @@ class AmazingDataGateway:
         self._market_data = None  # ad.MarketData 实例（含交易日历）
         self._ready = False       # 是否已登录且 MarketData 就绪
         self._base_data = None      # ad.BaseData 实例（供 get_code_list）
+        self._calendar = None       # 交易日历 list[int]（供 query_snapshot 默认日期）
         self._subscribe_data = None  # ad.SubscribeData 实例
         self._sub_thread = None      # 订阅 daemon 线程
 
@@ -130,6 +134,7 @@ class AmazingDataGateway:
             base = ad.BaseData()
             self._base_data = base
             calendar = base.get_calendar()
+            self._calendar = calendar
             self._market_data = ad.MarketData(calendar)
             self._ready = True
             logger.info("AmazingData gateway login successful")
@@ -157,6 +162,7 @@ class AmazingDataGateway:
         self._ready = False
         self._market_data = None
         self._base_data = None
+        self._calendar = None
 
     def is_ready(self) -> bool:
         """SDK 是否已登录且 MarketData 已初始化。"""
@@ -171,6 +177,44 @@ class AmazingDataGateway:
         except Exception as e:
             logger.error("get_code_list failed: %s: %s", type(e).__name__, e)
             raise GatewayQueryError(f"get_code_list failed: {e}") from e
+
+    def query_snapshot(
+        self,
+        symbols: list[str],
+        trade_date: int | None = None,
+    ) -> dict[str, "pd.DataFrame"]:
+        """查询历史快照。返回 {code: DataFrame}（每只股票当日全部快照行，按时间排列）。
+
+        trade_date 为 None 时用交易日历最后一天（最新交易日）。
+        SDK 返回嵌套 dict {date: {code: DataFrame}}，此处展平取内层 {code: DataFrame}。
+        用于 /realtime 订阅缓存为空（非交易时段）时的 fallback。
+        """
+        if not self._ready or self._market_data is None:
+            raise GatewayNotReadyError("gateway not ready")
+        if trade_date is None:
+            if not self._calendar:
+                raise GatewayNotReadyError("calendar not available")
+            trade_date = self._calendar[-1]
+        with self._lock:
+            try:
+                result = self._market_data.query_snapshot(
+                    symbols, begin_date=trade_date, end_date=trade_date
+                )
+            except Exception as e:
+                logger.error("query_snapshot failed: %s: %s (symbols=%d, date=%s)",
+                             type(e).__name__, e, len(symbols), trade_date)
+                raise GatewayQueryError(f"query_snapshot failed: {e}") from e
+        # 展平嵌套 {date: {code: DataFrame}} → {code: DataFrame}
+        flat: dict[str, pd.DataFrame] = {}
+        if isinstance(result, dict):
+            for _date, inner in result.items():
+                if isinstance(inner, dict):
+                    for code, df in inner.items():
+                        if df is not None and not df.empty:
+                            flat[code] = df
+                elif inner is not None and hasattr(inner, "empty") and not inner.empty:
+                    flat["_all"] = inner
+        return flat
 
     def query_kline(
         self,
