@@ -162,3 +162,20 @@ def test_query_gateway_error():
     svc = KlineService(gw)
     with pytest.raises(GatewayQueryError):
         svc.query(["000001.SZ"], "2024-01-01", "2024-01-31")
+
+
+def test_query_minute_passes_period():
+    """分钟K应把 period 透传给 gateway。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"], "2024-01-01", "2024-01-31", period="min5")
+    call = gw.query_calls[0]
+    assert call["period"] == "min5"
+
+
+def test_query_minute_default_period_is_day():
+    """不传 period 时默认 'day'，保持 /daily 向后兼容。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"], "2024-01-01", "2024-01-31")
+    assert gw.query_calls[0]["period"] == "day"

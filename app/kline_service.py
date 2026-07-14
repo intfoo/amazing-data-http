@@ -46,21 +46,23 @@ class KlineService:
         symbols: list[str],
         start_time: str | None = None,
         end_time: str | None = None,
+        period: str = "day",
     ) -> list[dict]:
-        """查询日 K 数据，返回展平后的记录列表。
+        """查询 K 线数据，返回展平后的记录列表。
 
         start_time / end_time 可选；为 None 时不传给 SDK，由 SDK 使用默认区间
         （begin_date 默认 20240101，end_date 默认 20991231）。
         仅当两者都提供时校验 start_time <= end_time（按解析后的日期比较，
         不受时间部分精度影响）。
-        首期固定使用 "day" 周期，不接受请求体中的任意周期参数。
+        period 默认 "day"（/daily 接口使用）；/minute 接口传入 "min1"~"min120"
+        等分钟周期，透传给 gateway。
         空结果返回 []（HTTP 层包装为 {"data": []}，HTTP 200）。
         """
         begin_date = to_sdk_date(start_time) if start_time else None
         end_date = to_sdk_date(end_time) if end_time else None
         if begin_date is not None and end_date is not None and begin_date > end_date:
             raise ValueError("start_time must not be later than end_time")
-        result = self._gw.query_kline(symbols, begin_date, end_date, "day")
+        result = self._gw.query_kline(symbols, begin_date, end_date, period)
         return self._flatten(result)
 
     @staticmethod
