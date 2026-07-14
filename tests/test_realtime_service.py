@@ -84,3 +84,36 @@ def test_snapshot_multiple_codes():
     assert len(data) == 2
     codes = {row["code"] for row in data}
     assert codes == {"000001.SZ", "600000.SH"}
+
+
+def test_snapshot_to_dict_plain_object_with_dict():
+    """非 dataclass 的普通对象（有 __dict__）应走第二级 vars() 降级。"""
+    class PlainSnapshot:
+        def __init__(self):
+            self.code = "000001.SZ"
+            self.last = 10.3
+            self.trade_time = datetime(2024, 1, 2, 9, 30)
+    svc = RealtimeService(gateway=None)
+    svc.on_snapshot(PlainSnapshot())
+    data = svc.snapshot()
+    assert len(data) == 1
+    assert data[0]["code"] == "000001.SZ"
+    assert data[0]["last"] == 10.3
+    assert data[0]["trade_time"] == "2024-01-02T09:30:00"
+
+
+def test_snapshot_to_dict_slots_object():
+    """用 __slots__ 的对象应走第三级 MRO slots 遍历降级。"""
+    class SlotsSnapshot:
+        __slots__ = ("code", "last", "trade_time")
+        def __init__(self):
+            self.code = "600000.SH"
+            self.last = 20.5
+            self.trade_time = datetime(2024, 1, 2, 10, 0)
+    svc = RealtimeService(gateway=None)
+    svc.on_snapshot(SlotsSnapshot())
+    data = svc.snapshot()
+    assert len(data) == 1
+    assert data[0]["code"] == "600000.SH"
+    assert data[0]["last"] == 20.5
+    assert data[0]["trade_time"] == "2024-01-02T10:00:00"

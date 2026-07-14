@@ -275,3 +275,35 @@ def test_health_has_realtime_field():
     resp = client.get("/health")
     assert resp.status_code == 200
     assert "realtime" in resp.json()
+
+
+def test_realtime_startup_activates_subscription():
+    """startup 事件应触发订阅启动，FakeGateway no-op 不会抛异常，is_active 应为 True。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    app = create_app(config=config, gateway=gw)
+    with TestClient(app) as client:
+        # startup 已执行：FakeGateway.start_snapshot_subscription 被调用 + set_active(True)
+        assert gw.sub_start_called == 1
+        assert app.state.realtime_service.is_active() is True
+        # /realtime 应返回 200（缓存为空，因为 FakeGateway 不真正推送数据）
+        resp = client.get("/realtime")
+        assert resp.status_code == 200
+        assert resp.json() == {"data": []}
+
+
+def test_realtime_not_active_after_startup_failure():
+    """若 startup 中订阅启动抛异常（FakeGateway 模拟），is_active 应保持 False，/realtime 返回 503。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    # 让 get_code_list 抛异常模拟订阅启动失败
+    def _boom(security_type="EXTRA_STOCK_A"):
+        raise RuntimeError("simulated failure")
+    gw.get_code_list = _boom
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    app = create_app(config=config, gateway=gw)
+    with TestClient(app) as client:
+        # startup 中 get_code_list 抛异常被 try/except 捕获，is_active 保持 False
+        assert app.state.realtime_service.is_active() is False
+        resp = client.get("/realtime")
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "REALTIME_SUBSCRIPTION_FAILED"

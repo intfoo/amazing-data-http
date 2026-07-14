@@ -7,11 +7,14 @@
 ```
 主项目数据同步任务
     │ POST /daily  (symbols, start_time, end_time)
+    │ POST /minute (symbols, period, start, end)
+    │ GET  /realtime
     ▼
 ┌─────────────────────────────────────────┐
 │  AmazingData HTTP 适配服务 (FastAPI)     │
 │  ├── http_app.py   路由 + 错误处理       │
 │  ├── kline_service 日期转换 + 展平       │
+│  ├── realtime_service.py 实时订阅缓存    │
 │  ├── gateway.py   SDK 封装 (login/query) │
 │  ├── serializer.py DataFrame → JSON      │
 │  └── health.py    健康检查               │
@@ -41,7 +44,7 @@ pip install fastapi uvicorn pandas numpy pytest httpx
 python -m pytest -v
 ```
 
-预期输出：`82 passed`。
+预期输出：`102 passed`。
 
 ## 验证方式二：本地真实 SDK（需要 Python 3.13 或 3.14 + 凭据，无需 Docker）
 
@@ -82,7 +85,7 @@ curl http://localhost:3021/health          # 期望 {"status":"ok"}
 curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d "{\"symbols\":[\"000001.SZ\"],\"start_time\":\"2024-01-02\",\"end_time\":\"2024-01-31\"}"
 ```
 
-错误场景验证（反向日期 / 空代码 / 错误格式）同 API 参考章节。
+错误场景验证（反向日期 / 空代码 / 错误格式）见 [docs/API.md](docs/API.md)。
 
 ### 主项目集成配置
 
@@ -123,65 +126,7 @@ transforms:
 
 ## API 参考
 
-### POST /daily
-
-查询日 K 数据。
-
-**请求体**：
-```json
-{
-  "symbols": ["000001.SZ", "600000.SH"],
-  "start_time": "2024-01-01",
-  "end_time": "2024-01-31"
-}
-```
-
-| 字段 | 类型 | 约束 |
-|------|------|------|
-| `symbols` | string[] | 非空数组（必填） |
-| `start_time` | string | 可选。支持 `YYYY-MM-DD`、`YYYY-MM-DDTHH:MM:SS`、`YYYYMMDD` 等 ISO 格式；时间部分截断只取日期。缺省时由 SDK 使用默认起始日 `20240101` |
-| `end_time` | string | 可选。格式同上。缺省时由 SDK 使用默认结束日 `20991231`；仅当两者都提供时校验 `start_time <= end_time`（按日期比较） |
-
-**成功响应**（HTTP 200）：
-```json
-{"data": [{"code": "000001.SZ", "kline_time": "...", "open": ..., ...}]}
-```
-
-**空结果**（HTTP 200）：`{"data": []}`
-
-### GET /health
-
-健康检查。
-
-**正常**（HTTP 200）：
-```json
-{"status": "ok", "sdk": "ready", "config": "complete"}
-```
-
-**异常**（HTTP 503）：
-```json
-{"status": "degraded", "sdk": "not_ready", "config": "incomplete"}
-```
-
-### 错误响应格式
-
-```json
-{
-  "error": {
-    "code": "SDK_QUERY_FAILED",
-    "message": "查询日K失败",
-    "request_id": "abc-123-def"
-  }
-}
-```
-
-| 错误码 | HTTP | 含义 |
-|--------|------|------|
-| `INVALID_REQUEST` | 422 | 请求体、代码列表或日期参数无效 |
-| `SDK_NOT_READY` | 503 | SDK 未登录或未初始化 |
-| `SDK_QUERY_FAILED` | 502 | 上游 SDK 查询失败 |
-| `SERIALIZATION_FAILED` | 502 | 返回值无法安全序列化 |
-| `INTERNAL_ERROR` | 500 | 未分类的内部错误 |
+接口契约详见 [docs/API.md](docs/API.md)，含 `/daily`、`/minute`、`/realtime`、`/health`、错误响应格式与错误码表。
 
 ## 环境变量
 
@@ -204,12 +149,13 @@ app/
 ├── serializer.py    # DataFrame/NumPy/datetime → JSON 序列化
 ├── gateway.py       # Gateway 接口 + AmazingDataGateway SDK 封装
 ├── kline_service.py # 日期转换 + dict[code, DataFrame] 展平
+├── realtime_service.py # 实时行情订阅缓存
 ├── health.py        # 健康检查服务
 ├── errors.py        # 错误码 + AppError + request_id 中间件
-└── http_app.py      # FastAPI 应用（/daily + /health 路由）
+└── http_app.py      # FastAPI 应用（/daily + /minute + /realtime + /health 路由）
 scripts/
 └── probe_sdk.py     # SDK 探测脚本（spec §5.2 门禁）
-tests/               # 单元测试（82 个）
+tests/               # 单元测试（102 个）
 Dockerfile           # python:3.14 + SDK wheel
 docker-compose.yml   # 部署编排
 ```
