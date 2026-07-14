@@ -18,12 +18,13 @@ from pydantic import BaseModel, field_validator
 
 from app.config import Config
 from app.errors import (
-    AppError, INTERNAL_ERROR, INVALID_REQUEST, RequestIdMiddleware,
-    SDK_NOT_READY, SDK_QUERY_FAILED, SERIALIZATION_FAILED, get_request_id,
+    AppError, INTERNAL_ERROR, INVALID_REQUEST, REALTIME_SUBSCRIPTION_FAILED,
+    RequestIdMiddleware, SDK_NOT_READY, SDK_QUERY_FAILED, SERIALIZATION_FAILED, get_request_id,
 )
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, AmazingDataGateway
 from app.health import HealthService
 from app.kline_service import KlineService
+from app.realtime_service import RealtimeService
 
 # 配置 amazingdata 命名空间日志：带时间戳，独立于 uvicorn 默认日志配置。
 # propagate=False 防止 uvicorn 启动重配 root 后重复输出；
@@ -87,6 +88,25 @@ class DailyRequest(BaseModel):
         return v
 
 
+MINUTE_PERIODS = {"min1", "min3", "min5", "min10", "min15", "min30", "min60", "min120"}
+
+
+class MinuteRequest(BaseModel):
+    """POST /minute 请求体。period 可选，默认 min1。"""
+
+    symbols: list[str]
+    period: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+
+    @field_validator("symbols")
+    @classmethod
+    def symbols_nonempty(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("symbols must be a non-empty array")
+        return v
+
+
 def create_app(config: Config | None = None, gateway: Gateway | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
@@ -102,11 +122,13 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         gateway = AmazingDataGateway(config)
 
     kline_service = KlineService(gateway)
-    health_service = HealthService(config, gateway)
+    realtime_service = RealtimeService(gateway)
+    health_service = HealthService(config, gateway, realtime_service)
 
     app.state.config = config
     app.state.gateway = gateway
     app.state.kline_service = kline_service
+    app.state.realtime_service = realtime_service
     app.state.health_service = health_service
 
     @app.on_event("startup")
@@ -121,6 +143,17 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             try:
                 gateway.login()
                 logger.info("gateway login succeeded on startup")
+                try:
+                    code_list = gateway.get_code_list(security_type="EXTRA_STOCK_A")
+                    gateway.start_snapshot_subscription(
+                        code_list,
+                        on_data=realtime_service.on_snapshot,
+                        on_error=realtime_service.on_subscription_error,
+                    )
+                    realtime_service.set_active(True)
+                    logger.info("realtime subscription started: %d symbols", len(code_list))
+                except Exception as e:
+                    logger.error("realtime subscription start failed: %s: %s", type(e).__name__, e)
             except Exception as e:
                 # 登录失败不阻止启动，使 /health 能暴露诊断
                 logger.error("gateway login failed on startup: %s: %s", type(e).__name__, e)
@@ -135,6 +168,10 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         此时调 gateway.logout() 释放 SDK 连接，避免服务端连接累积超限
         （TGW 报 "Connections of this user exceed the max limitation"）。
         """
+        try:
+            gateway.stop_subscription()
+        except Exception as e:
+            logger.warning("stop subscription on shutdown: %s: %s", type(e).__name__, e)
         try:
             gateway.logout()
             logger.info("gateway logout on shutdown")
@@ -178,6 +215,43 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         except Exception as e:
             logger.error("unhandled error: %s: %s", type(e).__name__, e)
             raise AppError(INTERNAL_ERROR, str(e), 500)
+
+    @app.post("/minute")
+    async def minute(req: MinuteRequest, request: Request):
+        """分钟K查询。period 可选（默认 min1），白名单 min1~min120。返回 {"data": [...]}。"""
+        period = req.period or "min1"
+        if period not in MINUTE_PERIODS:
+            raise AppError(INVALID_REQUEST, f"unsupported period: {period}", 422)
+        logger.info("request_id=%s /minute symbols=%d period=%s %s..%s",
+                    get_request_id(request), len(req.symbols), period,
+                    req.start_time or "(default)", req.end_time or "(default)")
+        try:
+            data = kline_service.query(req.symbols, req.start_time, req.end_time, period=period)
+            return {"data": data}
+        except AppError:
+            raise
+        except ValueError as e:
+            raise AppError(INVALID_REQUEST, str(e), 422)
+        except GatewayNotReadyError as e:
+            raise AppError(SDK_NOT_READY, str(e), 503)
+        except GatewayQueryError as e:
+            raise AppError(SDK_QUERY_FAILED, str(e), 502)
+        except (TypeError, OverflowError) as e:
+            if "serialize" in str(e).lower() or "json" in str(e).lower():
+                raise AppError(SERIALIZATION_FAILED, str(e), 502)
+            raise AppError(INTERNAL_ERROR, str(e), 500)
+        except Exception as e:
+            logger.error("unhandled error: %s: %s", type(e).__name__, e)
+            raise AppError(INTERNAL_ERROR, str(e), 500)
+
+    @app.get("/realtime")
+    async def realtime(request: Request):
+        """实时行情快照。全市场，忽略 symbols 参数。订阅未就绪返回 503。"""
+        logger.info("request_id=%s /realtime", get_request_id(request))
+        if not realtime_service.is_active():
+            raise AppError(REALTIME_SUBSCRIPTION_FAILED, "realtime subscription not active", 503)
+        data = realtime_service.snapshot()
+        return {"data": data}
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):

@@ -185,3 +185,93 @@ def test_daily_validation_error_envelope():
     assert body["error"]["code"] == "INVALID_REQUEST"
     assert "errors" in body["error"]
     assert "request_id" in body["error"]
+
+
+def test_minute_success():
+    client = make_test_app()
+    resp = client.post("/minute", json={
+        "symbols": ["000001.SZ"], "period": "min5",
+        "start_time": "2024-01-02", "end_time": "2024-01-02",
+    })
+    assert resp.status_code == 200
+    assert len(resp.json()["data"]) == 1
+
+
+def test_minute_default_period_min1():
+    client = make_test_app()
+    resp = client.post("/minute", json={
+        "symbols": ["000001.SZ"], "start_time": "2024-01-02", "end_time": "2024-01-02",
+    })
+    assert resp.status_code == 200
+
+
+def test_minute_invalid_period():
+    client = make_test_app()
+    resp = client.post("/minute", json={"symbols": ["000001.SZ"], "period": "day"})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_minute_empty_symbols():
+    client = make_test_app()
+    resp = client.post("/minute", json={"symbols": []})
+    assert resp.status_code == 422
+
+
+def test_realtime_not_active_returns_503():
+    """订阅未激活时 /realtime 返回 503。"""
+    gw = FakeGateway(ready=True)
+    client = make_test_app(gateway=gw)
+    resp = client.get("/realtime")
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "REALTIME_SUBSCRIPTION_FAILED"
+
+
+def test_realtime_active_returns_data():
+    """订阅激活 + 注入缓存数据后 /realtime 返回数据。"""
+    from dataclasses import dataclass
+    from datetime import datetime
+    from app.http_app import create_app
+
+    @dataclass
+    class Snap:
+        code: str
+        trade_time: datetime
+        last: float
+        pre_close: float
+        open: float
+        high: float
+        low: float
+        volume: int
+        amount: float
+
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    app = create_app(config=config, gateway=gw)
+    app.state.realtime_service.on_snapshot(
+        Snap("000001.SZ", datetime(2024, 1, 2, 9, 30), 10.3, 10.2, 10.2, 10.5, 10.1, 1000, 10300.0)
+    )
+    app.state.realtime_service.set_active(True)
+    client = TestClient(app)
+    resp = client.get("/realtime")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["data"]) == 1
+    assert body["data"][0]["code"] == "000001.SZ"
+    assert body["data"][0]["last"] == 10.3
+
+
+def test_realtime_ignores_symbols_param():
+    """GET /realtime?symbols=xxx 不报 422（忽略参数）。"""
+    gw = FakeGateway(ready=True)
+    client = make_test_app(gateway=gw)
+    resp = client.get("/realtime?symbols=000001.SZ")
+    assert resp.status_code == 503  # 未激活返回 503，但不报 422
+
+
+def test_health_has_realtime_field():
+    gw = FakeGateway(ready=True)
+    client = make_test_app(gateway=gw)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert "realtime" in resp.json()

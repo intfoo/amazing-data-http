@@ -8,17 +8,20 @@ from app.gateway import Gateway
 
 
 class HealthService:
-    def __init__(self, config, gateway: Gateway):
+    def __init__(self, config, gateway: Gateway, realtime_service=None):
         self._config = config
         self._gw = gateway
+        self._realtime_svc = realtime_service
 
     def status(self) -> dict:
         """返回健康状态详情。status=ok 当且仅当配置完整且 SDK 已登录。"""
         ready = self._config.is_configured() and self._gw.is_ready()
+        rt = self._realtime_svc.is_active() if self._realtime_svc else False
         return {
             "status": "ok" if ready else "degraded",
             "sdk": "ready" if self._gw.is_ready() else "not_ready",
             "config": "complete" if self._config.is_configured() else "incomplete",
+            "realtime": "active" if rt else "inactive",
         }
 
     def is_ok(self) -> bool:
