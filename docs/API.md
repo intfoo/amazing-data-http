@@ -23,8 +23,21 @@
 
 **成功响应**（HTTP 200）：
 ```json
-{"data": [{"code": "000001.SZ", "kline_time": "...", "open": ..., ...}]}
+{"data": [{"code": "000001.SZ", "kline_time": "2024-01-02T00:00:00", "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 1234567, "amount": 12700000.0}]}
 ```
+
+响应 `data` 数组元素字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `code` | string | 证券代码+市场，如 `000001.SZ` |
+| `kline_time` | string | ISO datetime 行情时间。日K为 `2024-01-02T00:00:00` |
+| `open` | float | 开盘价 |
+| `high` | float | 最高价 |
+| `low` | float | 最低价 |
+| `close` | float | 收盘价 |
+| `volume` | int | 成交总量 |
+| `amount` | float | 成交总金额 |
 
 **空结果**（HTTP 200）：`{"data": []}`
 
@@ -51,12 +64,76 @@
 
 **成功响应**（HTTP 200）：
 ```json
-{"data": [{"code": "000001.SZ", "kline_time": "...", "open": ..., "high": ..., "low": ..., "close": ..., "volume": ..., "amount": ...}]}
+{"data": [{"code": "000001.SZ", "kline_time": "2024-01-02T09:30:00", "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 123456, "amount": 1270000.0}]}
 ```
 
-字段与 `/daily` 完全一致（SDK `query_kline` 对所有周期返回相同列：`code/kline_time/open/high/low/close/volume/amount`）。
+响应 `data` 数组元素字段与 `/daily` 完全一致（SDK `query_kline` 对所有周期返回相同列）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `code` | string | 证券代码+市场 |
+| `kline_time` | string | ISO datetime 行情时间。分钟K含时分，如 `2024-01-02T09:30:00` |
+| `open` | float | 开盘价 |
+| `high` | float | 最高价 |
+| `low` | float | 最低价 |
+| `close` | float | 收盘价 |
+| `volume` | int | 成交总量 |
+| `amount` | float | 成交总金额 |
 
 **空结果**（HTTP 200）：`{"data": []}`
+
+## GET /realtime
+
+返回实时行情快照。数据来自后台 SDK 订阅的内存缓存（每个 code 保留最新一笔快照，覆盖语义）。
+
+**查询参数**：
+
+| 参数 | 类型 | 约束 |
+|------|------|------|
+| `symbols` | string | 可选。逗号分隔的代码列表，如 `?symbols=000001.SZ,600000.SH`。不传返回全市场快照；传入则从全市场缓存中过滤返回指定代码的快照。不触发额外订阅 |
+
+**示例**：
+```
+GET /realtime                           # 全市场快照
+GET /realtime?symbols=000001.SZ         # 单个代码
+GET /realtime?symbols=000001.SZ,600000.SH   # 多个代码
+```
+
+**成功响应**（HTTP 200）：
+```json
+{"data": [{"code": "000001.SZ", "trade_time": "2024-01-02T09:30:00", "last": 10.3, "pre_close": 10.2, "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 123456, "amount": 1270000.0, "num_trades": 1234, "high_limited": 11.22, "low_limited": 9.18, "ask_price1": 10.31, "ask_volume1": 500, "bid_price1": 10.29, "bid_volume1": 480, "trading_phase_code": "T0 "}]}
+```
+
+响应 `data` 数组元素字段（透传 SDK `Snapshot` 全部字段，字段名保持 SDK 原始名）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `code` | string | 证券代码+市场 |
+| `trade_time` | string | ISO datetime，交易所行情数据时间 |
+| `pre_close` | float | 昨收价 |
+| `last` | float | 最新价 |
+| `open` | float | 开盘价 |
+| `high` | float | 最高价 |
+| `low` | float | 最低价 |
+| `close` | float | 收盘价 |
+| `volume` | float | 成交总量 |
+| `amount` | float | 成交总金额 |
+| `num_trades` | float | 成交笔数 |
+| `high_limited` | float | 涨停价 |
+| `low_limited` | float | 跌停价 |
+| `ask_price1`~`ask_price5` | float | 卖1~卖5档价格 |
+| `ask_volume1`~`ask_volume5` | int | 卖1~卖5档量 |
+| `bid_price1`~`bid_price5` | float | 买1~买5档价格 |
+| `bid_volume1`~`bid_volume5` | int | 买1~买5档量 |
+| `iopv` | float | 净值估产（仅基金品种有效，其余为 null） |
+| `trading_phase_code` | string | 交易阶段代码（见 SDK 文档 §4.1.5） |
+
+> `NaN`/缺失值序列化为 `null`。SDK `Snapshot` 不含 `name`（证券简称）、`change_pct`、`change_amount`、`amplitude`、`turnover_rate` 等衍生字段，由主项目 pipeline 回算。
+
+**缓存状态**：
+- 订阅运行中且已收到数据：返回最新快照列表（非交易时段返回最后一笔快照，可能略过时）
+- 订阅刚启动未收到数据：返回 `200 {"data": []}`（空缓存）
+- 订阅未启动/已崩溃：HTTP 503
 
 ## GET /health
 
@@ -64,7 +141,7 @@
 
 **正常**（HTTP 200）：
 ```json
-{"status": "ok", "sdk": "ready", "config": "complete"}
+{"status": "ok", "sdk": "ready", "config": "complete", "realtime": "active"}
 ```
 
 **异常**（HTTP 503）：
@@ -72,25 +149,14 @@
 {"status": "degraded", "sdk": "not_ready", "config": "incomplete", "realtime": "inactive"}
 ```
 
-`realtime` 字段反映实时订阅状态：`active`（订阅运行中）或 `inactive`（未启动/已崩溃）。该字段不影响 `status` 和 HTTP 状态码（realtime 不阻断主健康）。
+响应字段：
 
-## GET /realtime
-
-返回全市场实时快照。忽略 `symbols` 查询参数，始终返回全市场缓存快照。
-
-> 主项目 `custom-data-source.md` 约定 GET 请求会发送 `symbols=000001.SZ,600000.SH` query 参数，但本接口始终返回全市场缓存快照，不支持逐个 symbol 拉取。FastAPI 路由不声明该参数即自动忽略。
-
-**成功响应**（HTTP 200）：
-```json
-{"data": [{"code": "...", "trade_time": "...", "last": ..., "pre_close": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ..., "amount": ..., "num_trades": ..., "high_limited": ..., "low_limited": ..., "ask_price1"~"ask_price5": ..., "ask_volume1"~"ask_volume5": ..., "bid_price1"~"bid_price5": ..., "bid_volume1"~"bid_volume5": ..., "iopv": ..., "trading_phase_code": "..."}]}
-```
-
-透传 SDK `Snapshot` 全部字段，字段名保持 SDK 原始名。
-
-**缓存状态**：
-- 订阅运行中且已收到数据：返回最新快照列表
-- 订阅刚启动未收到数据：返回 `200 {"data": []}`（空缓存）
-- 订阅未启动/已崩溃：HTTP 503
+| 字段 | 取值 | 说明 |
+|------|------|------|
+| `status` | `ok` / `degraded` | 配置完整且 SDK 就绪时 `ok`，否则 `degraded`。决定 HTTP 200/503 |
+| `sdk` | `ready` / `not_ready` | SDK 是否已登录且 MarketData 就绪 |
+| `config` | `complete` / `incomplete` | 四项凭据（用户名/密码/IP/端口）是否齐全 |
+| `realtime` | `active` / `inactive` | 实时订阅是否运行中。不影响 `status` 和 HTTP 状态码 |
 
 ## 错误响应格式
 

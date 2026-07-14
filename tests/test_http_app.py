@@ -261,12 +261,51 @@ def test_realtime_active_returns_data():
     assert body["data"][0]["last"] == 10.3
 
 
-def test_realtime_ignores_symbols_param():
-    """GET /realtime?symbols=xxx 不报 422（忽略参数）。"""
-    gw = FakeGateway(ready=True)
-    client = make_test_app(gateway=gw)
+def test_realtime_symbols_filter():
+    """GET /realtime?symbols=000001.SZ 只返回指定 code 的快照；不传返回全市场。"""
+    from dataclasses import dataclass
+    from datetime import datetime
+    from app.http_app import create_app
+
+    @dataclass
+    class Snap:
+        code: str
+        trade_time: datetime
+        last: float
+        pre_close: float
+        open: float
+        high: float
+        low: float
+        volume: int
+        amount: float
+
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    app = create_app(config=config, gateway=gw)
+    app.state.realtime_service.on_snapshot(
+        Snap("000001.SZ", datetime(2024, 1, 2, 9, 30), 10.3, 10.2, 10.2, 10.5, 10.1, 1000, 10300.0)
+    )
+    app.state.realtime_service.on_snapshot(
+        Snap("600000.SH", datetime(2024, 1, 2, 9, 30), 20.0, 19.5, 19.5, 20.5, 19.0, 2000, 40000.0)
+    )
+    app.state.realtime_service.set_active(True)
+    client = TestClient(app)
+    # 不传 symbols 返回全部
+    resp = client.get("/realtime")
+    assert resp.status_code == 200
+    assert len(resp.json()["data"]) == 2
+    # 传单个 symbols 只返回指定 code
     resp = client.get("/realtime?symbols=000001.SZ")
-    assert resp.status_code == 503  # 未激活返回 503，但不报 422
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["data"]) == 1
+    assert body["data"][0]["code"] == "000001.SZ"
+    # 传多个 symbols（逗号分隔）
+    resp = client.get("/realtime?symbols=000001.SZ,600000.SH")
+    assert len(resp.json()["data"]) == 2
+    # 传不存在的 code 返回空数组
+    resp = client.get("/realtime?symbols=999999.SZ")
+    assert resp.json() == {"data": []}
 
 
 def test_health_has_realtime_field():

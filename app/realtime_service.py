@@ -40,13 +40,18 @@ class RealtimeService:
         self._active = False
         logger.error("realtime subscription deactivated due to error: %s", err)
 
-    def snapshot(self) -> list[dict]:
-        """GET /realtime 读缓存，返回全市场快照列表。
+    def snapshot(self, symbols: list[str] | None = None) -> list[dict]:
+        """GET /realtime 读缓存，返回快照列表。
 
+        symbols 为 None 时返回全市场快照；非空时只返回指定 code 的快照
+        （从全市场缓存中过滤，不触发额外订阅）。
         对每个缓存 dict 做浅拷贝（dict(v)），避免外部序列化修改污染缓存。
         """
         with self._lock:
-            return [dict(v) for v in self._cache.values()]
+            if symbols is None:
+                return [dict(v) for v in self._cache.values()]
+            wanted = set(symbols)
+            return [dict(v) for code, v in self._cache.items() if code in wanted]
 
     def is_active(self) -> bool:
         return self._active

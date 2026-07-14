@@ -245,12 +245,17 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             raise AppError(INTERNAL_ERROR, str(e), 500)
 
     @app.get("/realtime")
-    async def realtime(request: Request):
-        """实时行情快照。全市场，忽略 symbols 参数。订阅未就绪返回 503。"""
-        logger.info("request_id=%s /realtime", get_request_id(request))
+    async def realtime(request: Request, symbols: str | None = None):
+        """实时行情快照。可选 symbols 过滤，不传返回全市场。订阅未就绪返回 503。
+
+        symbols 为逗号分隔的代码字符串（如 ?symbols=000001.SZ,600000.SH），
+        从全市场缓存中过滤返回；不传则返回全市场。
+        """
+        logger.info("request_id=%s /realtime symbols=%s", get_request_id(request), symbols or "(all)")
         if not realtime_service.is_active():
             raise AppError(REALTIME_SUBSCRIPTION_FAILED, "realtime subscription not active", 503)
-        data = realtime_service.snapshot()
+        sym_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else None
+        data = realtime_service.snapshot(sym_list)
         return {"data": data}
 
     @app.exception_handler(AppError)
