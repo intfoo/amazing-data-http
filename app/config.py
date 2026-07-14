@@ -25,7 +25,7 @@ class Config:
         return cls(
             username=os.environ.get("AMAZINGDATA_USERNAME", ""),
             password=os.environ.get("AMAZINGDATA_PASSWORD", ""),
-            ip=os.environ.get("AMAZINGDATA_IP", ""),
+            ip=os.environ.get("AMAZINGDATA_HOST", ""),
             port=int(os.environ.get("AMAZINGDATA_PORT", "0") or "0"),
             http_host=os.environ.get("HTTP_HOST", "0.0.0.0") or "0.0.0.0",
             http_port=int(os.environ.get("HTTP_PORT", "3021") or "3021"),

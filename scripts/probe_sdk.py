@@ -1,8 +1,10 @@
 """AmazingData SDK 最小探测脚本。
 
 只输出结构摘要，不输出账号、密码或完整行情数据。
-运行方式（在 Docker 容器内）：
-    python scripts/probe_sdk.py > docs/probe-report.json
+机器可读报告写入 --out 指定文件（默认 docs/probe-report.json），
+stdout 仅打印一行人类摘要，退出码 0 iff login_ok and query_ok。
+运行方式：
+    python scripts/probe_sdk.py [--out docs/probe-report.json]
 """
 import inspect
 import json
@@ -10,8 +12,42 @@ import os
 import sys
 import traceback
 
+DEFAULT_OUT = "docs/probe-report.json"
 
-def probe():
+
+def _finish(report, out_path):
+    """写报告文件 + 打印摘要 + 返回退出码。"""
+    try:
+        out_dir = os.path.dirname(out_path)
+        if out_dir and not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str, ensure_ascii=False)
+    except OSError as e:
+        print(json.dumps(report, indent=2, default=str, ensure_ascii=False))
+        print(f"probe FAIL: cannot write report file {out_path}: {e}")
+        return 1
+
+    ok = report.get("login_ok") is True and report.get("query_ok") is True
+    if ok:
+        cols = report.get("df_columns")
+        cols_str = str(len(cols)) if isinstance(cols, list) else "unknown"
+        print(f"probe OK: login=true query=true cols={cols_str}")
+    else:
+        reason = (
+            "import failed" if report.get("import_ok") is False
+            else report.get("login_skipped")
+            or report.get("login_error")
+            or report.get("calendar_error")
+            or report.get("marketdata_error")
+            or report.get("query_error")
+            or "unknown"
+        )
+        print(f"probe FAIL: {reason}")
+    return 0 if ok else 1
+
+
+def probe(out_path=DEFAULT_OUT):
     report = {"errors": []}
 
     try:
@@ -22,14 +58,14 @@ def probe():
         report["import_ok"] = False
         report["errors"].append(f"import failed: {type(e).__name__}: {e}")
         report["errors"].append(traceback.format_exc())
-        print(json.dumps(report, indent=2, default=str))
-        return
+        return _finish(report, out_path)
 
     # 1. login 签名
     try:
         sig = inspect.signature(ad.login)
         report["login_params"] = {
-            name: {"required": p.default is p.empty, "default": str(p.default) if p.default is not p.empty else None}
+            name: {"required": p.default is p.empty,
+                   "default": str(p.default) if p.default is not p.empty else None}
             for name, p in sig.parameters.items()
         }
     except Exception as e:
@@ -50,24 +86,22 @@ def probe():
     # 3. 登录（需要环境变量）
     username = os.environ.get("AMAZINGDATA_USERNAME", "")
     password = os.environ.get("AMAZINGDATA_PASSWORD", "")
-    ip = os.environ.get("AMAZINGDATA_IP", "")
+    host = os.environ.get("AMAZINGDATA_HOST", "")
     port_raw = os.environ.get("AMAZINGDATA_PORT", "0")
     port = int(port_raw) if port_raw else 0
 
-    if not all([username, password, ip, port]):
+    if not all([username, password, host, port]):
         report["login_skipped"] = "missing credentials in env"
-        print(json.dumps(report, indent=2, default=str))
-        return
+        return _finish(report, out_path)
 
     try:
-        ad.login(username=username, password=password, host=ip, port=port)
+        ad.login(username=username, password=password, host=host, port=port)
         report["login_ok"] = True
     except Exception as e:
         report["login_ok"] = False
         report["login_error"] = f"{type(e).__name__}: {e}"
         report["errors"].append(traceback.format_exc())
-        print(json.dumps(report, indent=2, default=str))
-        return
+        return _finish(report, out_path)
 
     # 4. BaseData + calendar
     try:
@@ -82,8 +116,7 @@ def probe():
         report["calendar_error"] = f"{type(e).__name__}: {e}"
         report["errors"].append(traceback.format_exc())
         _safe_logout(ad, report)
-        print(json.dumps(report, indent=2, default=str))
-        return
+        return _finish(report, out_path)
 
     # 5. MarketData
     try:
@@ -91,15 +124,15 @@ def probe():
         report["marketdata_created"] = True
         sig_qk = inspect.signature(md.query_kline)
         report["query_kline_params"] = {
-            name: {"required": p.default is p.empty, "default": str(p.default) if p.default is not p.empty else None}
+            name: {"required": p.default is p.empty,
+                   "default": str(p.default) if p.default is not p.empty else None}
             for name, p in sig_qk.parameters.items()
         }
     except Exception as e:
         report["marketdata_error"] = f"{type(e).__name__}: {e}"
         report["errors"].append(traceback.format_exc())
         _safe_logout(ad, report)
-        print(json.dumps(report, indent=2, default=str))
-        return
+        return _finish(report, out_path)
 
     # 6. 查询一个代码一个交易日
     trade_day = calendar[-1]
@@ -145,7 +178,7 @@ def probe():
     # 7. 登出
     _safe_logout(ad, report)
 
-    print(json.dumps(report, indent=2, default=str))
+    return _finish(report, out_path)
 
 
 def _safe_logout(ad, report):
@@ -159,4 +192,8 @@ def _safe_logout(ad, report):
 
 
 if __name__ == "__main__":
-    probe()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", default=DEFAULT_OUT)
+    args = parser.parse_args()
+    sys.exit(probe(args.out))

@@ -2,7 +2,7 @@
 name = "amazingdata-http"
 version = "0.1.0"
 description = "AmazingData HTTP adapter service"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",

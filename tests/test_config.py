@@ -5,7 +5,7 @@ from app.config import Config
 def test_config_from_env_reads_all_vars():
     os.environ["AMAZINGDATA_USERNAME"] = "user1"
     os.environ["AMAZINGDATA_PASSWORD"] = "pass1"
-    os.environ["AMAZINGDATA_IP"] = "1.2.3.4"
+    os.environ["AMAZINGDATA_HOST"] = "1.2.3.4"
     os.environ["AMAZINGDATA_PORT"] = "3021"
     os.environ["HTTP_HOST"] = "0.0.0.0"
     os.environ["HTTP_PORT"] = "8080"
@@ -20,7 +20,7 @@ def test_config_from_env_reads_all_vars():
 
 
 def test_config_defaults():
-    for key in ["AMAZINGDATA_USERNAME", "AMAZINGDATA_PASSWORD", "AMAZINGDATA_IP", "AMAZINGDATA_PORT"]:
+    for key in ["AMAZINGDATA_USERNAME", "AMAZINGDATA_PASSWORD", "AMAZINGDATA_HOST", "AMAZINGDATA_PORT"]:
         os.environ.pop(key, None)
     os.environ["HTTP_HOST"] = ""
     os.environ["HTTP_PORT"] = ""

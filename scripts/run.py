@@ -1,0 +1,305 @@
+"""统一本地 & Docker 启动入口。
+
+交互式向导收集凭据 → 可选装 SDK → probe 门禁 → 本地起 uvicorn 或编排 docker。
+本地模式凭据写 local.config.json（注入 os.environ，零改动 app 代码）；
+Docker 模式凭据写 .env。二者互不读取。
+"""
+import getpass
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 脚本直接运行时 sys.path[0] 是 scripts/，不含项目根，导致 uvicorn import app.http_app 失败
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+LOCAL_CONFIG = PROJECT_ROOT / "local.config.json"
+ENV_FILE = PROJECT_ROOT / ".env"
+PROBE_REPORT = PROJECT_ROOT / "docs" / "probe-report.json"
+PROBE_SCRIPT = PROJECT_ROOT / "scripts" / "probe_sdk.py"
+
+SUPPORTED_PY = {(3, 13), (3, 14)}
+DEFAULT_HTTP_HOST = "0.0.0.0"
+DEFAULT_HTTP_PORT = "3021"
+
+
+def check_python_version():
+    if sys.version_info[:2] not in SUPPORTED_PY:
+        print(f"需要 Python 3.13 或 3.14，当前 {sys.version_info[0]}.{sys.version_info[1]}")
+        sys.exit(1)
+
+
+def pick_sdk_wheels():
+    ver = sys.version_info[:2]
+    tgw = "tgw-1.0.8.7-py3-none-any.whl"
+    if ver == (3, 13):
+        ad = "AmazingData-1.1.7-cp313-none-any.whl"
+    elif ver == (3, 14):
+        ad = "AmazingData-1.1.7-cp314-none-any.whl"
+    else:
+        raise ValueError(f"unsupported python {ver}")
+    return [str(PROJECT_ROOT / tgw), str(PROJECT_ROOT / ad)]
+
+
+def load_local_config(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_local_config(path, creds):
+    data = {
+        "AMAZINGDATA_USERNAME": creds["AMAZINGDATA_USERNAME"],
+        "AMAZINGDATA_PASSWORD": creds["AMAZINGDATA_PASSWORD"],
+        "AMAZINGDATA_HOST": creds["AMAZINGDATA_HOST"],
+        "AMAZINGDATA_PORT": creds["AMAZINGDATA_PORT"],
+        "HTTP_HOST": DEFAULT_HTTP_HOST,
+        "HTTP_PORT": DEFAULT_HTTP_PORT,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def write_env_file(path, creds):
+    lines = [
+        f"AMAZINGDATA_USERNAME={creds['AMAZINGDATA_USERNAME']}",
+        f"AMAZINGDATA_PASSWORD={creds['AMAZINGDATA_PASSWORD']}",
+        f"AMAZINGDATA_HOST={creds['AMAZINGDATA_HOST']}",
+        f"AMAZINGDATA_PORT={creds['AMAZINGDATA_PORT']}",
+        f"HTTP_HOST={DEFAULT_HTTP_HOST}",
+        f"HTTP_PORT={DEFAULT_HTTP_PORT}",
+        "",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def inject_env(config):
+    for k, v in config.items():
+        os.environ[k] = str(v)
+
+
+def summarize_config(creds):
+    """打印已读取的本地配置摘要（密码隐藏）。"""
+    print("已读取 local.config.json：")
+    print(f"  账号   AMAZINGDATA_USERNAME = {creds.get('AMAZINGDATA_USERNAME', '<空>')}")
+    print(f"  服务器 AMAZINGDATA_HOST     = {creds.get('AMAZINGDATA_HOST', '<空>')}:{creds.get('AMAZINGDATA_PORT', '<空>')}")
+    print(f"  HTTP   监听 = {creds.get('HTTP_HOST', DEFAULT_HTTP_HOST)}:{creds.get('HTTP_PORT', DEFAULT_HTTP_PORT)}")
+    print("  密码   AMAZINGDATA_PASSWORD = <已隐藏>")
+
+
+def build_docker_build_cmd():
+    return ["docker", "build", "--platform", "linux/amd64", "-t", "amazingdata-http:probe", "."]
+
+
+def build_docker_probe_cmd(docs_abs):
+    docs_vol = str(Path(docs_abs).resolve()).replace("\\", "/")
+    return ["docker", "run", "--rm", "--env-file", ".env", "--platform", "linux/amd64",
+            "-v", f"{docs_vol}:/app/docs", "amazingdata-http:probe",
+            "python", "scripts/probe_sdk.py", "--out", "docs/probe-report.json"]
+
+
+def build_docker_compose_cmd():
+    return ["docker", "compose", "up", "-d"]
+
+
+def backup_env(path):
+    p = Path(path)
+    if p.exists():
+        shutil.copyfile(p, str(p) + ".bak")
+
+
+def run_probe(out_path, runner=subprocess.run):
+    cmd = [sys.executable, str(PROBE_SCRIPT), "--out", str(out_path)]
+    proc = runner(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    rc = _rc(proc)
+    out = ""
+    if hasattr(proc, "stdout") and proc.stdout:
+        out = proc.stdout.decode("utf-8", errors="replace").strip()
+    if rc != 0:
+        if out:
+            print("---- probe 输出 ----")
+            print(out)
+            print("--------------------")
+    else:
+        # 成功只回显摘要行（屏蔽 SDK 的 TGW 登录噪声与 token）
+        if out:
+            print(out.splitlines()[-1])
+    return rc
+
+
+def confirm(prompt, input_fn=input):
+    ans = input_fn(prompt + " (y/n) ").strip().lower()
+    return ans in ("y", "yes")
+
+
+def ask_credentials(input_fn=input, getpass_fn=getpass.getpass):
+    def _ask(label):
+        while True:
+            v = input_fn(label + ": ").strip()
+            if v:
+                return v
+            print("不能为空，请重新输入")
+
+    username = _ask("AMAZINGDATA_USERNAME")
+    host = _ask("AMAZINGDATA_HOST")
+    while True:
+        port = input_fn("AMAZINGDATA_PORT: ").strip()
+        try:
+            int(port)
+            break
+        except ValueError:
+            print("端口须为整数，请重新输入")
+    password = getpass_fn("AMAZINGDATA_PASSWORD: ").strip()
+    while not password:
+        print("不能为空，请重新输入")
+        password = getpass_fn("AMAZINGDATA_PASSWORD: ").strip()
+    return {
+        "AMAZINGDATA_USERNAME": username,
+        "AMAZINGDATA_HOST": host,
+        "AMAZINGDATA_PORT": port,
+        "AMAZINGDATA_PASSWORD": password,
+    }
+
+
+def ensure_sdk(install_fn, confirm_fn):
+    try:
+        import AmazingData  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if confirm_fn("SDK 未安装，是否自动安装？"):
+        pkgs = pick_sdk_wheels() + ["fastapi", "uvicorn[standard]", "pandas", "numpy"]
+        print("正在安装 SDK 依赖（可能 1-2 分钟，请稍候）...")
+        install_fn(pkgs)
+        print("安装完成。")
+    else:
+        print("已跳过安装。请手动执行：")
+        manual = " ".join(pick_sdk_wheels() + ["fastapi", "uvicorn[standard]", "pandas", "numpy"])
+        print(f"  {sys.executable} -m pip install {manual}")
+        sys.exit(1)
+
+
+def _pip_install(pkgs):
+    subprocess.run([sys.executable, "-m", "pip", "install", *pkgs], check=False)
+
+
+def docker_available():
+    return shutil.which("docker") is not None
+
+
+def _rc(proc):
+    return proc.returncode if hasattr(proc, "returncode") else proc
+
+
+def run_local(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
+              install_fn=_pip_install, runner=subprocess.run):
+    config_ok = False
+    creds = None
+    if LOCAL_CONFIG.exists():
+        try:
+            creds = load_local_config(LOCAL_CONFIG)
+            config_ok = True
+            summarize_config(creds)
+        except (json.JSONDecodeError, OSError):
+            print("local.config.json 损坏或不可读，进入向导重新配置")
+    if not config_ok:
+        print("未找到可用的 local.config.json，进入凭据向导（密码输入时不回显）。")
+        for _ in range(3):
+            creds = ask_credentials(input_fn, getpass_fn)
+            ensure_sdk(install_fn, confirm_fn)
+            inject_env(creds)
+            print("正在进行 probe 登录验证（约数秒，请稍候）...")
+            rc = run_probe(str(PROBE_REPORT), runner=runner)
+            if rc == 0:
+                break
+            print("凭据或网络有问题，请重试")
+        else:
+            print("连续 3 次验证失败，退出。")
+            sys.exit(1)
+        write_local_config(LOCAL_CONFIG, creds)
+        print("验证通过，凭据已保存到 local.config.json。")
+    else:
+        ensure_sdk(install_fn, confirm_fn)
+        inject_env(creds)
+        print("正在进行 probe 门禁验证（约数秒，请稍候）...")
+        rc = run_probe(str(PROBE_REPORT), runner=runner)
+        if rc != 0:
+            print("probe 门禁失败，请检查凭据/网络后重跑。")
+            sys.exit(1)
+
+    host = creds.get("HTTP_HOST", DEFAULT_HTTP_HOST)
+    port = int(creds.get("HTTP_PORT", DEFAULT_HTTP_PORT))
+    print(f"正在启动 uvicorn（监听 {host}:{port}，启动时会登录 SDK，约数秒）...")
+    import uvicorn
+
+    class _CleanExitServer(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            # 触发优雅关停但不记录信号，避免 capture_signals 退出时重抛信号
+            # 导致的 KeyboardInterrupt / CancelledError 异常链（Windows Ctrl+C 噪声）
+            if self.should_exit and sig == signal.SIGINT:
+                self.force_exit = True
+            else:
+                self.should_exit = True
+
+    _CleanExitServer(uvicorn.Config("app.http_app:app", host=host, port=port)).run()
+
+
+def run_docker(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
+               runner=subprocess.run):
+    if not docker_available():
+        print("docker 未安装或未运行，请先安装 Docker Desktop。")
+        sys.exit(1)
+    creds = ask_credentials(input_fn, getpass_fn)
+    if ENV_FILE.exists():
+        if confirm_fn(".env 已存在，覆盖？(会备份为 .env.bak)"):
+            backup_env(ENV_FILE)
+            write_env_file(ENV_FILE, creds)
+    else:
+        write_env_file(ENV_FILE, creds)
+    print(f".env 已写入：账号={creds['AMAZINGDATA_USERNAME']} 服务器={creds['AMAZINGDATA_HOST']}:{creds['AMAZINGDATA_PORT']}")
+
+    if confirm_fn("执行 docker build？"):
+        print("正在构建 Docker 镜像（首次较慢，可能数分钟）...")
+        if _rc(runner(build_docker_build_cmd(), cwd=str(PROJECT_ROOT))) != 0:
+            print("docker build 失败")
+            sys.exit(1)
+        print("正在容器内运行 probe 门禁（约数秒）...")
+        if _rc(runner(build_docker_probe_cmd(PROJECT_ROOT / "docs"), cwd=str(PROJECT_ROOT))) != 0:
+            print("probe 门禁失败：凭据可能有误，.env 已更新，建议修正后重跑")
+    else:
+        print("跳过 build，手动执行：")
+        print(" ".join(build_docker_build_cmd()))
+
+    if confirm_fn("执行 docker compose up -d？"):
+        print("正在启动容器...")
+        runner(build_docker_compose_cmd(), cwd=str(PROJECT_ROOT))
+    else:
+        print("跳过 compose，手动执行：")
+        print(" ".join(build_docker_compose_cmd()))
+
+    print("手动验证：")
+    print("  curl http://localhost:3021/health")
+    print("  若返回 503：docker compose logs amazingdata-http 查登录错误")
+
+
+def main():
+    check_python_version()
+    print(f"Python {sys.version.split()[0]}")
+    print("选择模式：1=本地真实 SDK  2=Docker 完整链路")
+    choice = input("模式 [1/2]: ").strip()
+    if choice == "1":
+        run_local()
+    elif choice == "2":
+        run_docker()
+    else:
+        print("无效选择")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

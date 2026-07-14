@@ -49,8 +49,8 @@ class Gateway(Protocol):
     def query_kline(
         self,
         symbols: list[str],
-        begin_date: int,
-        end_date: int,
+        begin_date: int | None,
+        end_date: int | None,
         period: str,
     ) -> dict[str, pd.DataFrame]: ...
 
@@ -95,6 +95,10 @@ class AmazingDataGateway:
 
         SDK import 延迟到此处（而非模块顶部），使服务在无 SDK 环境下也能启动，
         /health 能正常返回 503 诊断信息。
+
+        连接泄漏防护：ad.login() 成功后若后续步骤（BaseData/MarketData）失败，
+        必须调 _safe_logout 释放已建立的 SDK 连接，否则 _ready 仍为 False，
+        下次重 login 时不会先 logout（因 if self._ready 为 False），旧连接泄漏。
         """
         try:
             import AmazingData as ad
@@ -104,6 +108,7 @@ class AmazingDataGateway:
             raise GatewayNotReadyError(f"SDK import failed: {e}") from e
 
         self._ad = ad
+        sdk_logged_in = False  # 标记 ad.login 是否已成功，用于失败时回滚
         try:
             if self._ready:
                 self._safe_logout()
@@ -113,12 +118,16 @@ class AmazingDataGateway:
                 host=self._config.ip,
                 port=self._config.port,
             )
+            sdk_logged_in = True
             base = ad.BaseData()
             calendar = base.get_calendar()
             self._market_data = ad.MarketData(calendar)
             self._ready = True
             logger.info("AmazingData gateway login successful")
         except Exception as e:
+            # ad.login 已成功但后续步骤失败：必须 logout 释放连接，否则连接泄漏
+            if sdk_logged_in:
+                self._safe_logout()
             self._ready = False
             logger.error("AmazingData login failed: %s: %s", type(e).__name__, e)
             raise GatewayNotReadyError(f"login failed: {e}") from e
@@ -146,12 +155,14 @@ class AmazingDataGateway:
     def query_kline(
         self,
         symbols: list[str],
-        begin_date: int,
-        end_date: int,
+        begin_date: int | None,
+        end_date: int | None,
         period: str,
     ) -> dict[str, "pd.DataFrame"]:
         """查询 K 线数据。period 是内部字符串（如 "day"），通过 PERIOD_MAP 映射到 SDK 枚举。
 
+        begin_date / end_date 为 None 时不传给 SDK，由 SDK 使用默认区间
+        （begin_date 默认 20240101，end_date 默认 20991231）。
         返回 dict[code, DataFrame]。若 SDK 返回非 dict（如单个 DataFrame），
         用 {"_all": result} 包装以统一接口。
         """
@@ -166,19 +177,24 @@ class AmazingDataGateway:
         except Exception as e:
             raise GatewayQueryError(f"period mapping failed: {e}") from e
 
+        # 仅传非 None 的日期参数，None 时让 SDK 用默认值
+        kwargs: dict[str, Any] = {"period": sdk_period_value}
+        if begin_date is not None:
+            kwargs["begin_date"] = begin_date
+        if end_date is not None:
+            kwargs["end_date"] = end_date
+
         with self._lock:
             try:
-                result = self._market_data.query_kline(
-                    symbols,
-                    begin_date=begin_date,
-                    end_date=end_date,
-                    period=sdk_period_value,
-                )
+                result = self._market_data.query_kline(symbols, **kwargs)
                 return result if isinstance(result, dict) else {"_all": result}
             except Exception as e:
                 # 日志记录上下文（代码数量、日期区间），不记录完整代码列表和密码
                 logger.error(
-                    "query_kline failed: %s: %s (symbols=%d, begin=%d, end=%d, period=%s)",
-                    type(e).__name__, e, len(symbols), begin_date, end_date, period,
+                    "query_kline failed: %s: %s (symbols=%d, begin=%s, end=%s, period=%s)",
+                    type(e).__name__, e, len(symbols),
+                    begin_date if begin_date is not None else "default",
+                    end_date if end_date is not None else "default",
+                    period,
                 )
                 raise GatewayQueryError(f"query failed: {e}") from e

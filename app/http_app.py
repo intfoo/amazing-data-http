@@ -11,6 +11,8 @@
 import logging
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
@@ -23,15 +25,58 @@ from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, Amazin
 from app.health import HealthService
 from app.kline_service import KlineService
 
+# 配置 amazingdata 命名空间日志：带时间戳，独立于 uvicorn 默认日志配置。
+# propagate=False 防止 uvicorn 启动重配 root 后重复输出；
+# 幂等判断 handlers 避免热重载或多次 import 重复添加。
+_ad_root = logging.getLogger("amazingdata")
+if not _ad_root.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _ad_root.addHandler(_h)
+    _ad_root.setLevel(logging.INFO)
+    _ad_root.propagate = False
+
 logger = logging.getLogger("amazingdata.http")
+
+
+def _align_uvicorn_log_format() -> None:
+    """给 uvicorn 的 access/error logger 加时间戳前缀，与 amazingdata 日志对齐。
+
+    uvicorn 默认 formatter 用 levelprefix（INFO→"INFO:"），不含时间。
+    此处在 startup（uvicorn log_config 已 apply 之后）替换为带 %(asctime)s 的同类
+    formatter，保留 levelprefix/client_addr/request_line 等 uvicorn 自定义字段。
+    延迟 import uvicorn 避免无 uvicorn 环境（如纯 pytest）import 失败。
+    """
+    try:
+        from uvicorn.logging import AccessFormatter, DefaultFormatter
+    except ImportError:
+        return
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    # uvicorn.access：访问日志，格式同默认但加时间前缀
+    for h in logging.getLogger("uvicorn.access").handlers:
+        if isinstance(h.formatter, AccessFormatter):
+            h.setFormatter(AccessFormatter(
+                fmt='%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+                datefmt=datefmt,
+            ))
+    # uvicorn：启动/错误日志
+    for h in logging.getLogger("uvicorn").handlers:
+        if isinstance(h.formatter, DefaultFormatter):
+            h.setFormatter(DefaultFormatter(
+                fmt="%(asctime)s %(levelprefix)s %(name)s - %(message)s",
+                datefmt=datefmt,
+            ))
 
 
 class DailyRequest(BaseModel):
     """POST /daily 请求体。字段名与主项目自定义数据源协议一致。"""
 
-    symbols: list[str]     # 股票代码列表，如 ["000001.SZ", "600000.SH"]
-    start_time: str        # 开始日期，YYYY-MM-DD
-    end_time: str          # 结束日期，YYYY-MM-DD
+    symbols: list[str]              # 股票代码列表，如 ["000001.SZ", "600000.SH"]
+    start_time: str | None = None   # 开始日期，YYYY-MM-DD 或 ISO datetime（如 2024-01-01T00:00:00）；可选
+    end_time: str | None = None     # 结束日期，同上；可选
 
     @field_validator("symbols")
     @classmethod
@@ -66,7 +111,12 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
 
     @app.on_event("startup")
     async def startup_login():
-        """启动时尝试登录 SDK。配置缺失则跳过，/health 将返回 503。"""
+        """启动时尝试登录 SDK。配置缺失则跳过，/health 将返回 503。
+
+        同时重配 uvicorn 日志 formatter 加时间戳，与 amazingdata 日志格式对齐
+        （uvicorn 在触发 startup 前已完成自身 log_config，此时改 formatter 即生效）。
+        """
+        _align_uvicorn_log_format()
         if config.is_configured():
             try:
                 gateway.login()
@@ -76,6 +126,20 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 logger.error("gateway login failed on startup: %s: %s", type(e).__name__, e)
         else:
             logger.warning("config incomplete, skipping startup login")
+
+    @app.on_event("shutdown")
+    async def shutdown_logout():
+        """进程退出时登出 SDK，释放服务端连接。
+
+        docker stop / Ctrl+C 发 SIGTERM，uvicorn 优雅退出触发 shutdown 事件，
+        此时调 gateway.logout() 释放 SDK 连接，避免服务端连接累积超限
+        （TGW 报 "Connections of this user exceed the max limitation"）。
+        """
+        try:
+            gateway.logout()
+            logger.info("gateway logout on shutdown")
+        except Exception as e:
+            logger.warning("gateway logout failed on shutdown: %s: %s", type(e).__name__, e)
 
     @app.get("/health")
     async def health():
@@ -87,11 +151,15 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
 
     @app.post("/daily")
     async def daily(req: DailyRequest, request: Request):
-        """日 K 查询。返回 {"data": [...]}，空结果也是 200 + {"data": []}。"""
+        """日 K 查询。返回 {"data": [...]}，空结果也是 200 + {"data": []}。
+
+        start_time / end_time 可选；未传时由 SDK 使用默认区间。
+        日期格式校验与 start<=end 校验在 KlineService 内完成，ValueError 转 422。
+        """
+        logger.info("request_id=%s /daily symbols=%d %s..%s",
+                    get_request_id(request), len(req.symbols),
+                    req.start_time or "(default)", req.end_time or "(default)")
         try:
-            # ISO 日期字符串比较等价于日期比较（YYYY-MM-DD 格式天然有序）
-            if req.start_time > req.end_time:
-                raise AppError(INVALID_REQUEST, "start_time must not be later than end_time", 422)
             data = kline_service.query(req.symbols, req.start_time, req.end_time)
             return {"data": data}
         except AppError:
@@ -119,6 +187,23 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"code": exc.code, "message": exc.message, "request_id": request_id}},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        """请求体校验失败（422）：记录详细错误与原始 body，返回统一错误信封。"""
+        request_id = get_request_id(request)
+        errors = exc.errors()
+        logger.warning("request_id=%s validation failed: errors=%s body=%s",
+                       request_id, errors, repr(exc.body)[:500])
+        return JSONResponse(
+            status_code=422,
+            content={"error": {
+                "code": INVALID_REQUEST,
+                "message": "请求体校验失败",
+                "errors": jsonable_encoder(errors),
+                "request_id": request_id,
+            }},
         )
 
     return app

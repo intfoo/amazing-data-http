@@ -29,6 +29,44 @@ def test_daily_success():
     assert body["data"][0]["close"] == 10.3
 
 
+def test_daily_iso_datetime_format():
+    """ISO datetime 格式应被接受并截断为日期。"""
+    client = make_test_app()
+    resp = client.post("/daily", json={
+        "symbols": ["000001.SZ"],
+        "start_time": "2024-01-02T00:00:00",
+        "end_time": "2024-01-02T23:59:59",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["data"]) == 1
+    assert body["data"][0]["code"] == "000001.SZ"
+
+
+def test_daily_optional_dates_both_missing():
+    """不传 start_time/end_time 应使用 SDK 默认区间，返回 200。"""
+    client = make_test_app()
+    resp = client.post("/daily", json={"symbols": ["000001.SZ"]})
+    assert resp.status_code == 200
+    assert "data" in resp.json()
+
+
+def test_daily_optional_dates_one_side():
+    """只传一端时间应接受，另一端用 SDK 默认。"""
+    client = make_test_app()
+    resp = client.post("/daily", json={
+        "symbols": ["000001.SZ"],
+        "start_time": "2024-01-01",
+    })
+    assert resp.status_code == 200
+
+    resp = client.post("/daily", json={
+        "symbols": ["000001.SZ"],
+        "end_time": "2024-12-31",
+    })
+    assert resp.status_code == 200
+
+
 def test_daily_empty_result():
     gw = FakeGateway(ready=True)
     client = make_test_app(gateway=gw)
@@ -66,7 +104,7 @@ def test_daily_invalid_date_format():
     client = make_test_app()
     resp = client.post("/daily", json={
         "symbols": ["000001.SZ"],
-        "start_time": "20240101",
+        "start_time": "2025/07/14",  # 斜杠分隔非 ISO
         "end_time": "2024-01-31",
     })
     assert resp.status_code == 422
@@ -133,3 +171,17 @@ def test_health_no_secrets_in_response():
     resp = client.get("/health")
     body_text = resp.text
     assert "password" not in body_text.lower()
+
+
+def test_daily_validation_error_envelope():
+    """422 校验失败应返回统一错误信封（含 code/errors/request_id）。
+
+    时间参数已改为可选，这里用空 body 触发 symbols 必填校验失败。
+    """
+    client = make_test_app()
+    resp = client.post("/daily", json={})  # 缺 symbols
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "INVALID_REQUEST"
+    assert "errors" in body["error"]
+    assert "request_id" in body["error"]
