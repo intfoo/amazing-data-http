@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -179,3 +181,151 @@ def test_query_minute_default_period_is_day():
     svc = KlineService(gw)
     svc.query(["000001.SZ"], "2024-01-01", "2024-01-31")
     assert gw.query_calls[0]["period"] == "day"
+
+
+def test_query_day_truncates_kline_time_to_date():
+    """日 K 的 kline_time 应截断为 yyyy-MM-dd（不含时分秒）。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02")
+    assert len(data) == 1
+    # make_daily_df 的 kline_time 是 Timestamp "2024-01-02T00:00:00"
+    # serializer 转为 "2024-01-02T00:00:00"，日 K 截断后应为 "2024-01-02"
+    assert data[0]["kline_time"] == "2024-01-02"
+
+
+def test_query_minute_keeps_kline_time_full_datetime():
+    """分钟K的 kline_time 保留完整 datetime（不截断）。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02", period="min5")
+    assert len(data) == 1
+    # 分钟周期不截断，保留 serializer 输出的 ISO 字符串
+    assert data[0]["kline_time"] == "2024-01-02T00:00:00"
+
+
+def test_query_day_truncates_kline_time_idempotent_for_date_only():
+    """kline_time 已是 yyyy-MM-dd 格式时截断幂等（不破坏）。"""
+    df = pd.DataFrame({
+        "code": ["000001.SZ"],
+        "kline_time": [pd.Timestamp("2024-01-02")],
+        "open": [10.2],
+        "close": [10.3],
+    })
+    gw = FakeGateway(ready=True, result={"000001.SZ": df})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02")
+    assert data[0]["kline_time"] == "2024-01-02"
+
+
+def test_query_day_kline_time_none_preserved():
+    """kline_time 为 None（NaT）时保持 None，不抛异常。"""
+    df = pd.DataFrame({
+        "code": ["000001.SZ"],
+        "kline_time": [pd.NaT],
+        "open": [10.2],
+        "close": [10.3],
+    })
+    gw = FakeGateway(ready=True, result={"000001.SZ": df})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02")
+    assert data[0]["kline_time"] is None
+
+
+def test_query_minute_adds_kline_time_utc():
+    """分钟K应附加 kline_time_utc（视为 UTC+8 转 UTC，带 Z 后缀）。"""
+    df = pd.DataFrame({
+        "code": ["000001.SZ"],
+        "kline_time": [pd.Timestamp("2024-01-02T09:30:00")],
+        "open": [10.2],
+        "close": [10.3],
+    })
+    gw = FakeGateway(ready=True, result={"000001.SZ": df})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02", period="min5")
+    row = data[0]
+    # kline_time 保留原 ISO 字符串；kline_time_utc 为 UTC（09:30 UTC+8 → 01:30）
+    assert row["kline_time"] == "2024-01-02T09:30:00"
+    assert row["kline_time_utc"] == "2024-01-02T01:30:00"
+    # kline_time_utc 应紧跟 kline_time 之后
+    keys = list(row.keys())
+    assert keys.index("kline_time_utc") == keys.index("kline_time") + 1
+
+
+def test_query_day_has_no_kline_time_utc():
+    """日 K 不应附加 kline_time_utc 字段。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02")
+    assert "kline_time_utc" not in data[0]
+
+
+def test_query_minute_kline_time_nat_utc_is_none():
+    """分钟K的 kline_time 为 NaT 时，kline_time_utc 应为 None。"""
+    df = pd.DataFrame({
+        "code": ["000001.SZ"],
+        "kline_time": [pd.NaT],
+        "open": [10.2],
+        "close": [10.3],
+    })
+    gw = FakeGateway(ready=True, result={"000001.SZ": df})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02", period="min5")
+    assert data[0]["kline_time"] is None
+    assert data[0]["kline_time_utc"] is None
+
+
+def test_query_minute_midnight_crosses_day_boundary():
+    """kline_time 00:00 UTC+8 应转为前一天 16:00Z（跨日边界）。"""
+    df = pd.DataFrame({
+        "code": ["000001.SZ"],
+        "kline_time": [pd.Timestamp("2024-01-02T00:00:00")],
+        "open": [10.2],
+        "close": [10.3],
+    })
+    gw = FakeGateway(ready=True, result={"000001.SZ": df})
+    svc = KlineService(gw)
+    data = svc.query(["000001.SZ"], "2024-01-02", "2024-01-02", period="min1")
+    assert data[0]["kline_time_utc"] == "2024-01-01T16:00:00"
+
+
+def test_query_minute_default_range_last_year():
+    """minute 不传日期时默认 begin_date 为近一年，end_date 为 None（取到最新）。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"], period="min1")  # 不传 start_time/end_time
+    call = gw.query_calls[0]
+    assert call["begin_date"] is not None
+    expected = int((datetime.now() - timedelta(days=365)).strftime("%Y%m%d"))
+    assert abs(call["begin_date"] - expected) <= 1  # 允许 1 天误差
+    assert call["end_date"] is None
+
+
+def test_query_day_default_uses_sdk_default():
+    """day 不传日期时 begin_date/end_date 为 None（SDK 默认 20240101~20991231）。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"])  # period 默认 day
+    call = gw.query_calls[0]
+    assert call["begin_date"] is None
+    assert call["end_date"] is None
+
+
+def test_query_minute_with_dates_overrides_default():
+    """minute 传了日期时用用户日期，不应用默认近一年。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"], "2024-06-01", "2024-06-30", period="min5")
+    call = gw.query_calls[0]
+    assert call["begin_date"] == 20240601
+    assert call["end_date"] == 20240630
+
+
+def test_query_minute_only_start_still_applies_default_end():
+    """minute 只传 start_time 时 begin 用用户值，end_date 为 None。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"], start_time="2025-01-01", period="min5")
+    call = gw.query_calls[0]
+    assert call["begin_date"] == 20250101
+    assert call["end_date"] is None

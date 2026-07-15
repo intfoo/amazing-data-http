@@ -48,14 +48,14 @@ class Gateway(Protocol):
     def is_ready(self) -> bool: ...
     def query_kline(
         self,
-        symbols: list[str],
+        codes: list[str],
         begin_date: int | None,
         end_date: int | None,
         period: str,
     ) -> dict[str, pd.DataFrame]: ...
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]: ...
     def query_snapshot(
-        self, symbols: list[str], trade_date: int | None = None
+        self, codes: list[str], trade_date: int | None = None
     ) -> dict[str, pd.DataFrame]: ...
     def start_snapshot_subscription(
         self, code_list: list[str], on_data, on_error=None
@@ -180,7 +180,7 @@ class AmazingDataGateway:
 
     def query_snapshot(
         self,
-        symbols: list[str],
+        codes: list[str],
         trade_date: int | None = None,
     ) -> dict[str, "pd.DataFrame"]:
         """查询历史快照。返回 {code: DataFrame}（每只股票当日全部快照行，按时间排列）。
@@ -198,11 +198,11 @@ class AmazingDataGateway:
         with self._lock:
             try:
                 result = self._market_data.query_snapshot(
-                    symbols, begin_date=trade_date, end_date=trade_date
+                    codes, begin_date=trade_date, end_date=trade_date
                 )
             except Exception as e:
-                logger.error("query_snapshot failed: %s: %s (symbols=%d, date=%s)",
-                             type(e).__name__, e, len(symbols), trade_date)
+                logger.error("query_snapshot failed: %s: %s (codes=%d, date=%s)",
+                             type(e).__name__, e, len(codes), trade_date)
                 raise GatewayQueryError(f"query_snapshot failed: {e}") from e
         # 展平嵌套 {date: {code: DataFrame}} → {code: DataFrame}
         flat: dict[str, pd.DataFrame] = {}
@@ -218,7 +218,7 @@ class AmazingDataGateway:
 
     def query_kline(
         self,
-        symbols: list[str],
+        codes: list[str],
         begin_date: int | None,
         end_date: int | None,
         period: str,
@@ -250,13 +250,13 @@ class AmazingDataGateway:
 
         with self._lock:
             try:
-                result = self._market_data.query_kline(symbols, **kwargs)
+                result = self._market_data.query_kline(codes, **kwargs)
                 return result if isinstance(result, dict) else {"_all": result}
             except Exception as e:
                 # 日志记录上下文（代码数量、日期区间），不记录完整代码列表和密码
                 logger.error(
-                    "query_kline failed: %s: %s (symbols=%d, begin=%s, end=%s, period=%s)",
-                    type(e).__name__, e, len(symbols),
+                    "query_kline failed: %s: %s (codes=%d, begin=%s, end=%s, period=%s)",
+                    type(e).__name__, e, len(codes),
                     begin_date if begin_date is not None else "default",
                     end_date if end_date is not None else "default",
                     period,

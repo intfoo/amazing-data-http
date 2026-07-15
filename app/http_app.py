@@ -9,6 +9,8 @@
 """
 
 import logging
+import threading
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -23,7 +25,7 @@ from app.errors import (
 )
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, AmazingDataGateway
 from app.health import HealthService
-from app.kline_service import KlineService
+from app.kline_service import KlineService, MINUTE_PERIODS
 from app.realtime_service import RealtimeService
 
 # 配置 amazingdata 命名空间日志：带时间戳，独立于 uvicorn 默认日志配置。
@@ -75,35 +77,32 @@ def _align_uvicorn_log_format() -> None:
 class DailyRequest(BaseModel):
     """POST /daily 请求体。字段名与主项目自定义数据源协议一致。"""
 
-    symbols: list[str]              # 股票代码列表，如 ["000001.SZ", "600000.SH"]
+    codes: list[str]                # 股票代码列表，如 ["000001.SZ", "600000.SH"]
     start_time: str | None = None   # 开始日期，YYYY-MM-DD 或 ISO datetime（如 2024-01-01T00:00:00）；可选
     end_time: str | None = None     # 结束日期，同上；可选
 
-    @field_validator("symbols")
+    @field_validator("codes")
     @classmethod
-    def symbols_nonempty(cls, v):
-        """symbols 必须是非空数组，Pydantic 校验失败自动返回 422。"""
+    def codes_nonempty(cls, v):
+        """codes 必须是非空数组，Pydantic 校验失败自动返回 422。"""
         if not v or len(v) == 0:
-            raise ValueError("symbols must be a non-empty array")
+            raise ValueError("codes must be a non-empty array")
         return v
-
-
-MINUTE_PERIODS = {"min1", "min3", "min5", "min10", "min15", "min30", "min60", "min120"}
 
 
 class MinuteRequest(BaseModel):
     """POST /minute 请求体。period 可选，默认 min1。"""
 
-    symbols: list[str]
+    codes: list[str]
     period: str | None = None
     start_time: str | None = None
     end_time: str | None = None
 
-    @field_validator("symbols")
+    @field_validator("codes")
     @classmethod
-    def symbols_nonempty(cls, v):
+    def codes_nonempty(cls, v):
         if not v or len(v) == 0:
-            raise ValueError("symbols must be a non-empty array")
+            raise ValueError("codes must be a non-empty array")
         return v
 
 
@@ -143,17 +142,33 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             try:
                 gateway.login()
                 logger.info("gateway login succeeded on startup")
-                try:
-                    code_list = gateway.get_code_list(security_type="EXTRA_STOCK_A")
-                    gateway.start_snapshot_subscription(
-                        code_list,
-                        on_data=realtime_service.on_snapshot,
-                        on_error=realtime_service.on_subscription_error,
-                    )
-                    realtime_service.set_active(True)
-                    logger.info("realtime subscription started: %d symbols", len(code_list))
-                except Exception as e:
-                    logger.error("realtime subscription start failed: %s: %s", type(e).__name__, e)
+                # 订阅初始化（get_code_list + register）移到后台线程，不阻塞 startup。
+                # 此步在生产环境约 10~20s（5529 代码 get_code_list + register），
+                # 移到后台后 uvicorn 立即就绪接受请求；/realtime 在订阅就绪前走
+                # fallback（查当日历史快照），不影响可用性。
+                def _init_subscription():
+                    t0 = time.monotonic()
+                    try:
+                        code_list = gateway.get_code_list(security_type="EXTRA_STOCK_A")
+                        t1 = time.monotonic()
+                        gateway.start_snapshot_subscription(
+                            code_list,
+                            on_data=realtime_service.on_snapshot,
+                            on_error=realtime_service.on_subscription_error,
+                        )
+                        realtime_service.set_active(True)
+                        t2 = time.monotonic()
+                        logger.info(
+                            "realtime subscription started: %d symbols "
+                            "(get_code_list=%.3fs subscribe=%.3fs)",
+                            len(code_list), t1 - t0, t2 - t1,
+                        )
+                    except Exception as e:
+                        logger.error("realtime subscription start failed: %s: %s", type(e).__name__, e)
+                app.state.subscription_thread = threading.Thread(
+                    target=_init_subscription, daemon=True, name="sub-init"
+                )
+                app.state.subscription_thread.start()
             except Exception as e:
                 # 登录失败不阻止启动，使 /health 能暴露诊断
                 logger.error("gateway login failed on startup: %s: %s", type(e).__name__, e)
@@ -168,6 +183,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         此时调 gateway.logout() 释放 SDK 连接，避免服务端连接累积超限
         （TGW 报 "Connections of this user exceed the max limitation"）。
         """
+        # 等待 subscription 初始化线程完成，避免 stop_subscription 在
+        # start_snapshot_subscription 之前调用导致状态不一致
+        sub_thread = getattr(app.state, "subscription_thread", None)
+        if sub_thread and sub_thread.is_alive():
+            sub_thread.join(timeout=10)
         try:
             gateway.stop_subscription()
         except Exception as e:
@@ -193,11 +213,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         start_time / end_time 可选；未传时由 SDK 使用默认区间。
         日期格式校验与 start<=end 校验在 KlineService 内完成，ValueError 转 422。
         """
-        logger.info("request_id=%s /daily symbols=%d %s..%s",
-                    get_request_id(request), len(req.symbols),
+        logger.info("request_id=%s /daily codes=%d %s..%s",
+                    get_request_id(request), len(req.codes),
                     req.start_time or "(default)", req.end_time or "(default)")
         try:
-            data = kline_service.query(req.symbols, req.start_time, req.end_time)
+            data = kline_service.query(req.codes, req.start_time, req.end_time)
             return {"data": data}
         except AppError:
             raise
@@ -222,11 +242,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         period = req.period or "min1"
         if period not in MINUTE_PERIODS:
             raise AppError(INVALID_REQUEST, f"unsupported period: {period}", 422)
-        logger.info("request_id=%s /minute symbols=%d period=%s %s..%s",
-                    get_request_id(request), len(req.symbols), period,
+        logger.info("request_id=%s /minute codes=%d period=%s %s..%s",
+                    get_request_id(request), len(req.codes), period,
                     req.start_time or "(default)", req.end_time or "(default)")
         try:
-            data = kline_service.query(req.symbols, req.start_time, req.end_time, period=period)
+            data = kline_service.query(req.codes, req.start_time, req.end_time, period=period)
             return {"data": data}
         except AppError:
             raise
@@ -245,20 +265,20 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             raise AppError(INTERNAL_ERROR, str(e), 500)
 
     @app.get("/realtime")
-    async def realtime(request: Request, symbols: str | None = None):
+    async def realtime(request: Request, codes: str | None = None):
         """实时行情快照。优先读订阅缓存（盘中实时），缓存空时 fallback 查当日历史快照。
 
-        symbols 为逗号分隔的代码字符串（如 ?symbols=000001.SZ,600000.SH），
+        codes 为逗号分隔的代码字符串（如 ?codes=000001.SZ,600000.SH），
         从全市场缓存中过滤返回；不传则返回全市场。
         """
-        logger.info("request_id=%s /realtime symbols=%s", get_request_id(request), symbols or "(all)")
-        sym_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else None
+        logger.info("request_id=%s /realtime codes=%s", get_request_id(request), codes or "(all)")
+        code_list = [s.strip() for s in codes.split(",") if s.strip()] if codes else None
         # 优先读订阅缓存（盘中实时推送的数据）
-        data = realtime_service.snapshot(sym_list)
+        data = realtime_service.snapshot(code_list)
         if not data:
             # 缓存空（非交易时段/订阅未推送），fallback 查当日历史快照
             try:
-                data = realtime_service.fallback_snapshot(sym_list)
+                data = realtime_service.fallback_snapshot(code_list)
             except GatewayNotReadyError as e:
                 raise AppError(SDK_NOT_READY, str(e), 503)
             except Exception as e:

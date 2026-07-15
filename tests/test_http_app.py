@@ -17,7 +17,7 @@ def make_test_app(gateway=None):
 def test_daily_success():
     client = make_test_app()
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-02",
         "end_time": "2024-01-02",
     })
@@ -29,11 +29,63 @@ def test_daily_success():
     assert body["data"][0]["close"] == 10.3
 
 
+def test_daily_kline_time_is_date_only():
+    """daily 接口的 kline_time 应返回 yyyy-MM-dd 格式（不含时分秒）。"""
+    client = make_test_app()
+    resp = client.post("/daily", json={
+        "codes": ["000001.SZ"],
+        "start_time": "2024-01-02",
+        "end_time": "2024-01-02",
+    })
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["kline_time"] == "2024-01-02"
+
+
+def test_minute_kline_time_keeps_full_datetime():
+    """minute 接口的 kline_time 保留完整 datetime（含时分秒）。"""
+    client = make_test_app()
+    resp = client.post("/minute", json={
+        "codes": ["000001.SZ"], "period": "min5",
+        "start_time": "2024-01-02", "end_time": "2024-01-02",
+    })
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["kline_time"] == "2024-01-02T00:00:00"
+
+
+def test_minute_kline_time_utc_present():
+    """minute 接口响应应包含 kline_time_utc 字段（UTC，带 Z 后缀）。
+
+    make_daily_df 的 kline_time 是 00:00:00（UTC+8），转 UTC 为前一天 16:00Z。
+    """
+    client = make_test_app()
+    resp = client.post("/minute", json={
+        "codes": ["000001.SZ"], "period": "min5",
+        "start_time": "2024-01-02", "end_time": "2024-01-02",
+    })
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["kline_time_utc"] == "2024-01-01T16:00:00"
+
+
+def test_daily_no_kline_time_utc_field():
+    """daily 接口响应不应包含 kline_time_utc 字段。"""
+    client = make_test_app()
+    resp = client.post("/daily", json={
+        "codes": ["000001.SZ"],
+        "start_time": "2024-01-02", "end_time": "2024-01-02",
+    })
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert "kline_time_utc" not in row
+
+
 def test_daily_iso_datetime_format():
     """ISO datetime 格式应被接受并截断为日期。"""
     client = make_test_app()
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-02T00:00:00",
         "end_time": "2024-01-02T23:59:59",
     })
@@ -46,7 +98,7 @@ def test_daily_iso_datetime_format():
 def test_daily_optional_dates_both_missing():
     """不传 start_time/end_time 应使用 SDK 默认区间，返回 200。"""
     client = make_test_app()
-    resp = client.post("/daily", json={"symbols": ["000001.SZ"]})
+    resp = client.post("/daily", json={"codes": ["000001.SZ"]})
     assert resp.status_code == 200
     assert "data" in resp.json()
 
@@ -55,13 +107,13 @@ def test_daily_optional_dates_one_side():
     """只传一端时间应接受，另一端用 SDK 默认。"""
     client = make_test_app()
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-01",
     })
     assert resp.status_code == 200
 
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "end_time": "2024-12-31",
     })
     assert resp.status_code == 200
@@ -71,7 +123,7 @@ def test_daily_empty_result():
     gw = FakeGateway(ready=True)
     client = make_test_app(gateway=gw)
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-01",
         "end_time": "2024-01-31",
     })
@@ -82,7 +134,7 @@ def test_daily_empty_result():
 def test_daily_empty_symbols():
     client = make_test_app()
     resp = client.post("/daily", json={
-        "symbols": [],
+        "codes": [],
         "start_time": "2024-01-01",
         "end_time": "2024-01-31",
     })
@@ -92,7 +144,7 @@ def test_daily_empty_symbols():
 def test_daily_reversed_dates():
     client = make_test_app()
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-31",
         "end_time": "2024-01-01",
     })
@@ -103,7 +155,7 @@ def test_daily_reversed_dates():
 def test_daily_invalid_date_format():
     client = make_test_app()
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2025/07/14",  # 斜杠分隔非 ISO
         "end_time": "2024-01-31",
     })
@@ -114,7 +166,7 @@ def test_daily_sdk_not_ready():
     gw = FakeGateway(ready=False)
     client = make_test_app(gateway=gw)
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-01",
         "end_time": "2024-01-31",
     })
@@ -126,7 +178,7 @@ def test_daily_sdk_query_failed():
     gw = FakeGateway(ready=True, result=None)
     client = make_test_app(gateway=gw)
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-01",
         "end_time": "2024-01-31",
     })
@@ -138,7 +190,7 @@ def test_daily_error_has_request_id():
     gw = FakeGateway(ready=False)
     client = make_test_app(gateway=gw)
     resp = client.post("/daily", json={
-        "symbols": ["000001.SZ"],
+        "codes": ["000001.SZ"],
         "start_time": "2024-01-01",
         "end_time": "2024-01-31",
     })
@@ -190,7 +242,7 @@ def test_daily_validation_error_envelope():
 def test_minute_success():
     client = make_test_app()
     resp = client.post("/minute", json={
-        "symbols": ["000001.SZ"], "period": "min5",
+        "codes": ["000001.SZ"], "period": "min5",
         "start_time": "2024-01-02", "end_time": "2024-01-02",
     })
     assert resp.status_code == 200
@@ -200,21 +252,21 @@ def test_minute_success():
 def test_minute_default_period_min1():
     client = make_test_app()
     resp = client.post("/minute", json={
-        "symbols": ["000001.SZ"], "start_time": "2024-01-02", "end_time": "2024-01-02",
+        "codes": ["000001.SZ"], "start_time": "2024-01-02", "end_time": "2024-01-02",
     })
     assert resp.status_code == 200
 
 
 def test_minute_invalid_period():
     client = make_test_app()
-    resp = client.post("/minute", json={"symbols": ["000001.SZ"], "period": "day"})
+    resp = client.post("/minute", json={"codes": ["000001.SZ"], "period": "day"})
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "INVALID_REQUEST"
 
 
 def test_minute_empty_symbols():
     client = make_test_app()
-    resp = client.post("/minute", json={"symbols": []})
+    resp = client.post("/minute", json={"codes": []})
     assert resp.status_code == 422
 
 
@@ -271,7 +323,7 @@ def test_realtime_active_returns_data():
 
 
 def test_realtime_symbols_filter():
-    """GET /realtime?symbols=000001.SZ 只返回指定 code 的快照；不传返回全市场。"""
+    """GET /realtime?codes=000001.SZ 只返回指定 code 的快照；不传返回全市场。"""
     from dataclasses import dataclass
     from datetime import datetime
     from app.http_app import create_app
@@ -304,16 +356,16 @@ def test_realtime_symbols_filter():
     assert resp.status_code == 200
     assert len(resp.json()["data"]) == 2
     # 传单个 symbols 只返回指定 code
-    resp = client.get("/realtime?symbols=000001.SZ")
+    resp = client.get("/realtime?codes=000001.SZ")
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["data"]) == 1
     assert body["data"][0]["code"] == "000001.SZ"
     # 传多个 symbols（逗号分隔）
-    resp = client.get("/realtime?symbols=000001.SZ,600000.SH")
+    resp = client.get("/realtime?codes=000001.SZ,600000.SH")
     assert len(resp.json()["data"]) == 2
     # 传不存在的 code 返回空数组
-    resp = client.get("/realtime?symbols=999999.SZ")
+    resp = client.get("/realtime?codes=999999.SZ")
     assert resp.json() == {"data": []}
 
 
@@ -331,6 +383,10 @@ def test_realtime_startup_activates_subscription():
     config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
+        # subscription 初始化在后台线程，join 等待完成后再断言
+        sub_thread = getattr(app.state, "subscription_thread", None)
+        if sub_thread:
+            sub_thread.join(timeout=5)
         # startup 已执行：FakeGateway.start_snapshot_subscription 被调用 + set_active(True)
         assert gw.sub_start_called == 1
         assert app.state.realtime_service.is_active() is True
@@ -350,6 +406,10 @@ def test_realtime_not_active_after_startup_failure():
     config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
+        # subscription 初始化在后台线程，join 等待完成（异常被 catch，is_active 保持 False）
+        sub_thread = getattr(app.state, "subscription_thread", None)
+        if sub_thread:
+            sub_thread.join(timeout=5)
         # startup 中 get_code_list 抛异常被 try/except 捕获，is_active 保持 False
         assert app.state.realtime_service.is_active() is False
         # /realtime fallback：get_code_list 抛 RuntimeError（非 GatewayNotReadyError）→ 返回空

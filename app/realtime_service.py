@@ -46,17 +46,17 @@ class RealtimeService:
         self._active = False
         logger.error("realtime subscription deactivated due to error: %s", err)
 
-    def snapshot(self, symbols: list[str] | None = None) -> list[dict]:
+    def snapshot(self, codes: list[str] | None = None) -> list[dict]:
         """GET /realtime 读缓存，返回快照列表。
 
-        symbols 为 None 时返回全市场快照；非空时只返回指定 code 的快照
+        codes 为 None 时返回全市场快照；非空时只返回指定 code 的快照
         （从全市场缓存中过滤，不触发额外订阅）。
         对每个缓存 dict 做浅拷贝（dict(v)），避免外部序列化修改污染缓存。
         """
         with self._lock:
-            if symbols is None:
+            if codes is None:
                 return [dict(v) for v in self._cache.values()]
-            wanted = set(symbols)
+            wanted = set(codes)
             return [dict(v) for code, v in self._cache.items() if code in wanted]
 
     def is_active(self) -> bool:
@@ -65,17 +65,17 @@ class RealtimeService:
     def set_active(self, active: bool) -> None:
         self._active = active
 
-    def fallback_snapshot(self, symbols: list[str] | None = None) -> list[dict]:
+    def fallback_snapshot(self, codes: list[str] | None = None) -> list[dict]:
         """订阅缓存为空时的 fallback：用 query_snapshot 查当日历史快照。
 
         取每只股票的最后一行（最新/收盘快照）序列化返回。
         结果带 FALLBACK_TTL 秒缓存，避免每次请求都查 SDK（全市场查询较慢）。
-        symbols 过滤在缓存结果上应用。查询失败返回空列表（不抛异常，让 /realtime 返回空）。
+        codes 过滤在缓存结果上应用。查询失败返回空列表（不抛异常，让 /realtime 返回空）。
         """
         now = time.time()
         if self._fallback_cache is None or now - self._fallback_time > FALLBACK_TTL:
             try:
-                code_list = symbols if symbols else self._gw.get_code_list()
+                code_list = codes if codes else self._gw.get_code_list()
             except GatewayNotReadyError:
                 raise  # SDK 未就绪，传播给路由转 503
             except Exception as e:
@@ -97,9 +97,9 @@ class RealtimeService:
             self._fallback_cache = records
             self._fallback_time = now
             logger.info("fallback query_snapshot: %d records cached", len(records))
-        # 在缓存上按 symbols 过滤
-        if symbols:
-            wanted = set(symbols)
+        # 在缓存上按 codes 过滤
+        if codes:
+            wanted = set(codes)
             return [r for r in self._fallback_cache if r.get("code") in wanted]
         return list(self._fallback_cache)
 

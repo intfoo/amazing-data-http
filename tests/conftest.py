@@ -35,9 +35,9 @@ class FakeGateway:
     def is_ready(self) -> bool:
         return self._ready
 
-    def query_kline(self, symbols, begin_date, end_date, period):
+    def query_kline(self, codes, begin_date, end_date, period):
         self.query_calls.append({
-            "symbols": symbols,
+            "codes": codes,
             "begin_date": begin_date,
             "end_date": end_date,
             "period": period,
@@ -53,12 +53,12 @@ class FakeGateway:
             raise GatewayNotReadyError("fake not ready")
         return list(self._code_list)
 
-    def query_snapshot(self, symbols, trade_date=None):
+    def query_snapshot(self, codes, trade_date=None):
         """FakeGateway 快照查询：未就绪抛 GatewayNotReadyError，否则返回空 dict。"""
         if not self._ready:
             raise GatewayNotReadyError("fake not ready")
         self.snapshot_query_calls = getattr(self, "snapshot_query_calls", [])
-        self.snapshot_query_calls.append({"symbols": symbols, "trade_date": trade_date})
+        self.snapshot_query_calls.append({"codes": codes, "trade_date": trade_date})
         return {}
 
     def start_snapshot_subscription(self, code_list, on_data, on_error=None):
@@ -74,6 +74,7 @@ def make_daily_df(code: str = "000001.SZ", rows: int = 1) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "code": [code] * rows,
+            "kline_time": list(dates),  # Timestamp，反映真实 SDK 返回结构（见 probe-report.json）
             "open": [10.2] * rows,
             "high": [10.45] * rows,
             "low": [10.1] * rows,

@@ -9,7 +9,7 @@
 **请求体**：
 ```json
 {
-  "symbols": ["000001.SZ", "600000.SH"],
+  "codes": ["000001.SZ", "600000.SH"],
   "start_time": "2024-01-01",
   "end_time": "2024-01-31"
 }
@@ -17,13 +17,13 @@
 
 | 字段 | 类型 | 约束 |
 |------|------|------|
-| `symbols` | string[] | 非空数组（必填） |
+| `codes` | string[] | 非空数组（必填） |
 | `start_time` | string | 可选。支持 `YYYY-MM-DD`、`YYYY-MM-DDTHH:MM:SS`、`YYYYMMDD` 等 ISO 格式；时间部分截断只取日期。缺省时由 SDK 使用默认起始日 `20240101` |
 | `end_time` | string | 可选。格式同上。缺省时由 SDK 使用默认结束日 `20991231`；仅当两者都提供时校验 `start_time <= end_time`（按日期比较） |
 
 **成功响应**（HTTP 200）：
 ```json
-{"data": [{"code": "000001.SZ", "kline_time": "2024-01-02T00:00:00", "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 1234567, "amount": 12700000.0}]}
+{"data": [{"code": "000001.SZ", "kline_time": "2024-01-02", "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 1234567, "amount": 12700000.0}]}
 ```
 
 响应 `data` 数组元素字段：
@@ -31,7 +31,7 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `code` | string | 证券代码+市场，如 `000001.SZ` |
-| `kline_time` | string | ISO datetime 行情时间。日K为 `2024-01-02T00:00:00` |
+| `kline_time` | string | 行情日期，`yyyy-MM-dd` 格式（日K只到日期，不含时分秒） |
 | `open` | float | 开盘价 |
 | `high` | float | 最高价 |
 | `low` | float | 最低价 |
@@ -48,7 +48,7 @@
 **请求体**：
 ```json
 {
-  "symbols": ["000001.SZ", "600000.SH"],
+  "codes": ["000001.SZ", "600000.SH"],
   "period": "min5",
   "start_time": "2024-01-02",
   "end_time": "2024-01-02"
@@ -57,22 +57,23 @@
 
 | 字段 | 类型 | 约束 |
 |------|------|------|
-| `symbols` | string[] | 非空数组（必填） |
+| `codes` | string[] | 非空数组（必填） |
 | `period` | string | 可选。白名单 `min1/min3/min5/min10/min15/min30/min60/min120`，默认 `min1`。非法值返回 422 |
-| `start_time` | string | 可选。支持 `YYYY-MM-DD`、`YYYY-MM-DDTHH:MM:SS`、`YYYYMMDD` 等 ISO 格式；时间部分截断只取日期。缺省时由 SDK 使用默认起始日 `20240101` |
+| `start_time` | string | 可选。支持 `YYYY-MM-DD`、`YYYY-MM-DDTHH:MM:SS`、`YYYYMMDD` 等 ISO 格式；时间部分截断只取日期。**`start_time` 与 `end_time` 均缺省时，`begin_date` 默认设为近一年（当前日期前 365 天），避免返回海量分钟数据**；仅传 `start_time` 时 `end_date` 用 SDK 默认（取到最新） |
 | `end_time` | string | 可选。格式同上。缺省时由 SDK 使用默认结束日 `20991231`；仅当两者都提供时校验 `start_time <= end_time`（按日期比较） |
 
 **成功响应**（HTTP 200）：
 ```json
-{"data": [{"code": "000001.SZ", "kline_time": "2024-01-02T09:30:00", "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 123456, "amount": 1270000.0}]}
+{"data": [{"code": "000001.SZ", "kline_time": "2024-01-02T09:30:00", "kline_time_utc": "2024-01-02T01:30:00", "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 123456, "amount": 1270000.0}]}
 ```
 
-响应 `data` 数组元素字段与 `/daily` 完全一致（SDK `query_kline` 对所有周期返回相同列）：
+响应 `data` 数组元素字段（基于 `/daily` 字段集，额外附加 `kline_time_utc`）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `code` | string | 证券代码+市场 |
-| `kline_time` | string | ISO datetime 行情时间。分钟K含时分，如 `2024-01-02T09:30:00` |
+| `kline_time` | string | ISO datetime 行情时间（交易所本地时间，UTC+8）。分钟K含时分，如 `2024-01-02T09:30:00` |
+| `kline_time_utc` | string | UTC 时间，`yyyy-MM-ddTHH:mm:ss` 格式，如 `2024-01-02T01:30:00`。由 `kline_time` 视为 UTC+8 转换而来，供跨时区客户端使用。`kline_time` 为 null 时此字段也为 null |
 | `open` | float | 开盘价 |
 | `high` | float | 最高价 |
 | `low` | float | 最低价 |
@@ -92,13 +93,13 @@
 
 | 参数 | 类型 | 约束 |
 |------|------|------|
-| `symbols` | string | 可选。逗号分隔的代码列表，如 `?symbols=000001.SZ,600000.SH`。不传返回全市场快照；传入则过滤返回指定代码。不触发额外订阅 |
+| `codes` | string | 可选。逗号分隔的代码列表，如 `?codes=000001.SZ,600000.SH`。不传返回全市场快照；传入则过滤返回指定代码。不触发额外订阅 |
 
 **示例**：
 ```
 GET /realtime                           # 全市场快照
-GET /realtime?symbols=000001.SZ         # 单个代码
-GET /realtime?symbols=000001.SZ,600000.SH   # 多个代码
+GET /realtime?codes=000001.SZ         # 单个代码
+GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
 ```
 
 **成功响应**（HTTP 200）：
