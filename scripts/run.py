@@ -36,14 +36,19 @@ def check_python_version():
 
 def pick_sdk_wheels():
     ver = sys.version_info[:2]
-    tgw = "tgw-1.0.8.7-py3-none-any.whl"
     if ver == (3, 13):
-        ad = "AmazingData-1.1.7-cp313-none-any.whl"
+        ad_tag = "cp313"
     elif ver == (3, 14):
-        ad = "AmazingData-1.1.7-cp314-none-any.whl"
+        ad_tag = "cp314"
     else:
         raise ValueError(f"unsupported python {ver}")
-    return [str(PROJECT_ROOT / tgw), str(PROJECT_ROOT / ad)]
+    tgw = list(PROJECT_ROOT.glob("tgw-*-py3-none-any.whl"))
+    ad = list(PROJECT_ROOT.glob(f"AmazingData-*-{ad_tag}-none-any.whl"))
+    if len(tgw) != 1:
+        raise FileNotFoundError(f"期望恰好 1 个 tgw wheel，找到 {[p.name for p in tgw]}")
+    if len(ad) != 1:
+        raise FileNotFoundError(f"期望恰好 1 个 {ad_tag} AmazingData wheel，找到 {[p.name for p in ad]}")
+    return [str(tgw[0]), str(ad[0])]
 
 
 def load_local_config(path):
@@ -287,15 +292,74 @@ def run_docker(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
     print("  若返回 503：docker compose logs amazingdata-http 查登录错误")
 
 
+def get_installed_sdk_versions():
+    """返回已安装的 tgw / AmazingData 版本字典，未安装则为 None。"""
+    versions = {"tgw": None, "AmazingData": None}
+    for name in versions:
+        try:
+            import importlib.metadata as md
+            versions[name] = md.version(name)
+        except Exception:
+            pass
+    return versions
+
+
+def run_install_sdk(install_fn=_pip_install, runner=subprocess.run, confirm_fn=confirm):
+    """强制重装本地 wheel 到当前 Python 环境（模式 3）。"""
+    try:
+        wheels = pick_sdk_wheels()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"找不到 wheel 文件：{e}")
+        sys.exit(1)
+
+    before = get_installed_sdk_versions()
+    print("当前已安装版本：")
+    print(f"  tgw          = {before['tgw'] or '<未安装>'}")
+    print(f"  AmazingData  = {before['AmazingData'] or '<未安装>'}")
+    print("将安装以下 wheel：")
+    for w in wheels:
+        print(f"  {Path(w).name}")
+
+    if not confirm_fn("确认强制重装（仅这两个 wheel，依赖只补缺不重装）？"):
+        print("已取消。")
+        sys.exit(0)
+
+    # --no-deps --force-reinstall：只重装这两个 wheel，不动依赖；
+    # 再跑一次不带 --force-reinstall 的 install 补齐缺失依赖（已装的不重装）
+    cmd1 = [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", *wheels]
+    cmd2 = [sys.executable, "-m", "pip", "install", *wheels]
+    print("正在重装 wheel（可能 1-2 分钟，请稍候）...")
+    rc = _rc(runner(cmd1, cwd=str(PROJECT_ROOT)))
+    if rc != 0:
+        print("重装失败。")
+        sys.exit(1)
+    print("正在补齐依赖（已装的不重装）...")
+    rc = _rc(runner(cmd2, cwd=str(PROJECT_ROOT)))
+    if rc != 0:
+        print("依赖补齐失败，SDK 已重装但依赖可能缺失。")
+        sys.exit(1)
+
+    after = get_installed_sdk_versions()
+    print("安装完成，当前版本：")
+    print(f"  tgw          = {after['tgw'] or '<未安装>'}")
+    print(f"  AmazingData  = {after['AmazingData'] or '<未安装>'}")
+    if before["tgw"] == after["tgw"] and before["AmazingData"] == after["AmazingData"]:
+        print("（版本未变化，可能 wheel 与当前已装版本相同）")
+    else:
+        print("（版本已更新）")
+
+
 def main():
     check_python_version()
     print(f"Python {sys.version.split()[0]}")
-    print("选择模式：1=本地真实 SDK  2=Docker 完整链路")
-    choice = input("模式 [1/2]: ").strip()
+    print("选择模式：1=本地真实 SDK  2=Docker 完整链路  3=更新/安装 SDK wheel")
+    choice = input("模式 [1/2/3]: ").strip()
     if choice == "1":
         run_local()
     elif choice == "2":
         run_docker()
+    elif choice == "3":
+        run_install_sdk()
     else:
         print("无效选择")
         sys.exit(1)

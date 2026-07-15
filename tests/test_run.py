@@ -305,3 +305,81 @@ def test_run_docker_probe_fail_continues_to_compose(monkeypatch, tmp_path):
                    confirm_fn=lambda p: True,
                    runner=fake_runner)
     assert next(seq, "done") == "done"
+
+
+def test_get_installed_sdk_versions_returns_dict():
+    run = _load_run()
+    versions = run.get_installed_sdk_versions()
+    assert "tgw" in versions
+    assert "AmazingData" in versions
+    # 值为 None 或字符串版本号
+    for v in versions.values():
+        assert v is None or isinstance(v, str)
+
+
+def test_run_install_sdk_no_wheel_exits(monkeypatch):
+    run = _load_run()
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0, "final", 0))
+    # pick_sdk_wheels 对不支持的 Python 版本 raise ValueError
+    with pytest.raises(SystemExit):
+        run.run_install_sdk(confirm_fn=lambda p: True)
+
+
+def test_run_install_sdk_cancel_exits(monkeypatch):
+    run = _load_run()
+    monkeypatch.setattr(sys, "version_info", (3, 13, 0, "final", 0))
+    # 用户选 n → SystemExit(0)
+    with pytest.raises(SystemExit) as exc_info:
+        run.run_install_sdk(confirm_fn=lambda p: False)
+    assert exc_info.value.code == 0
+
+
+def test_run_install_sdk_success(monkeypatch):
+    run = _load_run()
+    monkeypatch.setattr(sys, "version_info", (3, 13, 0, "final", 0))
+    captured = []
+
+    class P:
+        returncode = 0
+
+    def fake_runner(cmd, cwd=None, **kwargs):
+        captured.append(cmd)
+        return P()
+
+    # 模拟版本从 None → "1.1.9"
+    version_seq = iter([
+        {"tgw": None, "AmazingData": None},
+        {"tgw": "1.0.9.1", "AmazingData": "1.1.9"},
+    ])
+    monkeypatch.setattr(run, "get_installed_sdk_versions", lambda: next(version_seq))
+
+    run.run_install_sdk(
+        runner=fake_runner,
+        confirm_fn=lambda p: True,
+    )
+    # 应执行两步：先 --no-deps --force-reinstall，再普通 install 补依赖
+    assert len(captured) == 2
+    assert "--no-deps" in captured[0]
+    assert "--force-reinstall" in captured[0]
+    assert "--no-deps" not in captured[1]
+    assert "--force-reinstall" not in captured[1]
+    assert captured[0][0] == sys.executable
+
+
+def test_run_install_sdk_pip_fail_exits(monkeypatch):
+    run = _load_run()
+    monkeypatch.setattr(sys, "version_info", (3, 13, 0, "final", 0))
+
+    class P:
+        returncode = 1
+
+    def fake_runner(cmd, cwd=None, **kwargs):
+        return P()
+
+    monkeypatch.setattr(run, "get_installed_sdk_versions",
+                        lambda: {"tgw": None, "AmazingData": None})
+    with pytest.raises(SystemExit):
+        run.run_install_sdk(
+            runner=fake_runner,
+            confirm_fn=lambda p: True,
+        )

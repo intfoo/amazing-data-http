@@ -79,7 +79,7 @@ class GatewayQueryError(GatewayError):
 
 
 class AmazingDataGateway:
-    """AmazingData SDK 1.1.7 的真实封装实现。
+    """AmazingData SDK 的真实封装实现。
 
     管理进程级 SDK 会话：启动时 login + 创建 MarketData，
     后续请求复用同一会话，避免重复登录。SDK 对象非线程安全，

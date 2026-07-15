@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 新建一个独立 Python HTTP 适配服务，让主项目通过既有自定义数据源协议获取 AmazingData 1.1.7 的日 K 数据。
+**Goal:** 新建一个独立 Python HTTP 适配服务，让主项目通过既有自定义数据源协议获取 AmazingData 的日 K 数据。
 
 **Architecture:** FastAPI 常驻进程，启动时登录 SDK 并初始化 MarketData；HTTP 层依赖内部 `Gateway` 接口（Protocol），真实实现 `AmazingDataGateway` 封装 SDK 调用细节，测试使用 `FakeGateway`。`Serializer` 负责 DataFrame/NumPy/datetime → JSON 安全值，`KlineService` 负责日期转换、周期映射和 `dict[code, DataFrame]` 展平。所有 SDK 字段名原样透传，字段重命名由主项目 YAML `field_map` 完成。
 
@@ -11,8 +11,8 @@
 ## Global Constraints
 
 - Python 标记固定为 `cp314`，基础镜像必须为 `python:3.14`，目标平台 `linux/amd64`
-- 安装两个本地 wheel：先 `tgw-1.0.8.7-py3-none-any.whl`，再 `AmazingData-1.1.7-cp314-none-any.whl`
-- AmazingData 声明依赖：`pydantic>=2.6.4`、`numba>=0.65.0`、`scipy>=1.15.1`、`tgw>=1.0.8.7`
+- 安装两个本地 wheel：先 `tgw-*-py3-none-any.whl`，再 `AmazingData-*-cp314-none-any.whl`
+- AmazingData 声明依赖：`pydantic>=2.6.4`、`numba>=0.65.0`、`scipy>=1.15.1`、`tgw`
 - **SDK 探测门禁**（spec §5.2）：编写真实 gateway 实现前，必须在目标 Docker 环境完成最小探测并产出探测报告
 - 凭据只通过环境变量注入，不得写入 Dockerfile、源码、测试快照或日志
 - 适配服务不重命名字段：保留 SDK 原始字段名（`code`、`trade_time`、`open`、`high`、`low`、`close`、`volume`、`amount`）
@@ -180,14 +180,12 @@ FROM python:3.14
 
 WORKDIR /app
 
-COPY tgw-1.0.8.7-py3-none-any.whl .
-COPY AmazingData-1.1.7-cp314-none-any.whl .
+COPY tgw-*-py3-none-any.whl ./
+COPY AmazingData-*-cp314-none-any.whl ./
 
-RUN pip install --no-cache-dir \
-    ./tgw-1.0.8.7-py3-none-any.whl
+RUN pip install --no-cache-dir ./tgw-*-py3-none-any.whl
 
-RUN pip install --no-cache-dir \
-    ./AmazingData-1.1.7-cp314-none-any.whl
+RUN pip install --no-cache-dir ./AmazingData-*-cp314-none-any.whl
 
 COPY pyproject.toml .
 COPY app/ app/

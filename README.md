@@ -1,6 +1,6 @@
 # AmazingData HTTP 适配服务
 
-将 AmazingData SDK 1.1.7 的日 K 数据通过 HTTP 接口暴露给主项目的自定义数据源。
+将 AmazingData SDK 的日 K 数据通过 HTTP 接口暴露给主项目的自定义数据源。
 
 ## 架构
 
@@ -19,7 +19,7 @@
 │  ├── serializer.py DataFrame → JSON      │
 │  └── health.py    健康检查               │
 └─────────────────────────────────────────┘
-    │ AmazingData SDK 1.1.7
+    │ AmazingData SDK
     ▼
   tgw 原生数据服务
 ```
@@ -31,9 +31,9 @@
 - Docker（支持 `linux/amd64` 平台）
 - AmazingData 账号凭据（用户名、密码、服务器 IP、端口）
 - 本地 wheel 文件（已包含在项目根目录，按 Python 版本选用）：
-  - `tgw-1.0.8.7-py3-none-any.whl`（tgw 原生库，纯 Python，3.13/3.14 通用）
-  - `AmazingData-1.1.7-cp313-none-any.whl`（Python 3.13 用）
-  - `AmazingData-1.1.7-cp314-none-any.whl`（Python 3.14 用）
+  - `tgw-*-py3-none-any.whl`（tgw 原生库，纯 Python，3.13/3.14 通用）
+  - `AmazingData-*-cp313-none-any.whl`（Python 3.13 用）
+  - `AmazingData-*-cp314-none-any.whl`（Python 3.14 用）
 
 ## 验证方式一：单元测试（无需 SDK、无需 Docker）
 

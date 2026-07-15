@@ -616,14 +616,19 @@ def check_python_version():
 
 def pick_sdk_wheels():
     ver = sys.version_info[:2]
-    tgw = "tgw-1.0.8.7-py3-none-any.whl"
     if ver == (3, 13):
-        ad = "AmazingData-1.1.7-cp313-none-any.whl"
+        ad_tag = "cp313"
     elif ver == (3, 14):
-        ad = "AmazingData-1.1.7-cp314-none-any.whl"
+        ad_tag = "cp314"
     else:
         raise ValueError(f"unsupported python {ver}")
-    return [str(PROJECT_ROOT / tgw), str(PROJECT_ROOT / ad)]
+    tgw = list(PROJECT_ROOT.glob("tgw-*-py3-none-any.whl"))
+    ad = list(PROJECT_ROOT.glob(f"AmazingData-*-{ad_tag}-none-any.whl"))
+    if len(tgw) != 1:
+        raise FileNotFoundError(f"期望恰好 1 个 tgw wheel，找到 {[p.name for p in tgw]}")
+    if len(ad) != 1:
+        raise FileNotFoundError(f"期望恰好 1 个 {ad_tag} AmazingData wheel，找到 {[p.name for p in ad]}")
+    return [str(tgw[0]), str(ad[0])]
 
 
 def load_local_config(path):

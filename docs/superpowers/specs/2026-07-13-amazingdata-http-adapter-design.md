@@ -8,7 +8,7 @@
 
 现有项目的自定义数据源只通过 HTTP 访问，当前支持 `daily`、`adj_factor` 和 `realtime` 三类数据集。项目通过 HTTP 响应中的 `field_map` 将上游字段映射为内部标准字段。
 
-`AmazingData-1.1.7-cp314-none-any.whl` 提供 Python API，依赖 `tgw>=1.0.8.7`，能够访问历史 K 线等数据。目标是新增一个独立的 Python HTTP 适配服务，让项目通过既有自定义数据源协议获取 AmazingData 的日 K 数据。
+AmazingData SDK（wheel 包，按 Python 版本选用 `cp313`/`cp314`）提供 Python API，依赖 `tgw`，能够访问历史 K 线等数据。目标是新增一个独立的 Python HTTP 适配服务，让项目通过既有自定义数据源协议获取 AmazingData 的日 K 数据。
 
 适配服务不负责项目字段重命名或业务加工，只负责：
 
@@ -25,7 +25,7 @@
 - `POST /daily`：按代码和日期区间查询日 K；
 - `GET /health`：检查配置、SDK 初始化和登录状态；
 - Linux x86_64 Docker 部署；
-- 使用 `AmazingData-1.1.7-cp314-none-any.whl`，并安装其依赖；
+- 使用 `AmazingData-*-cp314-none-any.whl`，并安装其依赖；
 - SDK 返回结果的通用 JSON 序列化；
 - 单元测试和无真实账号的集成测试；
 - 凭据通过环境变量或 Docker secrets 注入。
@@ -190,19 +190,18 @@ GET /health
 
 当前目录包含：
 
-- `AmazingData-1.1.7-cp314-none-any.whl`；
-- `tgw-1.0.8.7-py3-none-any.whl`。
+- `AmazingData-*-cp314-none-any.whl`；
+- `tgw-*-py3-none-any.whl`。
 
 `AmazingData` wheel 的元数据声明：
 
 - 包名：`AmazingData`；
-- 版本：`1.1.7`；
 - Python 标记：`cp314`；
-- 依赖：`pydantic>=2.6.4`、`numba>=0.65.0`、`scipy>=1.15.1`、`tgw>=1.0.8.7`。
+- 依赖：`pydantic>=2.6.4`、`numba>=0.65.0`、`scipy>=1.15.1`、`tgw`。
 
 wheel 内容包含 `AmazingData.query_api.market_data`、`AmazingData.query_api.base_data`、`AmazingData.subscribe_api` 等模块，与整理后的 SDK 文档中的 `AmazingData` API 结构一致。
 
-Docker 镜像优先固定为 Linux x86_64、Python 3.14；原因是 `AmazingData-1.1.7` 明确标记为 `cp314`。实施前必须确认 `tgw>=1.0.8.7` 在该 Linux x86_64 + Python 3.14 组合下存在可安装且兼容的 wheel。若供应商仅提供 Python 3.13 的 Linux 原生依赖，则必须退回使用兼容的 SDK 版本或由用户补充对应的 Linux wheel，不能在设计阶段假定跨 Python 小版本兼容。
+Docker 镜像优先固定为 Linux x86_64、Python 3.14；原因是 `AmazingData` wheel 明确标记为 `cp314`。实施前必须确认 `tgw` 在该 Linux x86_64 + Python 3.14 组合下存在可安装且兼容的 wheel。若供应商仅提供 Python 3.13 的 Linux 原生依赖，则必须退回使用兼容的 SDK 版本或由用户补充对应的 Linux wheel，不能在设计阶段假定跨 Python 小版本兼容。
 
 ### 5.2 实际 API 探测门禁
 
@@ -290,7 +289,7 @@ SDK 若提供超时参数，优先使用 SDK 的超时能力。若不提供，�
 ### 7.1 镜像
 
 - 目标平台：`linux/amd64`；
-- Python：优先 `3.14`，与 `AmazingData-1.1.7-cp314` 匹配；
+- Python：优先 `3.14`，与 `AmazingData` wheel 的 `cp314` 标记匹配；
 - 基础镜像：先使用完整的 Debian 系列 Python 镜像进行联调，确认依赖后再考虑 `slim`；
 - 镜像内安装本地 `tgw` wheel、`AmazingData` wheel 和 Web 服务依赖；
 - 通过 Docker build 的平台参数固定 AMD64，避免 ARM 主机产生不兼容镜像。
