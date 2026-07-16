@@ -54,6 +54,7 @@ class Gateway(Protocol):
         period: str,
     ) -> dict[str, pd.DataFrame]: ...
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]: ...
+    def get_realtime_code_list(self) -> list[str]: ...
     def query_snapshot(
         self, codes: list[str], trade_date: int | None = None
     ) -> dict[str, pd.DataFrame]: ...
@@ -177,6 +178,26 @@ class AmazingDataGateway:
         except Exception as e:
             logger.error("get_code_list failed: %s: %s", type(e).__name__, e)
             raise GatewayQueryError(f"get_code_list failed: {e}") from e
+
+    def get_realtime_code_list(self) -> list[str]:
+        """获取实时订阅用的合并代码列表（股票 + 指数）。
+
+        先取股票列表（EXTRA_STOCK_A），再取指数列表（EXTRA_INDEX_A）。
+        股票列表获取失败时异常正常传播（GatewayNotReadyError / GatewayQueryError）。
+        指数列表获取失败时降级：记录 warning，只返回股票列表，不抛异常。
+        """
+        stock_codes = self.get_code_list(security_type="EXTRA_STOCK_A")
+        try:
+            index_codes = self.get_code_list(security_type="EXTRA_INDEX_A")
+        except Exception as e:
+            logger.warning(
+                "get_code_list(EXTRA_INDEX_A) failed, degrading to stock-only: %s: %s",
+                type(e).__name__, e,
+            )
+            return stock_codes
+        logger.info("get_realtime_code_list: %d stocks + %d indices = %d total",
+                    len(stock_codes), len(index_codes), len(stock_codes) + len(index_codes))
+        return stock_codes + index_codes
 
     def query_snapshot(
         self,

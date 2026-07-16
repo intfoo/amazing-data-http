@@ -399,10 +399,10 @@ def test_realtime_startup_activates_subscription():
 def test_realtime_not_active_after_startup_failure():
     """startup 中订阅启动抛异常时 is_active=False，但 SDK 就绪，/realtime fallback 返回空（200）。"""
     gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
-    # 让 get_code_list 抛异常模拟订阅启动失败（fallback 也会失败）
-    def _boom(security_type="EXTRA_STOCK_A"):
+    # 让 get_realtime_code_list 抛异常模拟订阅启动失败（fallback 也会失败）
+    def _boom():
         raise RuntimeError("simulated failure")
-    gw.get_code_list = _boom
+    gw.get_realtime_code_list = _boom
     config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
@@ -410,9 +410,38 @@ def test_realtime_not_active_after_startup_failure():
         sub_thread = getattr(app.state, "subscription_thread", None)
         if sub_thread:
             sub_thread.join(timeout=5)
-        # startup 中 get_code_list 抛异常被 try/except 捕获，is_active 保持 False
+        # startup 中 get_realtime_code_list 抛异常被 try/except 捕获，is_active 保持 False
         assert app.state.realtime_service.is_active() is False
-        # /realtime fallback：get_code_list 抛 RuntimeError（非 GatewayNotReadyError）→ 返回空
+        # /realtime fallback：get_realtime_code_list 抛 RuntimeError（非 GatewayNotReadyError）→ 返回空
         resp = client.get("/realtime")
         assert resp.status_code == 200
         assert resp.json() == {"data": []}
+
+
+def test_realtime_startup_subscribes_combined_list_with_index():
+    """startup 事件应触发 _init_subscription 传入合并 code_list（股票+指数），含指数代码。
+
+    FakeGateway.start_snapshot_subscription 会记录 code_list 到 _sub_code_list，
+    验证该列表同时包含股票代码和指数代码。
+    """
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    app = create_app(config=config, gateway=gw)
+    with TestClient(app) as client:
+        sub_thread = getattr(app.state, "subscription_thread", None)
+        if sub_thread:
+            sub_thread.join(timeout=5)
+        # 订阅已启动
+        assert gw.sub_start_called == 1
+        # _sub_code_list 应包含股票 + 指数代码
+        assert gw._sub_code_list is not None
+        assert "000001.SZ" in gw._sub_code_list  # 股票
+        assert "600000.SH" in gw._sub_code_list  # 股票
+        assert "000001.SH" in gw._sub_code_list  # 指数（上证指数）
+        assert "399001.SZ" in gw._sub_code_list  # 指数（深证成指）
+        # 同时验证 set_combined_code_list 也被调用
+        assert app.state.realtime_service._combined_code_list is not None
+        assert set(app.state.realtime_service._combined_code_list) == set(gw._sub_code_list)
+        # /realtime 返回 200
+        resp = client.get("/realtime")
+        assert resp.status_code == 200

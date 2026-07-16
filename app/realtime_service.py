@@ -29,6 +29,8 @@ class RealtimeService:
         self._active = False
         self._fallback_cache: list[dict] | None = None  # query_snapshot fallback 缓存
         self._fallback_time: float = 0
+        # startup 注入的合并 code_list（股票+指数），供 fallback_snapshot 复用，避免每次重查 get_code_list
+        self._combined_code_list: list[str] | None = None
 
     def on_snapshot(self, data) -> None:
         """订阅回调：Snapshot → dict → 缓存覆盖。异常吞掉，不影响订阅线程。"""
@@ -65,6 +67,14 @@ class RealtimeService:
     def set_active(self, active: bool) -> None:
         self._active = active
 
+    def set_combined_code_list(self, codes: list[str]) -> None:
+        """注入 startup 时获取的合并 code_list（股票+指数），供 fallback_snapshot 复用。
+
+        避免每次 TTL 过期后重查 get_realtime_code_list（全市场查询 10~20s）。
+        未调用此方法时 fallback_snapshot 会实时调 get_realtime_code_list（向后兼容）。
+        """
+        self._combined_code_list = codes
+
     def fallback_snapshot(self, codes: list[str] | None = None) -> list[dict]:
         """订阅缓存为空时的 fallback：用 query_snapshot 查当日历史快照。
 
@@ -75,11 +85,16 @@ class RealtimeService:
         now = time.time()
         if self._fallback_cache is None or now - self._fallback_time > FALLBACK_TTL:
             try:
-                code_list = codes if codes else self._gw.get_code_list()
+                if codes:
+                    code_list = codes
+                elif self._combined_code_list is not None:
+                    code_list = self._combined_code_list
+                else:
+                    code_list = self._gw.get_realtime_code_list()
             except GatewayNotReadyError:
                 raise  # SDK 未就绪，传播给路由转 503
             except Exception as e:
-                logger.warning("fallback get_code_list failed: %s: %s", type(e).__name__, e)
+                logger.warning("fallback get_realtime_code_list failed: %s: %s", type(e).__name__, e)
                 return []
             try:
                 result = self._gw.query_snapshot(code_list)

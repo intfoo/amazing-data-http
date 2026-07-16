@@ -142,14 +142,14 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             try:
                 gateway.login()
                 logger.info("gateway login succeeded on startup")
-                # 订阅初始化（get_code_list + register）移到后台线程，不阻塞 startup。
-                # 此步在生产环境约 10~20s（5529 代码 get_code_list + register），
+                # 订阅初始化（get_realtime_code_list + register）移到后台线程，不阻塞 startup。
+                # 此步在生产环境约 20~40s（股票+指数 get_realtime_code_list + register），
                 # 移到后台后 uvicorn 立即就绪接受请求；/realtime 在订阅就绪前走
                 # fallback（查当日历史快照），不影响可用性。
                 def _init_subscription():
                     t0 = time.monotonic()
                     try:
-                        code_list = gateway.get_code_list(security_type="EXTRA_STOCK_A")
+                        code_list = gateway.get_realtime_code_list()
                         t1 = time.monotonic()
                         gateway.start_snapshot_subscription(
                             code_list,
@@ -157,10 +157,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                             on_error=realtime_service.on_subscription_error,
                         )
                         realtime_service.set_active(True)
+                        realtime_service.set_combined_code_list(code_list)
                         t2 = time.monotonic()
                         logger.info(
-                            "realtime subscription started: %d symbols "
-                            "(get_code_list=%.3fs subscribe=%.3fs)",
+                        "realtime subscription started: %d symbols "
+                        "(get_realtime_code_list=%.3fs subscribe=%.3fs)",
                             len(code_list), t1 - t0, t2 - t1,
                         )
                     except Exception as e:

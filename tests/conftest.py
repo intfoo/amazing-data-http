@@ -18,6 +18,7 @@ class FakeGateway:
         self.logout_called = 0
         self.query_calls: list[dict] = []
         self._code_list = ["000001.SZ", "600000.SH"]
+        self._index_code_list = ["000001.SH", "399001.SZ"]
         self.sub_start_called = 0
         self.sub_stop_called = 0
         self._sub_code_list = None
@@ -51,7 +52,12 @@ class FakeGateway:
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A"):
         if not self._ready:
             raise GatewayNotReadyError("fake not ready")
+        if security_type == "EXTRA_INDEX_A":
+            return list(self._index_code_list)
         return list(self._code_list)
+
+    def get_realtime_code_list(self) -> list[str]:
+        return self.get_code_list("EXTRA_STOCK_A") + self.get_code_list("EXTRA_INDEX_A")
 
     def query_snapshot(self, codes, trade_date=None):
         """FakeGateway 快照查询：未就绪抛 GatewayNotReadyError，否则返回空 dict。"""
