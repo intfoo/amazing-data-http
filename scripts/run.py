@@ -24,6 +24,9 @@ PROBE_REPORT = PROJECT_ROOT / "docs" / "probe-report.json"
 PROBE_SCRIPT = PROJECT_ROOT / "scripts" / "probe_sdk.py"
 
 SUPPORTED_PY = {(3, 13), (3, 14)}
+# 本地模式（scripts/run.py 模式 1）下生效，传给 uvicorn 监听地址。
+# Docker 模式下无效——Dockerfile CMD 写死了 0.0.0.0:3021，未读 .env 的 HTTP_HOST/HTTP_PORT。
+# 如需 Docker 模式支持自定义端口，需同步修改 Dockerfile CMD 与 docker-compose.yml 的 ports。
 DEFAULT_HTTP_HOST = "0.0.0.0"
 DEFAULT_HTTP_PORT = "3021"
 
