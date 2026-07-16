@@ -12,6 +12,7 @@ import asyncio
 import logging
 import threading
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -113,9 +114,6 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     config/gateway 可选注入：测试时传 FakeGateway，生产时默认从环境变量
     创建 Config + AmazingDataGateway。模块级 app = create_app() 供 uvicorn 直接引用。
     """
-    app = FastAPI(title="AmazingData HTTP Adapter")
-    app.add_middleware(RequestIdMiddleware)
-
     if config is None:
         config = Config.from_env()
     if gateway is None:
@@ -125,28 +123,18 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     realtime_service = RealtimeService(gateway)
     health_service = HealthService(config, gateway, realtime_service)
 
-    app.state.config = config
-    app.state.gateway = gateway
-    app.state.kline_service = kline_service
-    app.state.realtime_service = realtime_service
-    app.state.health_service = health_service
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """启动时登录 SDK + 后台订阅初始化；退出时停止订阅 + 登出。
 
-    @app.on_event("startup")
-    async def startup_login():
-        """启动时尝试登录 SDK。配置缺失则跳过，/health 将返回 503。
-
-        同时重配 uvicorn 日志 formatter 加时间戳，与 amazingdata 日志格式对齐
-        （uvicorn 在触发 startup 前已完成自身 log_config，此时改 formatter 即生效）。
+        替代已废弃的 on_event("startup"/"shutdown")。uvicorn 触发 lifespan
+        startup/shutdown，TestClient 的 with 语法同样触发。
         """
         _align_uvicorn_log_format()
         if config.is_configured():
             try:
                 gateway.login()
                 logger.info("gateway login succeeded on startup")
-                # 订阅初始化（get_realtime_code_list + register）移到后台线程，不阻塞 startup。
-                # 此步在生产环境约 20~40s（股票+指数 get_realtime_code_list + register），
-                # 移到后台后 uvicorn 立即就绪接受请求；/realtime 在订阅就绪前走
-                # fallback（查当日历史快照），不影响可用性。
                 def _init_subscription():
                     t0 = time.monotonic()
                     try:
@@ -160,8 +148,8 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                         realtime_service.set_active(True)
                         t2 = time.monotonic()
                         logger.info(
-                        "realtime subscription started: %d symbols "
-                        "(get_realtime_code_list=%.3fs subscribe=%.3fs)",
+                            "realtime subscription started: %d symbols "
+                            "(get_realtime_code_list=%.3fs subscribe=%.3fs)",
                             len(code_list), t1 - t0, t2 - t1,
                         )
                     except Exception as e:
@@ -171,21 +159,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 )
                 app.state.subscription_thread.start()
             except Exception as e:
-                # 登录失败不阻止启动，使 /health 能暴露诊断
                 logger.error("gateway login failed on startup: %s: %s", type(e).__name__, e)
         else:
             logger.warning("config incomplete, skipping startup login")
-
-    @app.on_event("shutdown")
-    async def shutdown_logout():
-        """进程退出时登出 SDK，释放服务端连接。
-
-        docker stop / Ctrl+C 发 SIGTERM，uvicorn 优雅退出触发 shutdown 事件，
-        此时调 gateway.logout() 释放 SDK 连接，避免服务端连接累积超限
-        （TGW 报 "Connections of this user exceed the max limitation"）。
-        """
-        # 等待 subscription 初始化线程完成，避免 stop_subscription 在
-        # start_snapshot_subscription 之前调用导致状态不一致
+        yield
+        # shutdown
         sub_thread = getattr(app.state, "subscription_thread", None)
         if sub_thread and sub_thread.is_alive():
             sub_thread.join(timeout=10)
@@ -198,6 +176,15 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             logger.info("gateway logout on shutdown")
         except Exception as e:
             logger.warning("gateway logout failed on shutdown: %s: %s", type(e).__name__, e)
+
+    app = FastAPI(title="AmazingData HTTP Adapter", lifespan=lifespan)
+    app.add_middleware(RequestIdMiddleware)
+
+    app.state.config = config
+    app.state.gateway = gateway
+    app.state.kline_service = kline_service
+    app.state.realtime_service = realtime_service
+    app.state.health_service = health_service
 
     @app.get("/health")
     async def health():

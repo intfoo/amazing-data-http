@@ -443,3 +443,15 @@ def test_realtime_startup_subscribes_combined_list_with_index():
         # /realtime 返回 200
         resp = client.get("/realtime")
         assert resp.status_code == 200
+
+
+def test_shutdown_calls_gateway_logout():
+    """lifespan shutdown 应调用 gateway.logout() 释放 SDK 连接。"""
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    app = create_app(config=config, gateway=gw)
+    with TestClient(app) as client:
+        # startup 触发 login
+        assert gw.login_called >= 1
+    # 退出 with 块后 shutdown 触发 logout
+    assert gw.logout_called >= 1
