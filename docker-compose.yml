@@ -2,6 +2,8 @@ version: "3.8"
 
 services:
   amazingdata-http:
+    container_name: amazingdata-http
+    image: amazingdata-http:latest
     build:
       context: .
       dockerfile: Dockerfile

@@ -1,8 +1,8 @@
-"""统一本地 & Docker 启动入口。
+"""统一本地 & Docker/Podman 启动入口。
 
-交互式向导收集凭据 → 可选装 SDK → probe 门禁 → 本地起 uvicorn 或编排 docker。
+交互式向导收集凭据 → 可选装 SDK → probe 门禁 → 本地起 uvicorn 或编排容器。
 本地模式凭据写 local.config.json（注入 os.environ，零改动 app 代码）；
-Docker 模式凭据写 .env。二者互不读取。
+容器模式（Docker/Podman）凭据写 .env。二者互不读取。
 """
 import getpass
 import json
@@ -25,8 +25,8 @@ PROBE_SCRIPT = PROJECT_ROOT / "scripts" / "probe_sdk.py"
 
 SUPPORTED_PY = {(3, 13), (3, 14)}
 # 本地模式（scripts/run.py 模式 1）下生效，传给 uvicorn 监听地址。
-# Docker 模式下无效——Dockerfile CMD 写死了 0.0.0.0:3021，未读 .env 的 HTTP_HOST/HTTP_PORT。
-# 如需 Docker 模式支持自定义端口，需同步修改 Dockerfile CMD 与 docker-compose.yml 的 ports。
+# Docker/Podman 模式下无效——Dockerfile CMD 写死了 0.0.0.0:3021，未读 .env 的 HTTP_HOST/HTTP_PORT。
+# 如需容器模式支持自定义端口，需同步修改 Dockerfile CMD 与 docker-compose.yml 的 ports。
 DEFAULT_HTTP_HOST = "0.0.0.0"
 DEFAULT_HTTP_PORT = "3021"
 
@@ -100,19 +100,19 @@ def summarize_config(creds):
     print("  密码   AMAZINGDATA_PASSWORD = <已隐藏>")
 
 
-def build_docker_build_cmd():
-    return ["docker", "build", "--platform", "linux/amd64", "-t", "amazingdata-http:probe", "."]
+def build_container_build_cmd(engine="docker"):
+    return [engine, "build", "--platform", "linux/amd64", "-t", "amazingdata-http:probe", "."]
 
 
-def build_docker_probe_cmd(docs_abs):
+def build_container_probe_cmd(docs_abs, engine="docker"):
     docs_vol = str(Path(docs_abs).resolve()).replace("\\", "/")
-    return ["docker", "run", "--rm", "--env-file", ".env", "--platform", "linux/amd64",
+    return [engine, "run", "--rm", "--env-file", ".env", "--platform", "linux/amd64",
             "-v", f"{docs_vol}:/app/docs", "amazingdata-http:probe",
             "python", "scripts/probe_sdk.py", "--out", "docs/probe-report.json"]
 
 
-def build_docker_compose_cmd():
-    return ["docker", "compose", "up", "-d"]
+def build_container_compose_cmd(engine="docker"):
+    return [engine, "compose", "up", "-d"]
 
 
 def backup_env(path):
@@ -196,8 +196,8 @@ def _pip_install(pkgs):
     subprocess.run([sys.executable, "-m", "pip", "install", *pkgs], check=False)
 
 
-def docker_available():
-    return shutil.which("docker") is not None
+def container_engine_available(engine="docker"):
+    return shutil.which(engine) is not None
 
 
 def _rc(proc):
@@ -257,10 +257,16 @@ def run_local(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
     _CleanExitServer(uvicorn.Config("app.http_app:app", host=host, port=port)).run()
 
 
-def run_docker(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
-               runner=subprocess.run):
-    if not docker_available():
-        print("docker 未安装或未运行，请先安装 Docker Desktop。")
+def run_container(engine="docker", input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
+                  runner=subprocess.run):
+    """通用容器引擎启动流程（Docker 模式 2 / Podman 模式 3）。
+
+    流程：凭据向导 → 写 .env → build 镜像 → 容器内 probe 门禁 → compose up。
+    engine 为 "docker" 或 "podman"，命令构造与提示信息自动适配。
+    """
+    if not container_engine_available(engine):
+        engine_labels = {"docker": "Docker Desktop", "podman": "podman"}
+        print(f"{engine} 未安装或未运行，请先安装 {engine_labels.get(engine, engine)}。")
         sys.exit(1)
     creds = ask_credentials(input_fn, getpass_fn)
     if ENV_FILE.exists():
@@ -271,28 +277,28 @@ def run_docker(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
         write_env_file(ENV_FILE, creds)
     print(f".env 已写入：账号={creds['AMAZINGDATA_USERNAME']} 服务器={creds['AMAZINGDATA_HOST']}:{creds['AMAZINGDATA_PORT']}")
 
-    if confirm_fn("执行 docker build？"):
-        print("正在构建 Docker 镜像（首次较慢，可能数分钟）...")
-        if _rc(runner(build_docker_build_cmd(), cwd=str(PROJECT_ROOT))) != 0:
-            print("docker build 失败")
+    if confirm_fn(f"执行 {engine} build？"):
+        print("正在构建镜像（首次较慢，可能数分钟）...")
+        if _rc(runner(build_container_build_cmd(engine), cwd=str(PROJECT_ROOT))) != 0:
+            print(f"{engine} build 失败")
             sys.exit(1)
         print("正在容器内运行 probe 门禁（约数秒）...")
-        if _rc(runner(build_docker_probe_cmd(PROJECT_ROOT / "docs"), cwd=str(PROJECT_ROOT))) != 0:
+        if _rc(runner(build_container_probe_cmd(PROJECT_ROOT / "docs", engine), cwd=str(PROJECT_ROOT))) != 0:
             print("probe 门禁失败：凭据可能有误，.env 已更新，建议修正后重跑")
     else:
         print("跳过 build，手动执行：")
-        print(" ".join(build_docker_build_cmd()))
+        print(" ".join(build_container_build_cmd(engine)))
 
-    if confirm_fn("执行 docker compose up -d？"):
+    if confirm_fn(f"执行 {engine} compose up -d？"):
         print("正在启动容器...")
-        runner(build_docker_compose_cmd(), cwd=str(PROJECT_ROOT))
+        runner(build_container_compose_cmd(engine), cwd=str(PROJECT_ROOT))
     else:
         print("跳过 compose，手动执行：")
-        print(" ".join(build_docker_compose_cmd()))
+        print(" ".join(build_container_compose_cmd(engine)))
 
     print("手动验证：")
     print("  curl http://localhost:3021/health")
-    print("  若返回 503：docker compose logs amazingdata-http 查登录错误")
+    print(f"  若返回 503：{engine} compose logs amazingdata-http 查登录错误")
 
 
 def get_installed_sdk_versions():
@@ -308,7 +314,7 @@ def get_installed_sdk_versions():
 
 
 def run_install_sdk(install_fn=_pip_install, runner=subprocess.run, confirm_fn=confirm):
-    """强制重装本地 wheel 到当前 Python 环境（模式 3）。"""
+    """强制重装本地 wheel 到当前 Python 环境（模式 9）。"""
     try:
         wheels = pick_sdk_wheels()
     except (FileNotFoundError, ValueError) as e:
@@ -355,13 +361,15 @@ def run_install_sdk(install_fn=_pip_install, runner=subprocess.run, confirm_fn=c
 def main():
     check_python_version()
     print(f"Python {sys.version.split()[0]}")
-    print("选择模式：1=本地真实 SDK  2=Docker 完整链路  3=更新/安装 SDK wheel")
-    choice = input("模式 [1/2/3]: ").strip()
+    print("选择模式：1=本地真实 SDK  2=Docker 完整链路  3=Podman 完整链路  9=更新/安装 SDK wheel")
+    choice = input("模式 [1/2/3/9]: ").strip()
     if choice == "1":
         run_local()
     elif choice == "2":
-        run_docker()
+        run_container("docker")
     elif choice == "3":
+        run_container("podman")
+    elif choice == "9":
         run_install_sdk()
     else:
         print("无效选择")
