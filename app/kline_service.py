@@ -115,7 +115,7 @@ class KlineService:
         for code, df in result.items():
             if df is None or df.empty:
                 continue
-            df = df.copy()
+            df = df.copy(deep=False)
             if "code" not in df.columns:
                 df["code"] = code
             # DataFrame 层后处理（向量化）：kline_time 列存在时按周期转换

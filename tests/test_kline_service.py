@@ -329,3 +329,20 @@ def test_query_minute_only_start_still_applies_default_end():
     call = gw.query_calls[0]
     assert call["begin_date"] == 20250101
     assert call["end_date"] is None
+
+
+def test_flatten_does_not_mutate_gateway_result():
+    """_flatten 改 kline_time 列后，gateway 返回的原始 DataFrame 不应被污染。"""
+    df = pd.DataFrame({
+        "code": ["000001.SZ"],
+        "kline_time": [pd.Timestamp("2024-01-02")],
+        "open": [10.2], "high": [10.4], "low": [10.1],
+        "close": [10.3], "volume": [100], "amount": [1000.0],
+    })
+    original_time = df["kline_time"].iloc[0]
+    gw = FakeGateway(ready=True, result={"000001.SZ": df})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"], "2024-01-02", "2024-01-02")
+    # 原始 df 的 kline_time 仍是 Timestamp，未被 strftime 改成字符串
+    assert df["kline_time"].iloc[0] == original_time
+    assert isinstance(df["kline_time"].iloc[0], pd.Timestamp)
