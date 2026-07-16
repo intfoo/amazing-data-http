@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   amazingdata-http:
     container_name: amazingdata-http
@@ -8,18 +6,15 @@ services:
       context: .
       dockerfile: Dockerfile
     platform: linux/amd64
-    # 端口映射：宿主机端口:容器内端口
-    # - 左侧(宿主机): 外部访问用，可自由改
-    # - 右侧(容器内): 必须等于 uvicorn 实际监听端口（见 Dockerfile CMD --port，当前写死 3021）
-    # 注意：.env 中的 HTTP_PORT 在 Docker 模式下未生效（Dockerfile CMD 未读取环境变量），
-    #       仅本地模式（scripts/run.py）下生效。如需自定义端口，需同步修改 Dockerfile CMD。
+    # 端口映射：宿主机端口:容器内端口，均读取 HTTP_PORT（默认 3021）。
+    # Dockerfile CMD 已读取 HTTP_HOST/HTTP_PORT，二者保持一致。
     ports:
-      - "3021:3021"
+      - "${HTTP_PORT:-3021}:${HTTP_PORT:-3021}"
     env_file:
       - .env
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3021/health')"]
+      test: python -c "import urllib.request; urllib.request.urlopen('http://localhost:${HTTP_PORT:-3021}/health')"
       interval: 30s
       timeout: 10s
       retries: 3

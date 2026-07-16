@@ -45,8 +45,7 @@ RUN pip install --no-cache-dir .
 # 诊断：列出 libtgw_python314.so 的依赖链，"not found" 即为 slim 缺失的系统库
 RUN ldd /usr/local/lib/python3.14/site-packages/tgw/linux_py314_x64_package/libtgw_python314.so 2>&1 || true
 
+# host/port 从环境变量读取（docker-compose env_file 注入 .env 的 HTTP_HOST/HTTP_PORT）。
 EXPOSE 3021
-# 注意：此处 host/port 写死，未读取 .env 的 HTTP_HOST/HTTP_PORT。
-# 如需支持自定义端口，改为：CMD ["sh", "-c", "uvicorn app.http_app:app --host $HTTP_HOST --port $HTTP_PORT"]
-# 并同步修改 docker-compose.yml 的 ports 映射右侧。
-CMD ["uvicorn", "app.http_app:app", "--host", "0.0.0.0", "--port", "3021"]
+# 读取 HTTP_HOST/HTTP_PORT 环境变量（.env 注入），默认 0.0.0.0:3021
+CMD ["sh", "-c", "uvicorn app.http_app:app --host ${HTTP_HOST:-0.0.0.0} --port ${HTTP_PORT:-3021}"]
