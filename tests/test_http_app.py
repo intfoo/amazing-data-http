@@ -399,7 +399,8 @@ def test_realtime_startup_activates_subscription():
 def test_realtime_not_active_after_startup_failure():
     """startup 中订阅启动抛异常时 is_active=False，但 SDK 就绪，/realtime fallback 返回空（200）。"""
     gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
-    # 让 get_realtime_code_list 抛异常模拟订阅启动失败（fallback 也会失败）
+    # 让 get_realtime_code_list 抛异常模拟订阅启动失败
+    # （startup 订阅失败；/realtime 走 fallback 但 codes=None 短路返回空，不触发 get_realtime_code_list）
     def _boom():
         raise RuntimeError("simulated failure")
     gw.get_realtime_code_list = _boom
@@ -412,7 +413,7 @@ def test_realtime_not_active_after_startup_failure():
             sub_thread.join(timeout=5)
         # startup 中 get_realtime_code_list 抛异常被 try/except 捕获，is_active 保持 False
         assert app.state.realtime_service.is_active() is False
-        # /realtime fallback：get_realtime_code_list 抛 RuntimeError（非 GatewayNotReadyError）→ 返回空
+        # /realtime codes=None：fallback 短路返回空（不调 get_realtime_code_list），SDK 就绪 → 200
         resp = client.get("/realtime")
         assert resp.status_code == 200
         assert resp.json() == {"data": []}
@@ -439,9 +440,6 @@ def test_realtime_startup_subscribes_combined_list_with_index():
         assert "600000.SH" in gw._sub_code_list  # 股票
         assert "000001.SH" in gw._sub_code_list  # 指数（上证指数）
         assert "399001.SZ" in gw._sub_code_list  # 指数（深证成指）
-        # 同时验证 set_combined_code_list 也被调用
-        assert app.state.realtime_service._combined_code_list is not None
-        assert set(app.state.realtime_service._combined_code_list) == set(gw._sub_code_list)
         # /realtime 返回 200
         resp = client.get("/realtime")
         assert resp.status_code == 200

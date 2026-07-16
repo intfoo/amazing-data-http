@@ -56,7 +56,8 @@ class Gateway(Protocol):
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]: ...
     def get_realtime_code_list(self) -> list[str]: ...
     def query_snapshot(
-        self, codes: list[str], trade_date: int | None = None
+        self, codes: list[str], trade_date: int | None = None,
+        begin_time: int | None = None, end_time: int | None = None,
     ) -> dict[str, pd.DataFrame]: ...
     def start_snapshot_subscription(
         self, code_list: list[str], on_data, on_error=None
@@ -170,14 +171,20 @@ class AmazingDataGateway:
         return self._ready
 
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]:
-        """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。"""
+        """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。
+
+        加 _lock 串行化：tgw SDK 非线程安全，startup 订阅线程与 /realtime fallback
+        线程并发调 get_code_list 会导致 'NoneType' object is not subscriptable
+        （SDK 内部状态错乱）。串行化后并发调用排队，牺牲少量并发换取正确性。
+        """
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
-        try:
-            return self._base_data.get_code_list(security_type=security_type)
-        except Exception as e:
-            logger.error("get_code_list failed: %s: %s", type(e).__name__, e)
-            raise GatewayQueryError(f"get_code_list failed: {e}") from e
+        with self._lock:
+            try:
+                return self._base_data.get_code_list(security_type=security_type)
+            except Exception as e:
+                logger.error("get_code_list failed: %s: %s", type(e).__name__, e)
+                raise GatewayQueryError(f"get_code_list failed: {e}") from e
 
     def get_realtime_code_list(self) -> list[str]:
         """获取实时订阅用的合并代码列表（股票 + 指数）。
@@ -203,10 +210,14 @@ class AmazingDataGateway:
         self,
         codes: list[str],
         trade_date: int | None = None,
+        begin_time: int | None = None,
+        end_time: int | None = None,
     ) -> dict[str, "pd.DataFrame"]:
         """查询历史快照。返回 {code: DataFrame}（每只股票当日全部快照行，按时间排列）。
 
         trade_date 为 None 时用交易日历最后一天（最新交易日）。
+        begin_time / end_time 为可选时分秒毫秒时间戳（如 9点整=90000000，15点=150000000），
+        传入时只返回该时间区间内的快照行，避免拉全量逐笔（默认返回当日全部，每只5000+行）。
         SDK 返回嵌套 dict {date: {code: DataFrame}}，此处展平取内层 {code: DataFrame}。
         用于 /realtime 订阅缓存为空（非交易时段）时的 fallback。
         """
@@ -216,11 +227,15 @@ class AmazingDataGateway:
             if not self._calendar:
                 raise GatewayNotReadyError("calendar not available")
             trade_date = self._calendar[-1]
+        # 仅传非 None 的时间参数，None 时让 SDK 返回当日全部快照
+        kwargs: dict[str, Any] = {"begin_date": trade_date, "end_date": trade_date}
+        if begin_time is not None:
+            kwargs["begin_time"] = begin_time
+        if end_time is not None:
+            kwargs["end_time"] = end_time
         with self._lock:
             try:
-                result = self._market_data.query_snapshot(
-                    codes, begin_date=trade_date, end_date=trade_date
-                )
+                result = self._market_data.query_snapshot(codes, **kwargs)
             except Exception as e:
                 logger.error("query_snapshot failed: %s: %s (codes=%d, date=%s)",
                              type(e).__name__, e, len(codes), trade_date)

@@ -59,12 +59,15 @@ class FakeGateway:
     def get_realtime_code_list(self) -> list[str]:
         return self.get_code_list("EXTRA_STOCK_A") + self.get_code_list("EXTRA_INDEX_A")
 
-    def query_snapshot(self, codes, trade_date=None):
+    def query_snapshot(self, codes, trade_date=None, begin_time=None, end_time=None):
         """FakeGateway 快照查询：未就绪抛 GatewayNotReadyError，否则返回空 dict。"""
         if not self._ready:
             raise GatewayNotReadyError("fake not ready")
         self.snapshot_query_calls = getattr(self, "snapshot_query_calls", [])
-        self.snapshot_query_calls.append({"codes": codes, "trade_date": trade_date})
+        self.snapshot_query_calls.append({
+            "codes": codes, "trade_date": trade_date,
+            "begin_time": begin_time, "end_time": end_time,
+        })
         return {}
 
     def start_snapshot_subscription(self, code_list, on_data, on_error=None):

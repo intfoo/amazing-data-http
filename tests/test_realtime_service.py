@@ -234,45 +234,76 @@ def test_snapshot_mixed_stock_and_index():
     assert "ask_price1" in data_stock[0]
 
 
-# ---- 用例 3：set_combined_code_list 注入后 fallback 用缓存列表 ----
+# ---- 用例 3：无 codes 时不触发全市场 query_snapshot（避免阻塞服务）----
 
-def test_fallback_uses_combined_code_list_when_set():
-    """set_combined_code_list 注入后 fallback_snapshot(codes=None) 应使用缓存列表，不调 get_realtime_code_list。"""
+def test_fallback_no_codes_does_not_query_all_market():
+    """fallback_snapshot(codes=None) 不触发全市场 query_snapshot，返回空。
+
+    全市场查询耗时数分钟且持 gateway._lock 阻塞 /daily /minute，故禁用。
+    无 codes 时直接返回空（或旧缓存），不查 SDK。
+    """
     gw = FakeGateway(ready=True)
     svc = RealtimeService(gateway=gw)
-    combined = ["000001.SZ", "000001.SH"]
-    svc.set_combined_code_list(combined)
-    svc.fallback_snapshot()
-    # query_snapshot 被调用时传入的 code_list 应为 combined
-    assert hasattr(gw, "snapshot_query_calls")
-    assert len(gw.snapshot_query_calls) == 1
-    assert gw.snapshot_query_calls[0]["codes"] == combined
-
-
-# ---- 用例 4：fallback_snapshot codes=None 且未 set_combined_code_list 时调 get_realtime_code_list ----
-
-def test_fallback_calls_get_realtime_code_list_without_combined():
-    """未调 set_combined_code_list 时 fallback_snapshot(codes=None) 应调 get_realtime_code_list()。"""
-    gw = FakeGateway(ready=True)
-    svc = RealtimeService(gateway=gw)
-    svc.fallback_snapshot()
-    # query_snapshot 应收到 get_realtime_code_list() 的结果（4 个代码）
-    assert hasattr(gw, "snapshot_query_calls")
-    assert len(gw.snapshot_query_calls) == 1
-    expected = gw.get_realtime_code_list()
-    assert gw.snapshot_query_calls[0]["codes"] == expected
-    assert set(expected) == {"000001.SZ", "600000.SH", "000001.SH", "399001.SZ"}
+    result = svc.fallback_snapshot()
+    assert result == []
+    # 不应调用 query_snapshot
+    assert not hasattr(gw, "snapshot_query_calls") or len(gw.snapshot_query_calls) == 0
 
 
 # ---- 用例 5：fallback_snapshot codes 非空时用用户 codes ----
 
 def test_fallback_uses_user_codes_when_provided():
-    """fallback_snapshot(codes=["000001.SZ"]) 应使用用户传入 codes，不走 combined 或 get_realtime_code_list。"""
+    """fallback_snapshot(codes=["000001.SZ"]) 应使用用户传入 codes，并透传收盘窄窗口时间参数。"""
     gw = FakeGateway(ready=True)
     svc = RealtimeService(gateway=gw)
-    # 即使设置了 combined_code_list，codes 非空时应优先用用户 codes
-    svc.set_combined_code_list(["000001.SZ", "000001.SH", "399001.SZ"])
     svc.fallback_snapshot(["000001.SZ"])
     assert hasattr(gw, "snapshot_query_calls")
     assert len(gw.snapshot_query_calls) == 1
     assert gw.snapshot_query_calls[0]["codes"] == ["000001.SZ"]
+    # 验证 begin_time/end_time 收盘窄窗口被透传（避免拉全量逐笔）
+    assert gw.snapshot_query_calls[0]["begin_time"] == 145900000
+    assert gw.snapshot_query_calls[0]["end_time"] == 150100000
+
+
+# ---- 用例 6：singleflight 并发去重 ----
+
+def test_fallback_singleflight_dedupes_concurrent_queries():
+    """并发调 fallback_snapshot 时，singleflight 应保证只发起一次 query_snapshot。
+
+    第一个查询进行中时，其他并发请求返回旧缓存/空，不重复查询、不堆积抢 gateway._lock。
+    """
+    import threading
+    import time as _time
+
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    # 用带延迟的 query_snapshot 模拟慢查询
+    original = gw.query_snapshot
+    call_count = [0]
+    cnt_lock = threading.Lock()
+
+    def slow_query(codes, trade_date=None, begin_time=None, end_time=None):
+        with cnt_lock:
+            call_count[0] += 1
+        _time.sleep(0.2)  # 模拟 SDK 慢查询
+        return original(codes, trade_date, begin_time, end_time)
+
+    gw.query_snapshot = slow_query
+
+    results = [None, None]
+    threads = []
+    for i in range(2):
+        def worker(idx=i):
+            results[idx] = svc.fallback_snapshot(["000001.SZ"])
+        t = threading.Thread(target=worker)
+        threads.append(t)
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    # 只应有一次 query_snapshot 调用（singleflight 去重）
+    assert call_count[0] == 1, f"expected 1 query, got {call_count[0]}"
+    # 两个线程都应拿到结果（空列表，FakeGateway 返回 {}）
+    for r in results:
+        assert r == []

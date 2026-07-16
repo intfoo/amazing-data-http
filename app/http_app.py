@@ -8,6 +8,7 @@
 所有错误统一为 {"error": {"code", "message", "request_id"}} 格式。
 """
 
+import asyncio
 import logging
 import threading
 import time
@@ -157,7 +158,6 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                             on_error=realtime_service.on_subscription_error,
                         )
                         realtime_service.set_active(True)
-                        realtime_service.set_combined_code_list(code_list)
                         t2 = time.monotonic()
                         logger.info(
                         "realtime subscription started: %d symbols "
@@ -218,7 +218,10 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                     get_request_id(request), len(req.codes),
                     req.start_time or "(default)", req.end_time or "(default)")
         try:
-            data = kline_service.query(req.codes, req.start_time, req.end_time)
+            # kline_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
+            data = await asyncio.to_thread(
+                kline_service.query, req.codes, req.start_time, req.end_time
+            )
             return {"data": data}
         except AppError:
             raise
@@ -247,7 +250,10 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                     get_request_id(request), len(req.codes), period,
                     req.start_time or "(default)", req.end_time or "(default)")
         try:
-            data = kline_service.query(req.codes, req.start_time, req.end_time, period=period)
+            # kline_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
+            data = await asyncio.to_thread(
+                kline_service.query, req.codes, req.start_time, req.end_time, period=period
+            )
             return {"data": data}
         except AppError:
             raise
@@ -274,12 +280,14 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         """
         logger.info("request_id=%s /realtime codes=%s", get_request_id(request), codes or "(all)")
         code_list = [s.strip() for s in codes.split(",") if s.strip()] if codes else None
-        # 优先读订阅缓存（盘中实时推送的数据）
+        # 优先读订阅缓存（盘中实时推送的数据）；snapshot 只读内存，不阻塞 event loop
         data = realtime_service.snapshot(code_list)
         if not data:
-            # 缓存空（非交易时段/订阅未推送），fallback 查当日历史快照
+            # 缓存空（非交易时段/订阅未推送），fallback 查当日历史快照。
+            # query_snapshot 是同步阻塞 SDK 调用（全市场可能数分钟），必须放线程池，
+            # 否则卡死 event loop 导致 /health 等其他请求全部阻塞。
             try:
-                data = realtime_service.fallback_snapshot(code_list)
+                data = await asyncio.to_thread(realtime_service.fallback_snapshot, code_list)
             except GatewayNotReadyError as e:
                 raise AppError(SDK_NOT_READY, str(e), 503)
             except Exception as e:
