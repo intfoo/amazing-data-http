@@ -307,3 +307,12 @@ def test_fallback_singleflight_dedupes_concurrent_queries():
     # 两个线程都应拿到结果（空列表，FakeGateway 返回 {}）
     for r in results:
         assert r == []
+
+
+def test_snapshot_large_cache_returns_correct_count():
+    """大量 code 缓存时 snapshot 返回数量正确（验证移出锁后不丢数据）。"""
+    svc = RealtimeService(gateway=None)
+    for i in range(100):
+        svc.on_snapshot(_snap(code=f"{i:06d}.SZ"))
+    result = svc.snapshot()
+    assert len(result) == 100

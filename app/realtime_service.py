@@ -62,15 +62,17 @@ class RealtimeService:
     def snapshot(self, codes: list[str] | None = None) -> list[dict]:
         """GET /realtime 读缓存，返回快照列表。
 
-        codes 为 None 时返回全市场快照；非空时只返回指定 code 的快照
-        （从全市场缓存中过滤，不触发额外订阅）。
-        对每个缓存 dict 做浅拷贝（dict(v)），避免外部序列化修改污染缓存。
+        codes 为 None 时返回全市场快照；非空时只返回指定 code 的快照。
+        锁内只取 values 引用快照（list 浅复制引用），浅拷贝 dict 在锁外完成，
+        避免长时间持锁阻塞 on_snapshot 写入。
         """
         with self._lock:
             if codes is None:
-                return [dict(v) for v in self._cache.values()]
-            wanted = set(codes)
-            return [dict(v) for code, v in self._cache.items() if code in wanted]
+                items = list(self._cache.values())
+            else:
+                wanted = set(codes)
+                items = [v for code, v in self._cache.items() if code in wanted]
+        return [dict(v) for v in items]
 
     def is_active(self) -> bool:
         return self._active
