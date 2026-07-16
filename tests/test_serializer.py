@@ -93,3 +93,32 @@ def test_serialize_dataframe_with_datetime_column():
     })
     result = serialize_dataframe(df)
     assert result == [{"trade_time": "2024-01-02T00:00:00", "close": 10.3}]
+
+
+def test_serialize_dataframe_object_column_with_timestamp():
+    """object dtype 列中残留 Timestamp 应被 serialize_value 兜底为 ISO 字符串。"""
+    df = pd.DataFrame({
+        "code": ["000001.SZ"],
+        "mixed": [pd.Timestamp("2024-01-02T09:30:00")],
+    })
+    result = serialize_dataframe(df)
+    assert result == [{"code": "000001.SZ", "mixed": "2024-01-02T09:30:00"}]
+
+
+def test_serialize_dataframe_large_volume_correctness():
+    """大数据量向量化后行为与逐条一致：numpy 标量转原生、NaN 转 None、datetime 转 ISO。"""
+    n = 5000
+    df = pd.DataFrame({
+        "code": ["000001.SZ"] * n,
+        "kline_time": pd.date_range("2024-01-02", periods=n, freq="D"),
+        "open": [10.2] * n,
+        "close": [float("nan")] * n,
+        "volume": np.int64(1234567) * np.ones(n, dtype=np.int64),
+    })
+    result = serialize_dataframe(df)
+    assert len(result) == n
+    assert isinstance(result[0]["volume"], int)
+    assert result[0]["volume"] == 1234567
+    assert result[0]["close"] is None
+    assert result[0]["kline_time"] == "2024-01-02T00:00:00"
+    assert result[-1]["kline_time"].startswith("20")

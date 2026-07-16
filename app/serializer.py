@@ -54,13 +54,28 @@ def serialize_value(v: Any) -> Any:
 
 
 def serialize_dataframe(df: pd.DataFrame) -> list[dict]:
-    """将 DataFrame 转为 JSON 安全的 list[dict]。
+    """将 DataFrame 转为 JSON 安全的 list[dict]（向量化序列化）。
 
-    若 DataFrame 有命名索引（如 trade_time），先 reset_index 将索引变为普通列，
-    使日期数据不出现在 JSON 之外。无名索引（RangeIndex）不需要 reset。
+    若 DataFrame 有命名索引（如 trade_time），先 reset_index 将索引变为普通列。
+    向量化策略（替代逐字段 serialize_value，大幅减少 Python 函数调用）：
+    - datetime64 列 → dt.strftime ISO 字符串（NaT → NaN，后续 where 填 None）
+    - 全表 astype(object)：numpy 标量 → Python 原生（int64→int, float64→float）
+    - 原生 object dtype 列可能残留 datetime/date/np 标量 → map(serialize_value) 兜底
+    - NaN/NaT → None（where 向量化填充）
     """
     if df is None or df.empty:
         return []
     df_to_use = df.reset_index() if df.index.name is not None else df
-    records = df_to_use.to_dict(orient="records")
-    return [{k: serialize_value(v) for k, v in record.items()} for record in records]
+    df_to_use = df_to_use.copy()
+    fallback_cols: list[str] = []
+    for col in list(df_to_use.columns):
+        s = df_to_use[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            df_to_use[col] = s.dt.strftime("%Y-%m-%dT%H:%M:%S")
+        elif s.dtype == object:
+            fallback_cols.append(col)
+    df_obj = df_to_use.astype(object)
+    for col in fallback_cols:
+        df_obj[col] = df_obj[col].map(serialize_value)
+    df_obj = df_obj.where(pd.notna(df_obj), None)
+    return df_obj.to_dict(orient="records")
