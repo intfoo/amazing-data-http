@@ -39,6 +39,20 @@ PERIOD_MAP: dict[str, str] = {
 }
 
 
+# 连接类错误关键词（小写匹配）。命中时触发惰性重连：持锁 relogin + 重试一次。
+# 基于常见网络异常消息，保守匹配，误判也只是多一次 relogin 尝试。
+_CONNECTION_KEYWORDS: tuple[str, ...] = (
+    "connection", "timeout", "timed out", "disconnect", "disconnected",
+    "broken pipe", "eof", "reset", "unreachable", "refused", "closed",
+)
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """判断异常是否可能是网络/连接类错误（应触发重连）。"""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _CONNECTION_KEYWORDS)
+
+
 @runtime_checkable
 class Gateway(Protocol):
     """Gateway 接口契约。HTTP 层只依赖此接口，测试用 FakeGateway 替换。"""
@@ -239,7 +253,17 @@ class AmazingDataGateway:
             except Exception as e:
                 logger.error("query_snapshot failed: %s: %s (codes=%d, date=%s)",
                              type(e).__name__, e, len(codes), trade_date)
-                raise GatewayQueryError(f"query_snapshot failed: {e}") from e
+                if _is_connection_error(e):
+                    logger.warning("query_snapshot connection error, attempting relogin: %s", e)
+                    try:
+                        self._do_login()
+                        result = self._market_data.query_snapshot(codes, **kwargs)
+                        logger.info("query_snapshot succeeded after relogin")
+                    except Exception as e2:
+                        logger.error("query_snapshot failed after reconnect: %s: %s", type(e2).__name__, e2)
+                        raise GatewayQueryError(f"query_snapshot failed after reconnect: {e2}") from e2
+                else:
+                    raise GatewayQueryError(f"query_snapshot failed: {e}") from e
         # 展平嵌套 {date: {code: DataFrame}} → {code: DataFrame}
         flat: dict[str, pd.DataFrame] = {}
         if isinstance(result, dict):
@@ -289,7 +313,6 @@ class AmazingDataGateway:
                 result = self._market_data.query_kline(codes, **kwargs)
                 return result if isinstance(result, dict) else {"_all": result}
             except Exception as e:
-                # 日志记录上下文（代码数量、日期区间），不记录完整代码列表和密码
                 logger.error(
                     "query_kline failed: %s: %s (codes=%d, begin=%s, end=%s, period=%s)",
                     type(e).__name__, e, len(codes),
@@ -297,6 +320,16 @@ class AmazingDataGateway:
                     end_date if end_date is not None else "default",
                     period,
                 )
+                if _is_connection_error(e):
+                    logger.warning("query_kline connection error, attempting relogin: %s", e)
+                    try:
+                        self._do_login()
+                        result = self._market_data.query_kline(codes, **kwargs)
+                        logger.info("query_kline succeeded after relogin")
+                        return result if isinstance(result, dict) else {"_all": result}
+                    except Exception as e2:
+                        logger.error("query_kline failed after reconnect: %s: %s", type(e2).__name__, e2)
+                        raise GatewayQueryError(f"query failed after reconnect: {e2}") from e2
                 raise GatewayQueryError(f"query failed: {e}") from e
 
     def start_snapshot_subscription(
