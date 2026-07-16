@@ -52,24 +52,24 @@ def test_write_env_file_format(tmp_path):
     assert lines[5] == "HTTP_PORT=3021"
 
 
-def test_build_docker_build_cmd_has_tag():
+def test_build_container_build_cmd_has_tag():
     run = _load_run()
-    cmd = run.build_docker_build_cmd()
+    cmd = run.build_container_build_cmd("docker")
     assert "-t" in cmd and "amazingdata-http:probe" in cmd
 
 
-def test_build_docker_probe_cmd_has_out_and_forward_slash(tmp_path):
+def test_build_container_probe_cmd_has_out_and_forward_slash(tmp_path):
     run = _load_run()
     docs = tmp_path / "docs"
-    cmd = run.build_docker_probe_cmd(docs)
+    cmd = run.build_container_probe_cmd(docs, "docker")
     assert "--out" in cmd and "docs/probe-report.json" in cmd
     vol = cmd[cmd.index("-v") + 1]
     assert "\\" not in vol
 
 
-def test_build_docker_compose_cmd():
+def test_build_container_compose_cmd():
     run = _load_run()
-    assert run.build_docker_compose_cmd() == ["docker", "compose", "up", "-d"]
+    assert run.build_container_compose_cmd("docker") == ["docker", "compose", "up", "-d"]
 
 
 def test_pick_sdk_wheels_313(monkeypatch):
@@ -264,9 +264,9 @@ def test_run_local_success_writes_config_and_calls_uvicorn(monkeypatch, tmp_path
     assert (tmp_path / "local.config.json").exists()
 
 
-def test_run_docker_build_fail_exits(monkeypatch, tmp_path):
+def test_run_container_build_fail_exits(monkeypatch, tmp_path):
     run = _load_run()
-    monkeypatch.setattr(run, "docker_available", lambda: True)
+    monkeypatch.setattr(run, "container_engine_available", lambda e: True)
     monkeypatch.setattr(run, "ENV_FILE", tmp_path / ".env")
     inputs = iter(["user", "1.2.3.4", "8600"])
     passes = iter(["pw"])
@@ -278,15 +278,15 @@ def test_run_docker_build_fail_exits(monkeypatch, tmp_path):
         return P1()
 
     with pytest.raises(SystemExit):
-        run.run_docker(input_fn=lambda p: next(inputs),
-                       getpass_fn=lambda p: next(passes),
-                       confirm_fn=lambda p: True,
-                       runner=fake_runner)
+        run.run_container("docker", input_fn=lambda p: next(inputs),
+                          getpass_fn=lambda p: next(passes),
+                          confirm_fn=lambda p: True,
+                          runner=fake_runner)
 
 
-def test_run_docker_probe_fail_continues_to_compose(monkeypatch, tmp_path):
+def test_run_container_probe_fail_continues_to_compose(monkeypatch, tmp_path):
     run = _load_run()
-    monkeypatch.setattr(run, "docker_available", lambda: True)
+    monkeypatch.setattr(run, "container_engine_available", lambda e: True)
     monkeypatch.setattr(run, "ENV_FILE", tmp_path / ".env")
     monkeypatch.setattr(run, "PROJECT_ROOT", tmp_path)
     inputs = iter(["user", "1.2.3.4", "8600"])
@@ -300,10 +300,10 @@ def test_run_docker_probe_fail_continues_to_compose(monkeypatch, tmp_path):
     def fake_runner(cmd, cwd=None, **kwargs):
         return P(next(seq))
 
-    run.run_docker(input_fn=lambda p: next(inputs),
-                   getpass_fn=lambda p: next(passes),
-                   confirm_fn=lambda p: True,
-                   runner=fake_runner)
+    run.run_container("docker", input_fn=lambda p: next(inputs),
+                      getpass_fn=lambda p: next(passes),
+                      confirm_fn=lambda p: True,
+                      runner=fake_runner)
     assert next(seq, "done") == "done"
 
 
@@ -383,3 +383,52 @@ def test_run_install_sdk_pip_fail_exits(monkeypatch):
             runner=fake_runner,
             confirm_fn=lambda p: True,
         )
+
+
+def test_load_env_file_parses_and_ignores_comments(tmp_path):
+    run = _load_run()
+    p = tmp_path / ".env"
+    p.write_text("# comment\nAMAZINGDATA_USERNAME=u\n\nAMAZINGDATA_PORT=8600\n",
+                 encoding="utf-8")
+    creds = run.load_env_file(p)
+    assert creds["AMAZINGDATA_USERNAME"] == "u"
+    assert creds["AMAZINGDATA_PORT"] == "8600"
+    assert "AMAZINGDATA_HOST" not in creds
+
+
+def test_env_credentials_complete_checks_all_required():
+    run = _load_run()
+    full = {"AMAZINGDATA_USERNAME": "u", "AMAZINGDATA_PASSWORD": "p",
+            "AMAZINGDATA_HOST": "h", "AMAZINGDATA_PORT": "8600"}
+    assert run.env_credentials_complete(full) is True
+    assert run.env_credentials_complete({**full, "AMAZINGDATA_PASSWORD": ""}) is False
+    assert run.env_credentials_complete({"AMAZINGDATA_USERNAME": "u"}) is False
+
+
+def test_run_container_reuses_complete_env_skips_wizard(monkeypatch, tmp_path):
+    run = _load_run()
+    monkeypatch.setattr(run, "container_engine_available", lambda e: True)
+    monkeypatch.setattr(run, "ENV_FILE", tmp_path / ".env")
+    monkeypatch.setattr(run, "PROJECT_ROOT", tmp_path)
+    run.write_env_file(tmp_path / ".env", {
+        "AMAZINGDATA_USERNAME": "keptuser", "AMAZINGDATA_PASSWORD": "keptpw",
+        "AMAZINGDATA_HOST": "9.9.9.9", "AMAZINGDATA_PORT": "8600",
+    })
+
+    class P:
+        returncode = 0
+
+    def fake_runner(cmd, cwd=None, **kwargs):
+        return P()
+
+    def fail_input(prompt):
+        raise AssertionError("不应进入凭据向导，.env 完整应被复用")
+
+    confirms = iter([True, True, True])  # 复用 / build / compose
+    run.run_container("docker",
+                      input_fn=fail_input,
+                      getpass_fn=fail_input,
+                      confirm_fn=lambda p: next(confirms),
+                      runner=fake_runner)
+    creds = run.load_env_file(tmp_path / ".env")
+    assert creds["AMAZINGDATA_USERNAME"] == "keptuser"

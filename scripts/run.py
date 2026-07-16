@@ -86,14 +86,36 @@ def write_env_file(path, creds):
         f.write("\n".join(lines))
 
 
+ENV_REQUIRED_KEYS = ("AMAZINGDATA_USERNAME", "AMAZINGDATA_PASSWORD",
+                     "AMAZINGDATA_HOST", "AMAZINGDATA_PORT")
+
+
+def load_env_file(path):
+    """解析 .env 文件为字典。格式 KEY=VALUE，忽略空行和 # 注释。"""
+    creds = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            creds[k.strip()] = v.strip()
+    return creds
+
+
+def env_credentials_complete(creds):
+    """检查字典是否包含全部必填凭据字段且非空。"""
+    return all(creds.get(k) for k in ENV_REQUIRED_KEYS)
+
+
 def inject_env(config):
     for k, v in config.items():
         os.environ[k] = str(v)
 
 
-def summarize_config(creds):
-    """打印已读取的本地配置摘要（密码隐藏）。"""
-    print("已读取 local.config.json：")
+def summarize_config(creds, source="local.config.json"):
+    """打印已读取的配置摘要（密码隐藏）。"""
+    print(f"已读取 {source}：")
     print(f"  账号   AMAZINGDATA_USERNAME = {creds.get('AMAZINGDATA_USERNAME', '<空>')}")
     print(f"  服务器 AMAZINGDATA_HOST     = {creds.get('AMAZINGDATA_HOST', '<空>')}:{creds.get('AMAZINGDATA_PORT', '<空>')}")
     print(f"  HTTP   监听 = {creds.get('HTTP_HOST', DEFAULT_HTTP_HOST)}:{creds.get('HTTP_PORT', DEFAULT_HTTP_PORT)}")
@@ -261,21 +283,35 @@ def run_container(engine="docker", input_fn=input, getpass_fn=getpass.getpass, c
                   runner=subprocess.run):
     """通用容器引擎启动流程（Docker 模式 2 / Podman 模式 3）。
 
-    流程：凭据向导 → 写 .env → build 镜像 → 容器内 probe 门禁 → compose up。
+    流程：读取/收集凭据 → 写 .env → build 镜像 → 容器内 probe 门禁 → compose up。
+    .env 存在且字段完整时默认复用，避免重复输入；缺失或不完整才进凭据向导。
     engine 为 "docker" 或 "podman"，命令构造与提示信息自动适配。
     """
     if not container_engine_available(engine):
         engine_labels = {"docker": "Docker Desktop", "podman": "podman"}
         print(f"{engine} 未安装或未运行，请先安装 {engine_labels.get(engine, engine)}。")
         sys.exit(1)
-    creds = ask_credentials(input_fn, getpass_fn)
+    creds = None
     if ENV_FILE.exists():
-        if confirm_fn(".env 已存在，覆盖？(会备份为 .env.bak)"):
-            backup_env(ENV_FILE)
-            write_env_file(ENV_FILE, creds)
+        try:
+            existing = load_env_file(ENV_FILE)
+            if env_credentials_complete(existing):
+                summarize_config(existing, source=".env")
+                if confirm_fn("复用现有 .env 配置？"):
+                    creds = existing
+                else:
+                    print("进入凭据向导重新输入（密码输入时不回显）。")
+            else:
+                print(".env 字段不完整，进入凭据向导补全。")
+        except OSError:
+            print(".env 不可读，进入凭据向导重新配置。")
     else:
+        print("未找到 .env，进入凭据向导（密码输入时不回显）。")
+    if creds is None:
+        creds = ask_credentials(input_fn, getpass_fn)
+        backup_env(ENV_FILE)
         write_env_file(ENV_FILE, creds)
-    print(f".env 已写入：账号={creds['AMAZINGDATA_USERNAME']} 服务器={creds['AMAZINGDATA_HOST']}:{creds['AMAZINGDATA_PORT']}")
+    print(f".env 已就绪：账号={creds['AMAZINGDATA_USERNAME']} 服务器={creds['AMAZINGDATA_HOST']}:{creds['AMAZINGDATA_PORT']}")
 
     if confirm_fn(f"执行 {engine} build？"):
         print("正在构建镜像（首次较慢，可能数分钟）...")
