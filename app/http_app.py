@@ -23,7 +23,8 @@ from pydantic import BaseModel, field_validator
 from app.config import Config
 from app.errors import (
     AppError, INTERNAL_ERROR, INVALID_REQUEST, REALTIME_SUBSCRIPTION_FAILED,
-    RequestIdMiddleware, SDK_NOT_READY, SDK_QUERY_FAILED, SERIALIZATION_FAILED, get_request_id,
+    RequestIdMiddleware, SDK_NOT_READY, SDK_QUERY_FAILED, SERIALIZATION_FAILED,
+    SERVICE_BUSY, get_request_id,
 )
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, AmazingDataGateway
 from app.health import HealthService
@@ -108,6 +109,31 @@ class MinuteRequest(BaseModel):
         return v
 
 
+class SdkGate:
+    """并发 SDK 调用闸门：在飞调用超过上限时快速失败返回 503，避免线程堆积雪崩。
+
+    gateway._lock 已串行化 SDK 调用，但默认线程池 40 线程会全部排队堆积。
+    SdkGate 在路由层限制"在飞"的 SDK 调用数，超出的立即 503，配合 try_acquire/release。
+    线程安全：内部 threading.Lock，持锁时间极短（仅计数器增减）。
+    """
+
+    def __init__(self, max_concurrent: int = 5):
+        self._max = max_concurrent
+        self._active = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._active >= self._max:
+                return False
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+
+
 def create_app(config: Config | None = None, gateway: Gateway | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
@@ -185,6 +211,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     app.state.kline_service = kline_service
     app.state.realtime_service = realtime_service
     app.state.health_service = health_service
+    app.state.sdk_gate = SdkGate(max_concurrent=5)
 
     @app.get("/health")
     async def health():
@@ -204,6 +231,8 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         logger.info("request_id=%s /daily codes=%d %s..%s",
                     get_request_id(request), len(req.codes),
                     req.start_time or "(default)", req.end_time or "(default)")
+        if not app.state.sdk_gate.try_acquire():
+            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
         try:
             # kline_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
             data = await asyncio.to_thread(
@@ -226,6 +255,8 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         except Exception as e:
             logger.error("unhandled error: %s: %s", type(e).__name__, e)
             raise AppError(INTERNAL_ERROR, str(e), 500)
+        finally:
+            app.state.sdk_gate.release()
 
     @app.post("/minute")
     async def minute(req: MinuteRequest, request: Request):
@@ -236,6 +267,8 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         logger.info("request_id=%s /minute codes=%d period=%s %s..%s",
                     get_request_id(request), len(req.codes), period,
                     req.start_time or "(default)", req.end_time or "(default)")
+        if not app.state.sdk_gate.try_acquire():
+            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
         try:
             # kline_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
             data = await asyncio.to_thread(
@@ -257,6 +290,8 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         except Exception as e:
             logger.error("unhandled error: %s: %s", type(e).__name__, e)
             raise AppError(INTERNAL_ERROR, str(e), 500)
+        finally:
+            app.state.sdk_gate.release()
 
     @app.get("/realtime")
     async def realtime(request: Request, codes: str | None = None):

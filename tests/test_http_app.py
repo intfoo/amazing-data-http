@@ -455,3 +455,32 @@ def test_shutdown_calls_gateway_logout():
         assert gw.login_called >= 1
     # 退出 with 块后 shutdown 触发 logout
     assert gw.logout_called >= 1
+
+
+def test_sdk_gate_rejects_when_busy():
+    """SdkGate 满载时 try_acquire 返回 False，路由返回 503 SERVICE_BUSY。"""
+    from app.http_app import SdkGate
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    app = create_app(config=config, gateway=gw)
+    app.state.sdk_gate = SdkGate(max_concurrent=1)
+    assert app.state.sdk_gate.try_acquire() is True  # 占用唯一槽位
+    client = TestClient(app)
+    resp = client.post("/daily", json={"codes": ["000001.SZ"]})
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "SERVICE_BUSY"
+    app.state.sdk_gate.release()
+    resp2 = client.post("/daily", json={"codes": ["000001.SZ"]})
+    assert resp2.status_code == 200
+
+
+def test_sdk_gate_allows_under_limit():
+    """并发数在上限内时正常返回 200。"""
+    from app.http_app import SdkGate
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+    app = create_app(config=config, gateway=gw)
+    app.state.sdk_gate = SdkGate(max_concurrent=5)
+    client = TestClient(app)
+    resp = client.post("/daily", json={"codes": ["000001.SZ"]})
+    assert resp.status_code == 200
