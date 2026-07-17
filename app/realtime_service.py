@@ -104,13 +104,16 @@ class RealtimeService:
             # 无 codes：不查全市场。有旧缓存返回缓存；缓存空时检查 SDK 就绪
             # （未就绪抛 GatewayNotReadyError 让路由转 503，保持错误语义不变）
             if self._fallback_cache:
+                logger.info("fallback no codes, returning cached: %d records", len(self._fallback_cache))
                 return list(self._fallback_cache)
             if not self._gw.is_ready():
                 raise GatewayNotReadyError("gateway not ready")
+            logger.info("fallback no codes, cache empty, returning []")
             return []
         now = time.time()
         # 1. 缓存有效 → 直接返回过滤结果
         if self._fallback_cache is not None and now - self._fallback_time <= FALLBACK_TTL:
+            logger.info("fallback cache hit (TTL valid): %d records", len(self._fallback_cache))
             return self._filter_fallback(codes)
         # 2. 缓存过期/空 → 非阻塞抢 singleflight 锁
         if not self._fallback_lock.acquire(blocking=False):
@@ -125,8 +128,10 @@ class RealtimeService:
             # 双检：抢锁期间可能已被其他请求填充缓存
             now = time.time()
             if self._fallback_cache is not None and now - self._fallback_time <= FALLBACK_TTL:
+                logger.info("fallback cache hit after lock: %d records", len(self._fallback_cache))
                 return self._filter_fallback(codes)
             # codes 此处必非空（无 codes 已在方法开头短路返回），直接用作查询列表
+            logger.info("fallback query_snapshot started: %d codes", len(codes))
             try:
                 result = self._gw.query_snapshot(
                     codes,
@@ -145,6 +150,7 @@ class RealtimeService:
                 records = serialize_dataframe(merged)
             else:
                 records = []
+                logger.info("fallback query_snapshot returned empty result for %d codes", len(codes))
             self._fallback_cache = records
             self._fallback_time = time.time()
             logger.info("fallback query_snapshot: %d records cached", len(records))

@@ -308,8 +308,12 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             # 缓存空（非交易时段/订阅未推送），fallback 查当日历史快照。
             # query_snapshot 是同步阻塞 SDK 调用（全市场可能数分钟），必须放线程池，
             # 否则卡死 event loop 导致 /health 等其他请求全部阻塞。
+            logger.info("request_id=%s realtime cache empty, falling back to query_snapshot (codes=%s)",
+                        get_request_id(request), code_list or "(none)")
             try:
                 data = await asyncio.to_thread(realtime_service.fallback_snapshot, code_list)
+                logger.info("request_id=%s realtime fallback returned %d records",
+                            get_request_id(request), len(data))
             except GatewayNotReadyError as e:
                 raise AppError(SDK_NOT_READY, str(e), 503)
             except Exception as e:
