@@ -44,6 +44,8 @@ class RealtimeService:
         # 全市场 query_snapshot 可能数分钟，并发请求若各自发起查询会堆积抢 gateway._lock，
         # 导致整个服务雪崩。改为：第一个请求查，期间其他请求返回旧缓存/空，不阻塞。
         self._fallback_lock = threading.Lock()
+        # 按类型缓存快照提取函数（dataclass/vars/slots），避免每帧类型探测
+        self._extract_fns: dict = {}
 
     def on_snapshot(self, data) -> None:
         """订阅回调：Snapshot → dict → 缓存覆盖。异常吞掉，不影响订阅线程。"""
@@ -158,29 +160,31 @@ class RealtimeService:
             return [r for r in self._fallback_cache if r.get("code") in wanted]
         return list(self._fallback_cache)
 
-    @staticmethod
-    def _snapshot_to_dict(data) -> dict:
-        """Snapshot 对象 → JSON 安全 dict。
+    def _snapshot_to_dict(self, data) -> dict:
+        """Snapshot 对象 → JSON 安全 dict（按类型缓存提取函数）。
 
-        SDK 回调传入 ad.constant.Snapshot 对象，字段访问方式未在 probe 中验证。
-        采用三级降级策略提取字段：
-        1. dataclasses.is_dataclass(data) → dataclasses.asdict(data)
-        2. 有 __dict__ → vars(data)
-        3. 遍历 type(data).__mro__ 收集所有 __slots__（含继承）
-
-        提取后对每个值调用 serialize_value 转换：
-        - datetime/Timestamp → isoformat 字符串
-        - NaN/NaT → None
-        - numpy 标量 → python 原生
-        返回 {} 表示无法提取（调用方 on_snapshot 跳过 code 为空的记录）。
+        首次遇到某类型时确定提取策略（dataclass.asdict / vars / slots 遍历），
+        缓存到 _extract_fns[type]，后续同类型直接调用，避免每帧 is_dataclass/hasattr 开销。
+        提取后对每个值调 serialize_value 转换 datetime/NaN/numpy。
         """
-        if dataclasses.is_dataclass(data):
-            raw = dataclasses.asdict(data)
-        elif hasattr(data, "__dict__"):
-            raw = dict(vars(data))
-        else:
-            slots = []
-            for cls in type(data).__mro__:
-                slots.extend(getattr(cls, "__slots__", []))
-            raw = {s: getattr(data, s) for s in slots if hasattr(data, s)} if slots else {}
+        t = type(data)
+        fn = self._extract_fns.get(t)
+        if fn is None:
+            fn = self._build_extract_fn(data)
+            self._extract_fns[t] = fn
+        raw = fn(data)
         return {k: serialize_value(v) for k, v in raw.items()}
+
+    @staticmethod
+    def _build_extract_fn(data):
+        """根据 data 类型构建字段提取函数（首次调用，结果可缓存）。"""
+        if dataclasses.is_dataclass(data):
+            return dataclasses.asdict
+        if hasattr(data, "__dict__"):
+            return lambda d: dict(vars(d))
+        slots = []
+        for cls in type(data).__mro__:
+            slots.extend(getattr(cls, "__slots__", []))
+        if slots:
+            return lambda d: {s: getattr(d, s) for s in slots if hasattr(d, s)}
+        return lambda d: {}

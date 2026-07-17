@@ -340,3 +340,20 @@ def test_fallback_concat_takes_last_row_per_code():
     by_code = {r["code"]: r for r in result}
     assert by_code["000001.SZ"]["last"] == 10.3  # 取最后一行
     assert by_code["600000.SH"]["last"] == 20.5
+
+
+def test_snapshot_to_dict_caches_per_type():
+    """同类型多次调用应复用提取函数，混合类型（股票+指数）不串类型。"""
+    svc = RealtimeService(gateway=None)
+    # 交替推送股票和指数快照，验证类型缓存不混淆
+    for i in range(10):
+        svc.on_snapshot(_snap(code=f"{i:06d}.SZ"))
+        svc.on_snapshot(_index_snap(code=f"{i:06d}.SH"))
+    result = svc.snapshot()
+    stock = [r for r in result if r["code"].endswith(".SZ")]
+    index = [r for r in result if r["code"].endswith(".SH")]
+    assert len(stock) == 10
+    assert len(index) == 10
+    # 指数快照含 trading_phase_code，股票不含
+    assert "trading_phase_code" in index[0]
+    assert "trading_phase_code" not in stock[0]
