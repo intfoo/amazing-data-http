@@ -13,6 +13,8 @@ import logging
 import threading
 import time
 
+import pandas as pd
+
 from app.gateway import GatewayNotReadyError
 from app.serializer import serialize_dataframe, serialize_value
 
@@ -132,12 +134,14 @@ class RealtimeService:
             except Exception as e:
                 logger.warning("fallback query_snapshot failed: %s: %s", type(e).__name__, e)
                 return self._filter_fallback(codes) if self._fallback_cache else []
-            records: list[dict] = []
-            for code, df in result.items():
-                if df is None or df.empty:
-                    continue
-                # 取最后一行（最新快照），用 serialize_dataframe 序列化
-                records.extend(serialize_dataframe(df.tail(1)))
+            # 合并每只股票的最后一行（最新快照），一次 serialize_dataframe 序列化，
+            # 避免几千只股票逐只调 serialize_dataframe 的开销。
+            tails = [df.tail(1) for df in result.values() if df is not None and not df.empty]
+            if tails:
+                merged = pd.concat(tails, ignore_index=True)
+                records = serialize_dataframe(merged)
+            else:
+                records = []
             self._fallback_cache = records
             self._fallback_time = time.time()
             logger.info("fallback query_snapshot: %d records cached", len(records))

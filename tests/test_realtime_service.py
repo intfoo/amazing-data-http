@@ -316,3 +316,27 @@ def test_snapshot_large_cache_returns_correct_count():
         svc.on_snapshot(_snap(code=f"{i:06d}.SZ"))
     result = svc.snapshot()
     assert len(result) == 100
+
+
+def test_fallback_concat_takes_last_row_per_code():
+    """fallback 应对每只股票取最后一行（最新快照），多只合并序列化。"""
+    import pandas as pd
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    gw.query_snapshot = lambda codes, **kw: {
+        "000001.SZ": pd.DataFrame({
+            "code": ["000001.SZ", "000001.SZ"],
+            "last": [10.0, 10.3],
+            "trade_time": [pd.Timestamp("2024-01-02T09:30"), pd.Timestamp("2024-01-02T15:00")],
+        }),
+        "600000.SH": pd.DataFrame({
+            "code": ["600000.SH"],
+            "last": [20.5],
+            "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+        }),
+    }
+    result = svc.fallback_snapshot(["000001.SZ", "600000.SH"])
+    assert len(result) == 2
+    by_code = {r["code"]: r for r in result}
+    assert by_code["000001.SZ"]["last"] == 10.3  # 取最后一行
+    assert by_code["600000.SH"]["last"] == 20.5
