@@ -122,3 +122,17 @@ def test_serialize_dataframe_large_volume_correctness():
     assert result[0]["close"] is None
     assert result[0]["kline_time"] == "2024-01-02T00:00:00"
     assert result[-1]["kline_time"].startswith("20")
+
+
+def test_serialize_dataframe_nullable_int64_column():
+    """pandas 可空整型 Int64 列中的 pd.NA 应转为 None，非空值转 Python int。"""
+    df = pd.DataFrame({
+        "code": ["A", "B", "C"],
+        "volume": pd.array([100, None, 300], dtype="Int64"),
+    })
+    result = serialize_dataframe(df)
+    assert result == [
+        {"code": "A", "volume": 100},
+        {"code": "B", "volume": None},
+        {"code": "C", "volume": 300},
+    ]

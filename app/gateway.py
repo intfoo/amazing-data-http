@@ -43,7 +43,7 @@ PERIOD_MAP: dict[str, str] = {
 # 基于常见网络异常消息，保守匹配，误判也只是多一次 relogin 尝试。
 _CONNECTION_KEYWORDS: tuple[str, ...] = (
     "connection", "timeout", "timed out", "disconnect", "disconnected",
-    "broken pipe", "eof", "reset", "unreachable", "refused", "closed",
+    "broken pipe", "eof occurred", "reset", "unreachable", "refused", "closed",
 )
 
 

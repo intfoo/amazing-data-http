@@ -46,6 +46,8 @@ RUN pip install --no-cache-dir .
 RUN ldd /usr/local/lib/python3.14/site-packages/tgw/linux_py314_x64_package/libtgw_python314.so 2>&1 || true
 
 # host/port 从环境变量读取（docker-compose env_file 注入 .env 的 HTTP_HOST/HTTP_PORT）。
-EXPOSE 3021
+# EXPOSE 跟随 HTTP_PORT 默认值（构建时展开）；实际监听端口由 CMD 的 uvicorn --port 决定（运行时展开）
+ARG HTTP_PORT=3021
+EXPOSE ${HTTP_PORT}
 # 读取 HTTP_HOST/HTTP_PORT 环境变量（.env 注入），默认 0.0.0.0:3021
 CMD ["sh", "-c", "uvicorn app.http_app:app --host ${HTTP_HOST:-0.0.0.0} --port ${HTTP_PORT:-3021}"]

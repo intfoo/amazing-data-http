@@ -90,3 +90,15 @@ def test_query_kline_non_connection_error_does_not_relogin(monkeypatch):
     with pytest.raises(GatewayQueryError, match="query failed"):
         gw.query_kline(["000001.SZ"], 20240101, 20240131, "day")
     assert login_called[0] == 0
+
+
+def test_is_connection_error_eof_occurred_matches():
+    """'EOF occurred in violation of protocol' 应匹配为连接错误。"""
+    from app.gateway import _is_connection_error
+    assert _is_connection_error(RuntimeError("EOF occurred in violation of protocol"))
+
+
+def test_is_connection_error_bare_eof_field_name_does_not_match():
+    """仅含 'eof' 子串但非连接错误（如字段名 'some_eof_field'）不应误匹配。"""
+    from app.gateway import _is_connection_error
+    assert not _is_connection_error(ValueError("invalid some_eof_field value"))

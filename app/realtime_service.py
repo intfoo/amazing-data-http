@@ -44,7 +44,8 @@ class RealtimeService:
         # 全市场 query_snapshot 可能数分钟，并发请求若各自发起查询会堆积抢 gateway._lock，
         # 导致整个服务雪崩。改为：第一个请求查，期间其他请求返回旧缓存/空，不阻塞。
         self._fallback_lock = threading.Lock()
-        # 按类型缓存快照提取函数（dataclass/vars/slots），避免每帧类型探测
+        # 按类型缓存快照提取函数。实际场景中 Snapshot 类型固定（股票/指数 2 种），
+        # 缓存条目数有界，无需淘汰策略。若未来 SDK 引入更多类型可考虑加上限。
         self._extract_fns: dict = {}
 
     def on_snapshot(self, data) -> None:

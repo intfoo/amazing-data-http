@@ -18,6 +18,7 @@ class Config:
     port: int            # AmazingData/tgw 服务器端口
     http_host: str = "0.0.0.0"  # HTTP 监听地址，默认全网卡
     http_port: int = 3021       # HTTP 监听端口
+    sdk_max_concurrent: int = 5  # SDK 最大并发调用数，超出返回 503
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -29,6 +30,7 @@ class Config:
             port=int(os.environ.get("AMAZINGDATA_PORT", "0") or "0"),
             http_host=os.environ.get("HTTP_HOST", "0.0.0.0") or "0.0.0.0",
             http_port=int(os.environ.get("HTTP_PORT", "3021") or "3021"),
+            sdk_max_concurrent=int(os.environ.get("SDK_MAX_CONCURRENT", "5") or "5"),
         )
 
     def is_configured(self) -> bool:

@@ -28,3 +28,15 @@ def test_config_defaults():
     assert cfg.http_host == "0.0.0.0"
     assert cfg.http_port == 3021
     assert cfg.is_configured() is False
+
+
+def test_config_reads_sdk_max_concurrent(monkeypatch):
+    monkeypatch.setenv("SDK_MAX_CONCURRENT", "3")
+    cfg = Config.from_env()
+    assert cfg.sdk_max_concurrent == 3
+
+
+def test_config_default_sdk_max_concurrent(monkeypatch):
+    monkeypatch.delenv("SDK_MAX_CONCURRENT", raising=False)
+    cfg = Config.from_env()
+    assert cfg.sdk_max_concurrent == 5

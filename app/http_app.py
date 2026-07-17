@@ -211,7 +211,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     app.state.kline_service = kline_service
     app.state.realtime_service = realtime_service
     app.state.health_service = health_service
-    app.state.sdk_gate = SdkGate(max_concurrent=5)
+    app.state.sdk_gate = SdkGate(max_concurrent=config.sdk_max_concurrent)
 
     @app.get("/health")
     async def health():
