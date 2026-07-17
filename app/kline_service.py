@@ -79,7 +79,7 @@ class KlineService:
         """
         if period in MINUTE_PERIODS and start_time is None and end_time is None:
             # 分钟K不传日期时默认近一年，end_date 用 None 让 SDK 取到最新
-            now = datetime.now()
+            now = datetime.now(_SHANGHAI_TZ)
             begin_date = int((now - timedelta(days=365)).strftime("%Y%m%d"))
             end_date = None
             logger.info("minute default range: begin_date=%s (last 365 days)", begin_date)

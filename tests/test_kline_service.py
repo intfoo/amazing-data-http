@@ -346,3 +346,25 @@ def test_flatten_does_not_mutate_gateway_result():
     # 原始 df 的 kline_time 仍是 Timestamp，未被 strftime 改成字符串
     assert df["kline_time"].iloc[0] == original_time
     assert isinstance(df["kline_time"].iloc[0], pd.Timestamp)
+
+
+def test_query_minute_default_range_uses_shanghai_timezone(monkeypatch):
+    """minute 默认 begin_date 应基于 UTC+8 计算，不受运行环境 TZ 影响。"""
+    from app.kline_service import _SHANGHAI_TZ
+    from datetime import datetime, timezone, timedelta
+    # 固定 UTC 2024-07-16 16:00 = 北京时间 2024-07-17 00:00
+    fake_now = datetime(2024, 7, 16, 16, 0, 0, tzinfo=timezone.utc).astimezone(_SHANGHAI_TZ)
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fake_now if tz else fake_now.replace(tzinfo=None)
+
+    monkeypatch.setattr("app.kline_service.datetime", FakeDateTime)
+    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()})
+    svc = KlineService(gw)
+    svc.query(["000001.SZ"], period="min1")
+    call = gw.query_calls[0]
+    expected = int((fake_now - timedelta(days=365)).strftime("%Y%m%d"))
+    assert call["begin_date"] == expected
+    assert call["end_date"] is None
