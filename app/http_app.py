@@ -28,6 +28,7 @@ from app.errors import (
 )
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, AmazingDataGateway
 from app.health import HealthService
+from app.adj_factor_service import AdjFactorService
 from app.kline_service import KlineService, MINUTE_PERIODS
 from app.realtime_service import RealtimeService
 
@@ -109,6 +110,22 @@ class MinuteRequest(BaseModel):
         return v
 
 
+class AdjFactorRequest(BaseModel):
+    """POST /adj_factor 请求体。字段名与 /daily 一致，由外部项目 YAML field_map 适配。"""
+
+    codes: list[str]                # 股票代码列表，如 ["000001.SZ", "600000.SH"]
+    start_time: str | None = None   # 开始日期，YYYY-MM-DD 或 ISO datetime；可选
+    end_time: str | None = None     # 结束日期，同上；可选
+
+    @field_validator("codes")
+    @classmethod
+    def codes_nonempty(cls, v):
+        """codes 必须是非空数组，Pydantic 校验失败自动返回 422。"""
+        if not v or len(v) == 0:
+            raise ValueError("codes must be a non-empty array")
+        return v
+
+
 class SdkGate:
     """并发 SDK 调用闸门：在飞调用超过上限时快速失败返回 503，避免线程堆积雪崩。
 
@@ -147,6 +164,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
 
     kline_service = KlineService(gateway)
     realtime_service = RealtimeService(gateway)
+    adj_factor_service = AdjFactorService(gateway)
     health_service = HealthService(config, gateway, realtime_service)
 
     @asynccontextmanager
@@ -211,6 +229,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     app.state.kline_service = kline_service
     app.state.realtime_service = realtime_service
     app.state.health_service = health_service
+    app.state.adj_factor_service = adj_factor_service
     app.state.sdk_gate = SdkGate(max_concurrent=config.sdk_max_concurrent)
 
     @app.get("/health")
@@ -273,6 +292,42 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             # kline_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
             data = await asyncio.to_thread(
                 kline_service.query, req.codes, req.start_time, req.end_time, period=period
+            )
+            return {"data": data}
+        except AppError:
+            raise
+        except ValueError as e:
+            raise AppError(INVALID_REQUEST, str(e), 422)
+        except GatewayNotReadyError as e:
+            raise AppError(SDK_NOT_READY, str(e), 503)
+        except GatewayQueryError as e:
+            raise AppError(SDK_QUERY_FAILED, str(e), 502)
+        except (TypeError, OverflowError) as e:
+            if "serialize" in str(e).lower() or "json" in str(e).lower():
+                raise AppError(SERIALIZATION_FAILED, str(e), 502)
+            raise AppError(INTERNAL_ERROR, str(e), 500)
+        except Exception as e:
+            logger.error("unhandled error: %s: %s", type(e).__name__, e)
+            raise AppError(INTERNAL_ERROR, str(e), 500)
+        finally:
+            app.state.sdk_gate.release()
+
+    @app.post("/adj_factor")
+    async def adj_factor(req: AdjFactorRequest, request: Request):
+        """除权因子查询。返回 {"data": [{code, trade_date, adj_factor}]}。
+
+        start_time / end_time 可选；未传时返回全量除权事件。
+        SDK get_adj_factor 不支持日期参数，由 AdjFactorService 服务端过滤 trade_date。
+        """
+        logger.info("request_id=%s /adj_factor codes=%d %s..%s",
+                    get_request_id(request), len(req.codes),
+                    req.start_time or "(default)", req.end_time or "(default)")
+        if not app.state.sdk_gate.try_acquire():
+            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
+        try:
+            # adj_factor_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
+            data = await asyncio.to_thread(
+                app.state.adj_factor_service.query, req.codes, req.start_time, req.end_time
             )
             return {"data": data}
         except AppError:

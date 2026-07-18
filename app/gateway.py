@@ -10,6 +10,7 @@ AmazingDataGateway 是真实实现，FakeGateway（tests/conftest.py）用于自
 
 import logging
 import threading
+import time
 from typing import Any, Protocol, runtime_checkable
 
 import pandas as pd
@@ -77,6 +78,7 @@ class Gateway(Protocol):
         self, code_list: list[str], on_data, on_error=None
     ) -> None: ...
     def stop_subscription(self) -> None: ...
+    def get_adj_factor(self, codes: list[str]) -> "pd.DataFrame": ...
 
 
 class GatewayError(Exception):
@@ -112,6 +114,27 @@ class AmazingDataGateway:
         self._calendar = None       # 交易日历 list[int]（供 query_snapshot 默认日期）
         self._subscribe_data = None  # ad.SubscribeData 实例
         self._sub_thread = None      # 订阅 daemon 线程
+        self._adj_factor_local_path = self._resolve_adj_factor_local_path()
+
+    def _resolve_adj_factor_local_path(self) -> str:
+        """解析 adj_factor 本地缓存目录：配置非空用配置，否则用项目根 data/adj_factor 兜底 + 警告。
+
+        启动时（实例化）调用，目录不存在则自动创建。SDK 要求绝对路径。
+        """
+        from pathlib import Path
+        configured = self._config.adj_factor_local_path
+        if configured:
+            local_path = str(Path(configured).resolve())
+        else:
+            # 默认项目根/data/adj_factor（gateway.py 在 app/，parent.parent = 项目根）
+            local_path = str(Path(__file__).resolve().parent.parent / "data" / "adj_factor")
+            logger.warning(
+                "ADJ_FACTOR_LOCAL_PATH not configured, using default: %s. "
+                "Set ADJ_FACTOR_LOCAL_PATH to a persistent absolute path for SDK caching.",
+                local_path,
+            )
+        Path(local_path).mkdir(parents=True, exist_ok=True)
+        return local_path
 
     def login(self) -> None:
         """线程安全的登录入口。"""
@@ -193,12 +216,27 @@ class AmazingDataGateway:
         """
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
+        t_enter = time.perf_counter()
         with self._lock:
+            t_lock = time.perf_counter()
+            logger.info(
+                "get_code_list(security_type=%s) calling SDK (lock_wait=%.3fs)",
+                security_type, t_lock - t_enter,
+            )
+            t0 = time.perf_counter()
             try:
-                return self._base_data.get_code_list(security_type=security_type)
+                result = self._base_data.get_code_list(security_type=security_type)
             except Exception as e:
                 logger.error("get_code_list failed: %s: %s", type(e).__name__, e)
                 raise GatewayQueryError(f"get_code_list failed: {e}") from e
+            sdk_elapsed = time.perf_counter() - t0
+            total_elapsed = time.perf_counter() - t_lock
+            logger.info(
+                "get_code_list(security_type=%s) returned %d codes "
+                "(sdk=%.3fs total=%.3fs)",
+                security_type, len(result), sdk_elapsed, total_elapsed,
+            )
+            return result
 
     def get_realtime_code_list(self) -> list[str]:
         """获取实时订阅用的合并代码列表（股票 + 指数）。
@@ -207,17 +245,30 @@ class AmazingDataGateway:
         股票列表获取失败时异常正常传播（GatewayNotReadyError / GatewayQueryError）。
         指数列表获取失败时降级：记录 warning，只返回股票列表，不抛异常。
         """
+        t_total = time.perf_counter()
         stock_codes = self.get_code_list(security_type="EXTRA_STOCK_A")
+        t_stock = time.perf_counter() - t_total
         try:
+            t0 = time.perf_counter()
             index_codes = self.get_code_list(security_type="EXTRA_INDEX_A")
+            t_index = time.perf_counter() - t0
         except Exception as e:
             logger.warning(
                 "get_code_list(EXTRA_INDEX_A) failed, degrading to stock-only: %s: %s",
                 type(e).__name__, e,
             )
+            logger.info(
+                "get_realtime_code_list done: %d stocks in %.3fs (index failed, total %.3fs)",
+                len(stock_codes), t_stock, time.perf_counter() - t_total,
+            )
             return stock_codes
-        logger.info("get_realtime_code_list: %d stocks + %d indices = %d total",
-                    len(stock_codes), len(index_codes), len(stock_codes) + len(index_codes))
+        total = time.perf_counter() - t_total
+        logger.info(
+            "get_realtime_code_list: %d stocks + %d indices = %d total "
+            "(stock=%.3fs index=%.3fs total=%.3fs)",
+            len(stock_codes), len(index_codes), len(stock_codes) + len(index_codes),
+            t_stock, t_index, total,
+        )
         return stock_codes + index_codes
 
     def query_snapshot(
@@ -387,3 +438,39 @@ class AmazingDataGateway:
                 logger.warning("stop subscription error (ignored): %s: %s", type(e).__name__, e)
         self._subscribe_data = None
         self._sub_thread = None
+
+    def get_adj_factor(self, codes: list[str]) -> "pd.DataFrame":
+        """获取单次复权因子（手册 3.5.2.6）。返回 SDK 原始 DataFrame（宽表：index=交易日期, columns=股票代码）。
+
+        SDK 签名 get_adj_factor(code_list, local_path, is_local)，无日期参数。
+        is_local=False：从服务端取最新，但仍会更新 local_path 缓存（手册注(2)）。
+        local_path 在启动时由 _resolve_adj_factor_local_path 解析（配置优先，否则项目根 data/adj_factor 兜底）。
+        """
+        if not self._ready or self._base_data is None:
+            raise GatewayNotReadyError("gateway not ready")
+        with self._lock:
+            try:
+                return self._base_data.get_adj_factor(
+                    codes,
+                    local_path=self._adj_factor_local_path,
+                    is_local=False,
+                )
+            except Exception as e:
+                logger.error("get_adj_factor failed: %s: %s (codes=%d)",
+                             type(e).__name__, e, len(codes))
+                if _is_connection_error(e):
+                    logger.warning("get_adj_factor connection error, attempting relogin: %s", e)
+                    try:
+                        self._do_login()
+                        result = self._base_data.get_adj_factor(
+                            codes,
+                            local_path=self._adj_factor_local_path,
+                            is_local=False,
+                        )
+                        logger.info("get_adj_factor succeeded after relogin")
+                        return result
+                    except Exception as e2:
+                        logger.error("get_adj_factor failed after reconnect: %s: %s",
+                                     type(e2).__name__, e2)
+                        raise GatewayQueryError(f"get_adj_factor failed after reconnect: {e2}") from e2
+                raise GatewayQueryError(f"get_adj_factor failed: {e}") from e

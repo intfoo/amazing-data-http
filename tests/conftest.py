@@ -10,13 +10,16 @@ _UNSET = object()
 
 
 class FakeGateway:
-    def __init__(self, ready: bool = True, result: dict[str, pd.DataFrame] | None = _UNSET):
+    def __init__(self, ready: bool = True, result: dict[str, pd.DataFrame] | None = _UNSET,
+                 adj_factor_result: pd.DataFrame | None = None):
         self._ready = ready
         self._result = result if result is not _UNSET else {}
+        self._adj_factor_result = adj_factor_result
         self._logged_in = ready
         self.login_called = 0
         self.logout_called = 0
         self.query_calls: list[dict] = []
+        self.adj_factor_query_calls: list[dict] = []
         self._code_list = ["000001.SZ", "600000.SH"]
         self._index_code_list = ["000001.SH", "399001.SZ"]
         self.sub_start_called = 0
@@ -77,6 +80,15 @@ class FakeGateway:
     def stop_subscription(self):
         self.sub_stop_called += 1
 
+    def get_adj_factor(self, codes):
+        """FakeGateway 除权因子查询：记录调用，未就绪抛 GatewayNotReadyError。"""
+        self.adj_factor_query_calls.append({"codes": codes})
+        if not self._ready:
+            raise GatewayNotReadyError("fake not ready")
+        if self._adj_factor_result is None:
+            return pd.DataFrame()
+        return self._adj_factor_result
+
 
 def make_daily_df(code: str = "000001.SZ", rows: int = 1) -> pd.DataFrame:
     dates = pd.date_range("2024-01-02", periods=rows, freq="D")
@@ -92,6 +104,21 @@ def make_daily_df(code: str = "000001.SZ", rows: int = 1) -> pd.DataFrame:
             "amount": [12700000.0] * rows,
         },
         index=pd.Index(dates, name="trade_time"),
+    )
+
+
+def make_adj_factor_df() -> pd.DataFrame:
+    """模拟 SDK get_adj_factor 返回的宽表：index=交易日期, columns=股票代码。
+
+    含 NaN 单元格模拟非除权日（dropna 后被过滤）。与 SDK 手册 3.5.2.6 输出格式一致。
+    """
+    dates = pd.date_range("2024-05-30", periods=2, freq="D")
+    return pd.DataFrame(
+        {
+            "000001.SZ": [1.05, None],
+            "600000.SH": [None, 1.10],
+        },
+        index=pd.Index(dates, name="trade_date"),
     )
 
 

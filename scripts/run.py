@@ -203,14 +203,35 @@ def ensure_sdk(install_fn, confirm_fn):
     except ImportError:
         pass
     if confirm_fn("SDK 未安装，是否自动安装？"):
-        pkgs = pick_sdk_wheels() + ["fastapi", "uvicorn[standard]", "pandas", "numpy"]
+        pkgs = pick_sdk_wheels() + ["fastapi", "uvicorn[standard]", "pandas", "numpy", "tables"]
         print("正在安装 SDK 依赖（可能 1-2 分钟，请稍候）...")
         install_fn(pkgs)
         print("安装完成。")
     else:
         print("已跳过安装。请手动执行：")
-        manual = " ".join(pick_sdk_wheels() + ["fastapi", "uvicorn[standard]", "pandas", "numpy"])
+        manual = " ".join(pick_sdk_wheels() + ["fastapi", "uvicorn[standard]", "pandas", "numpy", "tables"])
         print(f"  {sys.executable} -m pip install {manual}")
+        sys.exit(1)
+
+
+def ensure_tables(install_fn, confirm_fn):
+    """确保 pytables(tables) 可 import——SDK get_adj_factor 的 HDF5 本地缓存依赖它。
+
+    SDK whl 未声明此依赖，新环境装了 SDK 仍可能缺 tables。无论 SDK 是否已装，
+    启动前都检查一次，缺了补装（老环境兜底）。
+    """
+    try:
+        import tables  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if confirm_fn("pytables(tables) 未安装（SDK 复权因子缓存需要），是否自动安装？"):
+        print("正在安装 tables...")
+        install_fn(["tables"])
+        print("安装完成。")
+    else:
+        print("已跳过。请手动执行：")
+        print(f"  {sys.executable} -m pip install tables")
         sys.exit(1)
 
 
@@ -262,6 +283,7 @@ def run_local(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
             print("probe 门禁失败，请检查凭据/网络后重跑。")
             sys.exit(1)
 
+    ensure_tables(install_fn, confirm_fn)
     host = creds.get("HTTP_HOST", DEFAULT_HTTP_HOST)
     port = int(creds.get("HTTP_PORT", DEFAULT_HTTP_PORT))
     print(f"正在启动 uvicorn（监听 {host}:{port}，启动时会登录 SDK，约数秒）...")

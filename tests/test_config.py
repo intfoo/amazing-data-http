@@ -40,3 +40,15 @@ def test_config_default_sdk_max_concurrent(monkeypatch):
     monkeypatch.delenv("SDK_MAX_CONCURRENT", raising=False)
     cfg = Config.from_env()
     assert cfg.sdk_max_concurrent == 5
+
+
+def test_config_default_adj_factor_local_path(monkeypatch):
+    monkeypatch.delenv("ADJ_FACTOR_LOCAL_PATH", raising=False)
+    cfg = Config.from_env()
+    assert cfg.adj_factor_local_path == ""
+
+
+def test_config_reads_adj_factor_local_path(monkeypatch):
+    monkeypatch.setenv("ADJ_FACTOR_LOCAL_PATH", "D://cache//adj//")
+    cfg = Config.from_env()
+    assert cfg.adj_factor_local_path == "D://cache//adj//"

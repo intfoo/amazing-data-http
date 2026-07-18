@@ -10,6 +10,13 @@ dist/
 
 # SDK 探测输出，含登录 token 与权限码，勿入库
 docs/probe-report.json
+docs/probe-code-info.json
 
 # codegraph MCP 索引（工具生成，勿入库）
 .codegraph/
+
+# 运行时数据缓存（SDK adj_factor HDF5 等）
+data/
+
+# 测试输出
+pytest_junit.xml

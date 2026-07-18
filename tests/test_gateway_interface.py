@@ -30,6 +30,26 @@ def test_fake_gateway_get_code_list():
     assert len(codes) > 0
 
 
+def test_fake_gateway_implements_get_adj_factor():
+    """FakeGateway 扩展 get_adj_factor 后仍满足 Gateway Protocol（@runtime_checkable）。"""
+    from tests.conftest import FakeGateway, make_adj_factor_df
+    from app.gateway import Gateway
+    gw = FakeGateway(ready=True, adj_factor_result=make_adj_factor_df())
+    assert isinstance(gw, Gateway)  # Protocol runtime check
+    df = gw.get_adj_factor(["000001.SZ"])
+    assert df is not None
+    assert not df.empty
+
+
+def test_fake_gateway_get_adj_factor_not_ready():
+    from tests.conftest import FakeGateway
+    from app.gateway import GatewayNotReadyError
+    import pytest
+    gw = FakeGateway(ready=False)
+    with pytest.raises(GatewayNotReadyError):
+        gw.get_adj_factor(["000001.SZ"])
+
+
 def test_fake_gateway_subscription_noop():
     from tests.conftest import FakeGateway
     gw = FakeGateway(ready=True)

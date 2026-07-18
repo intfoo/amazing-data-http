@@ -34,6 +34,12 @@
   - `tgw-*-py3-none-any.whl`（tgw 原生库，纯 Python，3.13/3.14 通用）
   - `AmazingData-*-cp313-none-any.whl`（Python 3.13 用）
   - `AmazingData-*-cp314-none-any.whl`（Python 3.14 用）
+- Python 运行时依赖（声明在 `pyproject.toml`）：`fastapi` / `uvicorn[standard]` / `pandas` / `numpy` / `tables`
+  - 本地 `scripts/run.py` 模式 1 会自动安装（SDK wheel + 全部 Python 依赖，含 `tables`）
+  - Docker 模式由 Dockerfile `pip install .` 自动安装
+  - 手动安装：`pip install -e .`（读 `pyproject.toml`）或 `pip install fastapi "uvicorn[standard]" pandas numpy tables`
+
+> `tables`（pytables）是 SDK `get_adj_factor`（复权因子 HDF5 本地缓存）的隐式依赖，SDK whl 未声明，必须单独确保安装。`/adj_factor` 端点依赖它；`/daily` `/minute` `/realtime` 不需要。
 
 ## 验证方式一：单元测试（无需 SDK、无需 Docker）
 
@@ -57,7 +63,7 @@ python scripts/run.py
 
 首次运行会逐项询问用户名 / IP / 端口 / 密码（密码隐藏输入），probe 登录验证通过后写入 `local.config.json`（gitignored），随后每次启动自动读取并重跑 probe 门禁。
 
-> SDK wheel 按 Python 解释器版本自动选 `cp313` / `cp314`；`import AmazingData` 失败时会询问是否自动 `pip install`。
+> SDK wheel 按 Python 解释器版本自动选 `cp313` / `cp314`；`import AmazingData` 失败时会询问是否自动 `pip install`。启动 uvicorn 前还会检查 `tables`（pytables，复权因子缓存依赖），缺失时提示自动安装。
 
 启动后用以下命令手动验证：
 

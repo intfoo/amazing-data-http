@@ -83,6 +83,42 @@
 
 **空结果**（HTTP 200）：`{"data": []}`
 
+## POST /adj_factor
+
+查询除权因子（单次复权因子，对应 SDK 手册 3.5.2.6 `BaseData.get_adj_factor`）。每次除权除息事件一行。
+
+**请求体**：
+```json
+{
+  "codes": ["000001.SZ", "600000.SH"],
+  "start_time": "2024-01-01",
+  "end_time": "2024-06-30"
+}
+```
+
+| 字段 | 类型 | 约束 |
+|------|------|------|
+| `codes` | string[] | 非空数组（必填） |
+| `start_time` | string | 可选。ISO 日期/日期时间格式。SDK `get_adj_factor` 不支持日期参数，服务端拉取全量后按 `trade_date` 过滤；缺省时该侧不过滤 |
+| `end_time` | string | 可选。格式同上。仅当两者都提供时校验 `start_time <= end_time`（按日期比较） |
+
+**成功响应**（HTTP 200）：
+```json
+{"data": [{"code": "000001.SZ", "trade_date": "2024-05-30", "adj_factor": 1.05}]}
+```
+
+响应 `data` 数组元素字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `code` | string | 证券代码+市场，如 `000001.SZ` |
+| `trade_date` | string | 除权日期，`yyyy-MM-dd` 格式 |
+| `adj_factor` | float | 单次复权因子（每次除权除息事件的比例，消费方自行累乘算累计因子） |
+
+**空结果**（HTTP 200）：`{"data": []}`
+
+> SDK `get_adj_factor` 返回宽表（index=交易日期, columns=股票代码），服务端 `melt` 成长表并 `dropna` 过滤非除权日。字段命名中性（`code`/`trade_date`/`adj_factor`），外部项目通过自身 YAML `field_map` 适配为内部字段（如 stocker 的 `symbol`/`trade_date`/`ex_factor`）。
+
 ## GET /realtime
 
 返回实时行情快照。**优先读订阅缓存**（盘中 SDK 实时推送，每个 code 保留最新一笔），**缓存空时 fallback 查当日历史快照**（`query_snapshot` 取收盘快照，覆盖非交易时段）。
@@ -180,4 +216,5 @@ GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
 | `SDK_QUERY_FAILED` | 502 | 上游 SDK 查询失败 |
 | `SERIALIZATION_FAILED` | 502 | 返回值无法安全序列化 |
 | `INTERNAL_ERROR` | 500 | 未分类的内部错误 |
+| `SERVICE_BUSY` | 503 | 并发 SDK 调用超限（`SDK_MAX_CONCURRENT`），快速失败 |
 | `REALTIME_SUBSCRIPTION_FAILED` | 503 | （保留）实时订阅降级标记；`/realtime` 当前改用 fallback 查询 + `SDK_NOT_READY`，不再返回此码 |
