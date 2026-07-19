@@ -197,6 +197,51 @@ GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
 | `config` | `complete` / `incomplete` | 四项凭据（用户名/密码/IP/端口）是否齐全 |
 | `realtime` | `active` / `inactive` | 实时订阅是否运行中。不影响 `status` 和 HTTP 状态码 |
 
+## 认证
+
+`/daily`、`/minute`、`/adj_factor`、`/realtime` 接口需要 Bearer Token 认证。客户端必须在请求头中携带：
+
+```
+Authorization: Bearer <AUTH_TOKEN>
+```
+
+`/health` 接口免认证（Docker healthcheck 约束）。
+
+### 配置
+
+| 环境变量 | 默认 | 说明 |
+|---------|------|------|
+| `AUTH_TOKEN` | `""` | Bearer token。强度要求：长度 > 12 且同时含字母和数字 |
+| `AUTH_REQUIRED` | `true` | 认证开关。`false` 时认证彻底关闭，所有请求直接放行，`AUTH_TOKEN` 被忽略 |
+
+启动时校验 token 强度，弱 token 阻止进程启动。
+
+### 401 响应
+
+缺失或无效 token 时返回 401：
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+X-Request-ID: <uuid>
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "missing or malformed Authorization header",
+    "request_id": "<uuid>"
+  }
+}
+```
+
+`message` 可能值：
+- `missing or malformed Authorization header` — 缺失或非 Bearer scheme
+- `empty bearer token` — `Bearer ` 后为空
+- `invalid bearer token` — token 比对失败
+
+token 比对使用 `hmac.compare_digest`（常数时间，防时序攻击）。scheme 名大小写不敏感（`bearer`/`Bearer`/`BEARER` 均接受，RFC 6750 §2.1）。
+
 ## 错误响应格式
 
 ```json
@@ -212,6 +257,7 @@ GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
 | 错误码 | HTTP | 含义 |
 |--------|------|------|
 | `INVALID_REQUEST` | 422 | 请求体、代码列表或日期参数无效 |
+| `UNAUTHORIZED` | 401 | 缺失或无效的 Bearer token |
 | `SDK_NOT_READY` | 503 | SDK 未登录或未初始化 |
 | `SDK_QUERY_FAILED` | 502 | 上游 SDK 查询失败 |
 | `SERIALIZATION_FAILED` | 502 | 返回值无法安全序列化 |
