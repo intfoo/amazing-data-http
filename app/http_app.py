@@ -228,8 +228,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             logger.warning("gateway logout failed on shutdown: %s: %s", type(e).__name__, e)
 
     app = FastAPI(title="AmazingData HTTP Adapter", lifespan=lifespan)
-    app.add_middleware(RequestIdMiddleware)  # 先 add = 外层 = 最先执行
+    # Starlette ≥1.x 的 add_middleware 用 insert(0,...)，后 add 的位于最外层 = 最先执行。
+    # 故 RequestIdMiddleware 后 add → 最外层 → 先执行 → 设置 request.state.request_id，
+    # AuthMiddleware 才能在 401 响应中读到正确 request_id（顺序写反则 401 的 request_id 恒为 "unknown"）。
     app.add_middleware(AuthMiddleware, token=config.auth_token, enabled=config.auth_required)
+    app.add_middleware(RequestIdMiddleware)
 
     app.state.config = config
     app.state.gateway = gateway

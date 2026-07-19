@@ -127,8 +127,11 @@ from app.http_app import create_app
 from fastapi.testclient import TestClient
 
 
-def make_test_app(gateway=None):
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021)
+def make_test_app(gateway=None, auth_token="", auth_required=False):
+    config = Config(
+        username="u", password="p", ip="1.2.3.4", port=3021,
+        auth_token=auth_token, auth_required=auth_required,
+    )
     if gateway is None:
         gateway = FakeGateway(ready=True, adj_factor_result=make_adj_factor_df())
     app = create_app(config=config, gateway=gateway)
