@@ -17,11 +17,19 @@ class HealthService:
         """返回健康状态详情。status=ok 当且仅当配置完整且 SDK 已登录。"""
         ready = self._config.is_configured() and self._gw.is_ready()
         rt = self._realtime_svc.is_active() if self._realtime_svc else False
+        # 复用 is_auth_valid() 保证与 lifespan validate_auth() 同口径
+        if not self._config.auth_required:
+            auth_state = "disabled"
+        elif self._config.is_auth_valid():
+            auth_state = "configured"
+        else:
+            auth_state = "misconfigured"
         return {
             "status": "ok" if ready else "degraded",
             "sdk": "ready" if self._gw.is_ready() else "not_ready",
             "config": "complete" if self._config.is_configured() else "incomplete",
             "realtime": "active" if rt else "inactive",
+            "auth": auth_state,
         }
 
     def is_ok(self) -> bool:

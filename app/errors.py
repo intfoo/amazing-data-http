@@ -18,6 +18,7 @@ SERIALIZATION_FAILED = "SERIALIZATION_FAILED"  # 502：返回值无法安全序�
 REALTIME_SUBSCRIPTION_FAILED = "REALTIME_SUBSCRIPTION_FAILED"  # 503：实时订阅未启动或已崩溃
 INTERNAL_ERROR = "INTERNAL_ERROR"            # 500：未分类的内部错误
 SERVICE_BUSY = "SERVICE_BUSY"                # 503：并发 SDK 调用超限，快速失败
+UNAUTHORIZED = "UNAUTHORIZED"                # 401：缺失或无效的 Bearer token
 
 
 class AppError(Exception):

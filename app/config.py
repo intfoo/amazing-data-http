@@ -20,6 +20,8 @@ class Config:
     http_port: int = 3021       # HTTP 监听端口
     sdk_max_concurrent: int = 5  # SDK 最大并发调用数，超出返回 503
     adj_factor_local_path: str = ""  # SDK get_adj_factor 的 local_path 参数，必须为绝对路径
+    auth_token: str = ""  # Bearer token；AUTH_REQUIRED=true 时客户端必须携带
+    auth_required: bool = False  # 字段默认 False（测试便利）；env 默认 "true"（生产安全）
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -33,8 +35,41 @@ class Config:
             http_port=int(os.environ.get("HTTP_PORT", "3021") or "3021"),
             sdk_max_concurrent=int(os.environ.get("SDK_MAX_CONCURRENT", "5") or "5"),
             adj_factor_local_path=os.environ.get("ADJ_FACTOR_LOCAL_PATH", "") or "",
+            auth_token=os.environ.get("AUTH_TOKEN", ""),
+            auth_required=os.environ.get("AUTH_REQUIRED", "true").lower()
+            in ("1", "true", "yes", "on"),
         )
 
     def is_configured(self) -> bool:
         """四项必填凭据是否全部非空。决定启动时是否尝试登录 SDK。"""
         return bool(self.username and self.password and self.ip and self.port)
+
+    def is_auth_valid(self) -> bool:
+        """返回 auth 配置是否有效。与 is_configured() 同风格（查询方法）。
+
+        - auth_required=False：始终返回 True（认证关闭，token 被忽略）
+        - auth_required=True：token 非空 + 长度>12 + 含字母和数字
+        """
+        if not self.auth_required:
+            return True
+        if not self.auth_token:
+            return False
+        if len(self.auth_token) <= 12:
+            return False
+        has_alpha = any(c.isalpha() for c in self.auth_token)
+        has_digit = any(c.isdigit() for c in self.auth_token)
+        return bool(has_alpha and has_digit)
+
+    def validate_auth(self) -> None:
+        """启动时校验 auth 配置。失败抛 ValueError，由 lifespan 捕获后进程退出。
+        内部委托给 is_auth_valid()，保证与 HealthService.status() 同口径。
+        """
+        if self.is_auth_valid():
+            return
+        if not self.auth_token:
+            raise ValueError("AUTH_TOKEN is required when AUTH_REQUIRED=true")
+        if len(self.auth_token) <= 12:
+            raise ValueError(
+                f"AUTH_TOKEN too short: {len(self.auth_token)} chars, need > 12"
+            )
+        raise ValueError("AUTH_TOKEN must contain both letters and digits")

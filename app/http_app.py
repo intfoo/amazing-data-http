@@ -26,6 +26,7 @@ from app.errors import (
     RequestIdMiddleware, SDK_NOT_READY, SDK_QUERY_FAILED, SERIALIZATION_FAILED,
     SERVICE_BUSY, get_request_id,
 )
+from app.auth import AuthMiddleware
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, AmazingDataGateway
 from app.health import HealthService
 from app.adj_factor_service import AdjFactorService
@@ -175,6 +176,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         startup/shutdown，TestClient 的 with 语法同样触发。
         """
         _align_uvicorn_log_format()
+        try:
+            config.validate_auth()
+        except ValueError as e:
+            logger.error("auth config invalid: %s", e)
+            raise  # 进程退出，uvicorn 启动失败
         if config.is_configured():
             try:
                 gateway.login()
@@ -222,7 +228,8 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             logger.warning("gateway logout failed on shutdown: %s: %s", type(e).__name__, e)
 
     app = FastAPI(title="AmazingData HTTP Adapter", lifespan=lifespan)
-    app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(RequestIdMiddleware)  # 先 add = 外层 = 最先执行
+    app.add_middleware(AuthMiddleware, token=config.auth_token, enabled=config.auth_required)
 
     app.state.config = config
     app.state.gateway = gateway
