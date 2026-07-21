@@ -12,6 +12,9 @@ services:
       - "${HTTP_PORT:-3021}:${HTTP_PORT:-3021}"
     env_file:
       - .env
+    volumes:
+      # 复权因子缓存目录：SDK get_adj_factor 的 local_path 缓存，
+      - ./data/adj_factor:/app/data/adj_factor
     restart: unless-stopped
     healthcheck:
       test: python -c "import urllib.request; urllib.request.urlopen('http://localhost:${HTTP_PORT:-3021}/health')"
