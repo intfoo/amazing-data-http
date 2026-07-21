@@ -63,44 +63,7 @@ jobs:
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ vars.SERVER_HOST }}
-          username: root
+          username: deployer
           key: ${{ secrets.SSH_KEY }}
           script: |
-            # 1. 开启严格模式：遇到错误立即退出，防止 pull 失败仍执行 up
-            set -e
-            set -o pipefail
-
-            cd /app/${{ github.event.repository.name }}
-
-            echo "::group::🛑 2. 停止并清理旧服务"
-            # --remove-orphans 清理 compose 文件中已删除的服务
-            podman-compose down --remove-orphans || true
-            echo "::endgroup::"
-
-            echo "::group::📦 3. 拉取最新镜像"
-            podman-compose pull
-            echo "::endgroup::"
-
-            echo "::group::🚀 4. 启动新服务"
-            podman-compose up -d --remove-orphans
-            echo "::endgroup::"
-
-            echo "::group::🧹 5. 清理悬空镜像 (释放磁盘空间)"
-            # 每次 pull 新镜像后，旧镜像会变成 <none>，定期清理防止磁盘爆满
-            podman image prune -f
-            echo "::endgroup::"
-
-            echo "::group::📊 6. 验证部署状态"
-            # 等待容器完全启动（特别是数据库等需要初始化的服务）
-            sleep 10
-            
-            echo ""
-            echo "=== Compose 服务状态 ==="
-            podman-compose ps
-            
-            echo ""
-            echo "=== 最近 20 行日志 ==="
-            podman-compose logs --tail=20
-            echo "::endgroup::"
-
-            echo "✅ 部署脚本执行完毕！"
+            bash /usr/local/bin/deploy.sh ${{ github.event.repository.name }}
