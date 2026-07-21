@@ -70,7 +70,7 @@ jobs:
             set -e
             set -o pipefail
 
-            cd /app/${{ github.repository }}
+            cd /app/${{ github.event.repository.name }}
 
             echo "::group::🛑 2. 停止并清理旧服务"
             # --remove-orphans 清理 compose 文件中已删除的服务
