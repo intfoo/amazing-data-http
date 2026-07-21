@@ -5,26 +5,61 @@
 ## 架构
 
 ```
-主项目数据同步任务
-    │ POST /daily  (symbols, start_time, end_time)
-    │ POST /minute (symbols, period, start, end)
-    │ GET  /realtime
+HTTP 客户端
+    │ POST /daily       (codes, start_time, end_time)
+    │ POST /minute      (codes, period, start_time, end_time)
+    │ POST /adj_factor  (codes, start_time, end_time)
+    │ GET  /realtime    (?codes=)
+    │ GET  /health
     ▼
-┌─────────────────────────────────────────┐
-│  AmazingData HTTP 适配服务 (FastAPI)     │
-│  ├── http_app.py   路由 + 错误处理       │
-│  ├── kline_service 日期转换 + 展平       │
-│  ├── realtime_service.py 实时订阅缓存    │
-│  ├── gateway.py   SDK 封装 (login/query) │
-│  ├── serializer.py DataFrame → JSON      │
-│  └── health.py    健康检查               │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  AmazingData HTTP 适配服务 (FastAPI)                 │
+│  ├── auth.py               Bearer Token 认证守卫     │
+│  ├── http_app.py           路由 + 错误处理           │
+│  ├── kline_service.py      日K/分钟K 转换 + 展平     │
+│  ├── adj_factor_service.py 除权因子 melt 长表        │
+│  ├── realtime_service.py   订阅缓存 + fallback       │
+│  ├── gateway.py            SDK 封装 (login/query)    │
+│  ├── serializer.py         DataFrame → JSON          │
+│  ├── errors.py             错误码 + request_id       │
+│  └── health.py             健康检查                  │
+└─────────────────────────────────────────────────────┘
     │ AmazingData SDK
     ▼
   tgw 原生数据服务
 ```
 
-**职责边界**：适配服务保留 SDK 原始字段名（`code`、`kline_time`、`open`…），不重命名、不换算单位、不复权。字段映射由主项目 YAML 的 `field_map` 完成。
+**职责边界**：适配服务保留 SDK 原始字段名（`code`、`kline_time`、`open`…），不重命名、不换算单位、不复权。字段映射、单位换算、复权计算由消费方自行处理。
+
+### 项目结构
+
+```
+app/
+├── config.py             # 环境变量配置（Config dataclass）
+├── errors.py             # 错误码 + AppError + request_id 中间件
+├── auth.py               # Bearer Token 认证依赖
+├── http_app.py           # FastAPI 应用（/daily /minute /adj_factor /realtime /health 路由）
+├── gateway.py            # Gateway 接口 + AmazingDataGateway SDK 封装
+├── kline_service.py      # 日期转换 + dict[code, DataFrame] 展平
+├── adj_factor_service.py # 除权因子查询（宽表 melt 长表 + dropna）
+├── realtime_service.py   # 实时行情订阅缓存 + snapshot fallback
+├── serializer.py         # DataFrame/NumPy/datetime → JSON 序列化
+└── health.py             # 健康检查服务
+scripts/
+├── run.py                # 统一启动入口（本地/Docker/Podman/SDK 安装）
+├── probe_sdk.py          # SDK 登录门禁探测（启动前校验凭据）
+├── probe_code_info.py    # 证券基础信息探测
+├── probe_index_mixed.py  # 指数成分探测
+├── probe_snapshot.py     # 快照接口探测
+└── probe_subscription.py # 实时订阅探测
+tests/                    # 单元测试（13 个文件，107 个用例，全 FakeGateway）
+docs/
+└── API.md                # HTTP 接口契约
+Dockerfile                # python:3.14-slim + SDK wheel + 系统库
+docker-compose.yml        # 部署编排（env_file 注入 .env）
+pyproject.toml            # 依赖声明
+uv.lock                   # uv 锁文件
+```
 
 ## 前置条件
 
@@ -93,75 +128,65 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 
 错误场景验证（反向日期 / 空代码 / 错误格式）见 [docs/API.md](docs/API.md)。
 
-### 主项目集成配置
-
-在主项目的自定义数据源 YAML 中配置：
-
-```yaml
-# 数据源：日 K
-url: http://amazingdata-http:3021/daily
-method: POST
-response_path: data          # 从响应 JSON 的 data 字段提取记录数组
-auth_type: none              # 内网服务，无需认证
-batch: 100                   # 每次请求最多 100 个代码
-rpm: 200                     # 每分钟最多 200 次请求
-
-# 字段映射：upstream_field → internal_field
-field_map:
-  code: symbol               # SDK 的 code → 主项目的 symbol
-  kline_time: date           # SDK 的 kline_time → 主项目的 date
-  open: open
-  high: high
-  low: low
-  close: close
-  volume: volume
-  amount: amount
-
-# 日期解析：SDK 返回 ISO 格式
-transforms:
-  date: "parse_date(value, '%Y-%m-%d')"
-```
-
-> `field_map` 方向是 `upstream_field: internal_field`（左=适配服务返回的字段名，右=主项目内部字段名）。
-
-在主项目中执行"试拉测试"，确认：
-1. 能解析 `response_path: data` 指向的数组
-2. 字段映射正确（`code→symbol`、`kline_time→date`…）
-3. 日期列能被 `parse_date` 正确解析
-4. 数据行数 > 0（在交易日区间内）
-
 ## API 参考
 
 接口契约详见 [docs/API.md](docs/API.md)，含 `/daily`、`/minute`、`/realtime`、`/health`、错误响应格式与错误码表。
 
-## 环境变量
+## 配置说明
 
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `AMAZINGDATA_USERNAME` | 是 | AmazingData 账号 |
-| `AMAZINGDATA_PASSWORD` | 是 | AmazingData 密码 |
-| `AMAZINGDATA_HOST` | 是 | 服务器地址（IP/主机名，SDK host 参数） |
-| `AMAZINGDATA_PORT` | 是 | 服务器端口 |
-| `HTTP_HOST` | 否 | 监听地址，默认 `0.0.0.0` |
-| `HTTP_PORT` | 否 | 监听端口，默认 `3021` |
+服务通过环境变量读取配置。两种启动模式对应不同配置文件，互不读取：
 
-> 本地模式用 `local.config.json`，Docker 模式用 `.env`，二者互不读取。
+| 模式 | 配置文件 | 注入方式 | 启动入口 |
+|------|---------|---------|---------|
+| 本地模式 | `local.config.json`（JSON） | `scripts/run.py` 模式 1 读取后注入 `os.environ` | `python scripts/run.py` 选 1 |
+| Docker/Podman 模式 | `.env`（KEY=VALUE） | `docker-compose.yml` 的 `env_file` 注入容器 | `python scripts/run.py` 选 2/3 |
 
-## 项目结构
+`scripts/run.py` 交互式向导只写入 4 项 SDK 凭据 + `HTTP_HOST` + `HTTP_PORT`；认证、并发限制等字段需手动编辑配置文件追加。`local.config.json` 的所有键值都会被注入环境变量，JSON 字段名必须与环境变量名一致。
 
+### 字段参考
+
+| 变量 | 必填 | 默认 | 说明 |
+|------|------|------|------|
+| `AMAZINGDATA_USERNAME` | 是 | — | AmazingData 账号 |
+| `AMAZINGDATA_PASSWORD` | 是 | — | AmazingData 密码（不写入日志） |
+| `AMAZINGDATA_HOST` | 是 | — | SDK 登录目标服务器 IP/主机名 |
+| `AMAZINGDATA_PORT` | 是 | — | SDK 登录目标服务器端口 |
+| `HTTP_HOST` | 否 | `0.0.0.0` | 本服务 HTTP 监听地址。容器内必须 `0.0.0.0`；仅本机访问可改 `127.0.0.1` |
+| `HTTP_PORT` | 否 | `3021` | 本服务 HTTP 监听端口。Docker 模式下 `docker-compose.yml` 端口映射同步读取此变量，`Dockerfile` CMD 也读取它 |
+| `SDK_MAX_CONCURRENT` | 否 | `5` | SDK 最大并发调用数，超出返回 503 `SERVICE_BUSY` |
+| `AUTH_TOKEN` | 视情况 | `""` | Bearer token。`AUTH_REQUIRED=true` 时必填，客户端需带 `Authorization: Bearer <token>`。强度要求：长度 > 12 且同时含字母和数字，弱 token 阻止启动 |
+| `AUTH_REQUIRED` | 否 | `true` | 认证开关。`false` 时认证彻底关闭，所有请求直接放行，`AUTH_TOKEN` 被忽略。仅本地调试用，生产必须保持 `true` |
+| `ADJ_FACTOR_LOCAL_PATH` | 否 | `""` | SDK `get_adj_factor` 的 `local_path` 参数，必须为绝对路径。留空由 SDK 自行管理 HDF5 缓存 |
+
+> 四项凭据缺失时进程仍可启动，`/health` 返回 503 `config: incomplete`，便于 Docker 日志暴露诊断信息。认证配置无效（`AUTH_REQUIRED=true` 但 token 为空/过弱）时进程启动即退出。
+
+### 配置文件示例
+
+`local.config.json`（本地模式）：
+
+```json
+{
+  "AMAZINGDATA_USERNAME": "your_account",
+  "AMAZINGDATA_PASSWORD": "your_password",
+  "AMAZINGDATA_HOST": "1.2.3.4",
+  "AMAZINGDATA_PORT": "8600",
+  "HTTP_HOST": "0.0.0.0",
+  "HTTP_PORT": "3021",
+  "AUTH_TOKEN": "your_token_with_letters_and_digits_123"
+}
 ```
-app/
-├── config.py        # 环境变量配置
-├── serializer.py    # DataFrame/NumPy/datetime → JSON 序列化
-├── gateway.py       # Gateway 接口 + AmazingDataGateway SDK 封装
-├── kline_service.py # 日期转换 + dict[code, DataFrame] 展平
-├── realtime_service.py # 实时行情订阅缓存
-├── health.py        # 健康检查服务
-├── errors.py        # 错误码 + AppError + request_id 中间件
-└── http_app.py      # FastAPI 应用（/daily + /minute + /realtime + /health 路由）
-scripts/
-└── probe_sdk.py     # SDK 探测脚本（spec §5.2 门禁）
-tests/               # 单元测试（107 个）
-Dockerfile           # python:3.14 + SDK wheel
-docker-compose.yml   # 部署编排
+
+`.env`（Docker 模式）：
+
+```ini
+AMAZINGDATA_USERNAME=your_account
+AMAZINGDATA_PASSWORD=your_password
+AMAZINGDATA_HOST=1.2.3.4
+AMAZINGDATA_PORT=8600
+HTTP_HOST=0.0.0.0
+HTTP_PORT=3021
+AUTH_TOKEN=your_token_with_letters_and_digits_123
+AUTH_REQUIRED=true
 ```
+
+两个文件均含凭据，不应提交到版本库（`.env.example` 是可提交的脱敏模板）。

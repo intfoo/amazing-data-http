@@ -1,6 +1,6 @@
 # API 参考
 
-> 本文件从 README 抽离，只描述 HTTP 接口契约。部署、启动、主项目集成等内容见 [README](../README.md)。
+> 本文件从 README 抽离，只描述 HTTP 接口契约。部署、启动、配置等内容见 [README](../README.md)。
 
 ## POST /daily
 
