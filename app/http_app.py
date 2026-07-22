@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import datetime
 import logging
 import threading
 import time
@@ -32,6 +33,7 @@ from app.health import HealthService
 from app.adj_factor_service import AdjFactorService
 from app.kline_service import KlineService, MINUTE_PERIODS
 from app.realtime_service import RealtimeService
+from app.subscription_schedule import is_subscription_window
 
 # 配置 amazingdata 命名空间日志：带时间戳，独立于 uvicorn 默认日志配置。
 # propagate=False 防止 uvicorn 启动重配 root 后重复输出；
@@ -185,7 +187,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             try:
                 gateway.login()
                 logger.info("gateway login succeeded on startup")
-                def _init_subscription():
+                def _init_subscription(cal):
                     t0 = time.monotonic()
                     try:
                         code_list = gateway.get_realtime_code_list()
@@ -196,6 +198,13 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                             on_error=realtime_service.on_subscription_error,
                         )
                         realtime_service.set_active(True)
+                        realtime_service.start_watchdog(
+                            cal,
+                            stale_threshold_sec=config.stale_threshold_sec,
+                            watchdog_interval_sec=config.watchdog_interval_sec,
+                            open_time=config.subscription_open,
+                            close_time=config.subscription_close,
+                        )
                         t2 = time.monotonic()
                         logger.info(
                             "realtime subscription started: %d symbols "
@@ -204,16 +213,25 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                         )
                     except Exception as e:
                         logger.error("realtime subscription start failed: %s: %s", type(e).__name__, e)
-                app.state.subscription_thread = threading.Thread(
-                    target=_init_subscription, daemon=True, name="sub-init"
-                )
-                app.state.subscription_thread.start()
+                cal = gateway.calendar
+                if cal and is_subscription_window(
+                    datetime.datetime.now(), cal,
+                    open_time=config.subscription_open,
+                    close_time=config.subscription_close,
+                ):
+                    app.state.subscription_thread = threading.Thread(
+                        target=_init_subscription, args=(cal,), daemon=True, name="sub-init"
+                    )
+                    app.state.subscription_thread.start()
+                else:
+                    logger.info("outside subscription window, skipping subscription (SDK query still available)")
             except Exception as e:
                 logger.error("gateway login failed on startup: %s: %s", type(e).__name__, e)
         else:
             logger.warning("config incomplete, skipping startup login")
         yield
         # shutdown
+        realtime_service.stop_watchdog()
         sub_thread = getattr(app.state, "subscription_thread", None)
         if sub_thread and sub_thread.is_alive():
             sub_thread.join(timeout=10)
