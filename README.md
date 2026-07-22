@@ -157,8 +157,12 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 | `AUTH_TOKEN` | 视情况 | `""` | Bearer token。`AUTH_REQUIRED=true` 时必填，客户端需带 `Authorization: Bearer <token>`。强度要求：长度 > 12 且同时含字母和数字，弱 token 阻止启动 |
 | `AUTH_REQUIRED` | 否 | `true` | 认证开关。`false` 时认证彻底关闭，所有请求直接放行，`AUTH_TOKEN` 被忽略。仅本地调试用，生产必须保持 `true` |
 | `ADJ_FACTOR_LOCAL_PATH` | 否 | `""` | SDK `get_adj_factor` 的 `local_path` 参数，必须为绝对路径。留空由 SDK 自行管理 HDF5 缓存 |
+| `SUBSCRIPTION_OPEN` | 否 | `09:00` | 订阅窗口开始（HH:MM）。仅在交易日窗口内启动快照订阅，非交易时段不持有订阅会话以降 CPU。SDK 查询接口不受影响 |
+| `SUBSCRIPTION_CLOSE` | 否 | `15:20` | 订阅窗口结束（HH:MM） |
+| `STALE_THRESHOLD_SEC` | 否 | `90` | watchdog 失活阈值（秒）。窗口期内连续 N 秒未收到快照即判定订阅失活，`/health` 返回 503 触发容器重启 |
+| `WATCHDOG_INTERVAL_SEC` | 否 | `60` | watchdog 检查间隔（秒） |
 
-> 四项凭据缺失时进程仍可启动，`/health` 返回 503 `config: incomplete`，便于 Docker 日志暴露诊断信息。认证配置无效（`AUTH_REQUIRED=true` 但 token 为空/过弱）时进程启动即退出。
+> 四项凭据缺失时进程仍可启动，`/health` 返回 503 `config: incomplete`，便于 Docker 日志暴露诊断信息。认证配置无效（`AUTH_REQUIRED=true` 但 token 为空/过弱）时进程启动即退出。非交易时段或窗口期外不启动订阅，`/health` 报 `realtime_detail: inactive_offhours` 且仍返回 200；窗口期内订阅失活则报 503（`inactive_stale`/`inactive_error`/`inactive_not_started`）。
 
 ### 配置文件示例
 
@@ -187,6 +191,11 @@ HTTP_HOST=0.0.0.0
 HTTP_PORT=3021
 AUTH_TOKEN=your_token_with_letters_and_digits_123
 AUTH_REQUIRED=true
+# 实时订阅窗口与存活检测（可选，留空用默认值）
+SUBSCRIPTION_OPEN=09:00
+SUBSCRIPTION_CLOSE=15:20
+STALE_THRESHOLD_SEC=90
+WATCHDOG_INTERVAL_SEC=60
 ```
 
 两个文件均含凭据，不应提交到版本库（`.env.example` 是可提交的脱敏模板）。
