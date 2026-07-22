@@ -16,6 +16,11 @@ services:
       # 复权因子缓存目录：SDK get_adj_factor 的 local_path 缓存，
       - ./data/adj_factor:/app/data/adj_factor
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 2g
     healthcheck:
       test: python -c "import urllib.request; urllib.request.urlopen('http://localhost:${HTTP_PORT:-3021}/health')"
       interval: 30s

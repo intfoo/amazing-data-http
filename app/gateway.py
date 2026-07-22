@@ -9,6 +9,7 @@ AmazingDataGateway 是真实实现，FakeGateway（tests/conftest.py）用于自
 """
 
 import logging
+import sys
 import threading
 import time
 from typing import Any, Protocol, runtime_checkable
@@ -79,6 +80,9 @@ class Gateway(Protocol):
     ) -> None: ...
     def stop_subscription(self) -> None: ...
     def get_adj_factor(self, codes: list[str]) -> "pd.DataFrame": ...
+
+    @property
+    def calendar(self) -> list[int] | None: ...
 
 
 class GatewayError(Exception):
@@ -177,6 +181,7 @@ class AmazingDataGateway:
             self._market_data = ad.MarketData(calendar)
             self._ready = True
             logger.info("AmazingData gateway login successful")
+            self._install_tgw_event_logger()
         except Exception as e:
             # ad.login 已成功但后续步骤失败：必须 logout 释放连接，否则连接泄漏
             if sdk_logged_in:
@@ -184,6 +189,115 @@ class AmazingDataGateway:
             self._ready = False
             logger.error("AmazingData login failed: %s: %s", type(e).__name__, e)
             raise GatewayNotReadyError(f"login failed: {e}") from e
+
+    def _install_tgw_event_logger(self) -> None:
+        """Monkey-patch tgw.g_spi 的 OnLog/OnEvent/OnLogon 以捕获所有可能导致进程退出的事件。
+
+        tgw 原生层在收到 force-logout 等致命事件时先调 OnLog，然后 native 线程直接调
+        ExitProcess() 杀进程。Python 的 atexit/faulthandler/signal 都无法拦截 ExitProcess，
+        但回调在 ExitProcess 之前被调用，可以在此打日志。
+
+        已确认的退出路径：OnLog("RspForceLogout | release and exit now!!")
+        其他可能的退出路径：OnEvent(kChannelTCPSessionClosed/kChannelTCPHeartbeatTimeout)
+        OnLogon（登录状态变更，可能包含失败/被踢信息）
+        """
+        try:
+            import tgw
+        except ImportError:
+            return
+
+        spi = getattr(tgw, "g_spi", None)
+        if spi is None:
+            logger.warning("tgw.g_spi not found, cannot install event logger")
+            return
+
+        # 避免重复安装
+        if getattr(spi, "_event_logger_installed", False):
+            return
+
+        original_on_log = spi.OnLog
+        original_on_event = spi.OnEvent
+        original_on_logon = spi.OnLogon
+
+        # 预建 EventLevel / EventCode 反查表
+        level_names = {}
+        for attr in dir(tgw.EventLevel):
+            if not attr.startswith("_"):
+                level_names[getattr(tgw.EventLevel, attr)] = attr
+        event_names = {}
+        for attr in dir(tgw.EventCode):
+            if not attr.startswith("_"):
+                event_names[getattr(tgw.EventCode, attr)] = attr
+
+        # 可能导致进程退出的关键词
+        EXIT_KEYWORDS = ("ForceLogout", "force_logout", "release and exit",
+                         "abort", "fatal", "FATAL")
+        # 连接异常关键词（不一定导致退出，但值得关注）
+        DISCONNECT_KEYWORDS = ("Disconnect", "disconnect", "SessionClosed",
+                               "session_closed", "timeout", "Timeout",
+                               "ConnectFailed", "connect_failed",
+                               "LogonFailed", "logon_failed")
+
+        def logged_on_log(level, log_msg=None, *args):
+            """OnLog 回调：tgw 所有日志都走这里，包括 force-logout。"""
+            msg_str = str(log_msg or "")
+            level_name = level_names.get(level, str(level))
+
+            if any(kw in msg_str for kw in EXIT_KEYWORDS):
+                logger.error("tgw FATAL: [%s] %s (process may exit)", level_name, msg_str)
+            elif any(kw in msg_str for kw in DISCONNECT_KEYWORDS):
+                logger.warning("tgw disconnect: [%s] %s", level_name, msg_str)
+            elif level == 3:  # kError
+                logger.error("tgw error: [%s] %s", level_name, msg_str)
+            else:
+                # kWarn/kInfo 含大量心跳日志，降级到 debug 避免刷屏
+                logger.debug("tgw [%s] %s", level_name, msg_str)
+
+            sys.stderr.flush()  # 确保 ExitProcess 前日志已落盘
+            try:
+                original_on_log(level, log_msg, *args)
+            except Exception:
+                pass
+
+        def logged_on_event(level, code, event_msg=None):
+            """OnEvent 回调：连接状态变更事件。"""
+            level_name = level_names.get(level, str(level))
+            code_name = event_names.get(code, f"unknown({code})")
+            logger.warning("tgw event: level=%s code=%s msg=%s",
+                           level_name, code_name, event_msg or "")
+            sys.stderr.flush()
+            try:
+                original_on_event(level, code, event_msg)
+            except Exception:
+                pass
+
+        def logged_on_logon(data=None):
+            """OnLogon 回调：登录状态变更（可能包含被踢/失败信息）。
+
+            data 是 LogonResponse 对象（有 logon_json 属性），原始回调会调
+            IGMDApi_FreeMemory(data) 释放它，所以必须在此之前提取信息。
+            """
+            info = ""
+            if data is not None:
+                try:
+                    logon_json = getattr(data, "logon_json", None)
+                    if logon_json:
+                        # logon_json 可能很长，截取前 500 字符
+                        info = f" logon_json={str(logon_json)[:500]}"
+                except Exception:
+                    info = " (failed to extract logon info)"
+            logger.warning("tgw logon event:%s", info or " (no details)")
+            sys.stderr.flush()
+            try:
+                original_on_logon(data)
+            except Exception:
+                pass
+
+        spi.OnLog = logged_on_log
+        spi.OnEvent = logged_on_event
+        spi.OnLogon = logged_on_logon
+        spi._event_logger_installed = True
+        logger.info("tgw event logger installed on OnLog + OnEvent + OnLogon")
 
     def logout(self) -> None:
         """线程安全的登出入口。"""
@@ -206,6 +320,11 @@ class AmazingDataGateway:
     def is_ready(self) -> bool:
         """SDK 是否已登录且 MarketData 已初始化。"""
         return self._ready
+
+    @property
+    def calendar(self) -> list[int] | None:
+        """交易日历 list[int]（login 后可用，logout 后为 None）。"""
+        return self._calendar
 
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]:
         """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。
@@ -415,6 +534,14 @@ class AmazingDataGateway:
         def _run():
             try:
                 sub.run()
+                # sub.run() 是无限循环(time.sleep(10))，正常情况下永不返回。
+                # 如果返回了，说明 SDK 内部出了问题（会话被踢/内部错误等）。
+                logger.error("SubscribeData.run() returned unexpectedly — session may have been kicked")
+                if on_error:
+                    try:
+                        on_error(RuntimeError("SubscribeData.run() returned unexpectedly"))
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error("subscription thread crashed: %s: %s", type(e).__name__, e)
                 if on_error:

@@ -12,8 +12,11 @@ import dataclasses
 import logging
 import threading
 import time
+import datetime
 
 import pandas as pd
+
+from app.subscription_schedule import is_subscription_window
 
 from app.gateway import GatewayNotReadyError
 from app.serializer import serialize_dataframe, serialize_value
@@ -48,6 +51,13 @@ class RealtimeService:
         # 缓存条目数有界，无需淘汰策略。若未来 SDK 引入更多类型可考虑加上限。
         self._extract_fns: dict = {}
 
+        # Watchdog 相关字段
+        self._last_snapshot_ts: float = 0.0
+        self._deactivation_reason: str | None = None  # "stale" / "error" / None
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_start_ts: float = 0.0
+        self._stop_flag = threading.Event()
+
     def on_snapshot(self, data) -> None:
         """订阅回调：Snapshot → dict → 缓存覆盖。异常吞掉，不影响订阅线程。"""
         try:
@@ -56,12 +66,19 @@ class RealtimeService:
             if code:
                 with self._lock:
                     self._cache[code] = record
+            self._last_snapshot_ts = time.time()
+            # 自动恢复：若订阅曾被标记 inactive 但数据又来了，说明已恢复
+            if not self._active:
+                self._active = True
+                self._deactivation_reason = None
+                logger.info("subscription recovered: data received, reactivating")
         except Exception as e:
             logger.warning("on_snapshot convert failed: %s: %s", type(e).__name__, e)
 
     def on_subscription_error(self, err=None) -> None:
         """订阅线程崩溃/异常退出回调：标记不活跃，/realtime 将返回 503。"""
         self._active = False
+        self._deactivation_reason = "error"
         logger.error("realtime subscription deactivated due to error: %s", err)
 
     def snapshot(self, codes: list[str] | None = None) -> list[dict]:
@@ -84,6 +101,79 @@ class RealtimeService:
 
     def set_active(self, active: bool) -> None:
         self._active = active
+        if active:
+            self._deactivation_reason = None
+
+    def deactivation_reason(self) -> str | None:
+        """供 HealthService 区分 inactive_stale / inactive_not_started / inactive_error。"""
+        return self._deactivation_reason
+
+    def last_snapshot_ts(self) -> float:
+        """最后一次收到快照数据的时间戳（0=从未收到）。"""
+        return self._last_snapshot_ts
+
+    def start_watchdog(
+        self,
+        calendar: list[int],
+        stale_threshold_sec: int = 90,
+        watchdog_interval_sec: int = 60,
+        open_time: str = "09:00",
+        close_time: str = "15:20",
+    ) -> None:
+        """启动后台 watchdog 线程。lifespan 订阅启动后调用。"""
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            return
+        self._stop_flag.clear()
+        self._watchdog_start_ts = time.time()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            args=(calendar, stale_threshold_sec, watchdog_interval_sec, open_time, close_time),
+            daemon=True, name="sub-watchdog",
+        )
+        self._watchdog_thread.start()
+
+    def stop_watchdog(self) -> None:
+        """优雅停止 watchdog。lifespan shutdown 时调用。"""
+        self._stop_flag.set()
+
+    def _watchdog_loop(
+        self,
+        calendar: list[int] | None,
+        stale_threshold_sec: int,
+        watchdog_interval_sec: int,
+        open_time: str,
+        close_time: str,
+    ) -> None:
+        """watchdog 主循环：每 watchdog_interval_sec 检查一次订阅存活状态。"""
+        while self._active and not self._stop_flag.is_set():
+            if self._stop_flag.wait(timeout=watchdog_interval_sec):
+                break
+            if not self._active:
+                break
+            now = datetime.datetime.now()
+            if not is_subscription_window(now, calendar, open_time, close_time):
+                continue
+            if self._last_snapshot_ts == 0:
+                # 从未收到数据：检查启动后是否超过阈值
+                elapsed_since_start = time.time() - self._watchdog_start_ts
+                if elapsed_since_start > stale_threshold_sec:
+                    logger.error(
+                        "subscription started but no data received for %.0fs, marking inactive",
+                        elapsed_since_start,
+                    )
+                    self._active = False
+                    self._deactivation_reason = "stale"
+                    break
+                continue
+            elapsed = time.time() - self._last_snapshot_ts
+            if elapsed > stale_threshold_sec:
+                logger.error(
+                    "subscription stale: no data for %.0fs during trading hours, marking inactive",
+                    elapsed,
+                )
+                self._active = False
+                self._deactivation_reason = "stale"
+                break
 
     def fallback_snapshot(self, codes: list[str] | None = None) -> list[dict]:
         """订阅缓存为空时的 fallback：用 query_snapshot 查当日历史快照。
