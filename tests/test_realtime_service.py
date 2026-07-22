@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+import time
 
 from app.realtime_service import RealtimeService
 from tests.conftest import FakeGateway
@@ -357,3 +358,129 @@ def test_snapshot_to_dict_caches_per_type():
     # 指数快照含 trading_phase_code，股票不含
     assert "trading_phase_code" in index[0]
     assert "trading_phase_code" not in stock[0]
+
+
+# ---------------------------------------------------------------------------
+# Watchdog 测试
+# ---------------------------------------------------------------------------
+
+def test_on_snapshot_auto_recovery():
+    """订阅曾被标记 inactive 但收到数据 → 自动恢复 active。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_active(False)
+    svc._deactivation_reason = "stale"
+    assert svc.is_active() is False
+    svc.on_snapshot(_snap(last=10.0))
+    assert svc.is_active() is True
+    assert svc.deactivation_reason() is None
+
+
+def test_on_subscription_error_sets_reason():
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc.on_subscription_error(Exception("test"))
+    assert svc.is_active() is False
+    assert svc.deactivation_reason() == "error"
+
+
+def test_set_active_true_clears_reason():
+    svc = RealtimeService(gateway=None)
+    svc._deactivation_reason = "stale"
+    svc.set_active(True)
+    assert svc.deactivation_reason() is None
+
+
+def test_deactivation_reason_default_none():
+    svc = RealtimeService(gateway=None)
+    assert svc.deactivation_reason() is None
+
+
+def test_last_snapshot_ts_default_zero():
+    svc = RealtimeService(gateway=None)
+    assert svc.last_snapshot_ts() == 0.0
+
+
+def test_on_snapshot_updates_timestamp():
+    import time as _time
+    svc = RealtimeService(gateway=None)
+    t_before = _time.time()
+    svc.on_snapshot(_snap(last=10.0))
+    t_after = _time.time()
+    assert t_before <= svc.last_snapshot_ts() <= t_after
+
+
+def test_watchdog_stale_marks_inactive():
+    """窗口期内超过 stale_threshold 无数据 → 标记 inactive + reason=stale。"""
+    import datetime
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc.on_snapshot(_snap())  # 收到一次数据，设置 timestamp
+    svc._last_snapshot_ts = time.time() - 200  # 回拨到200秒前（超过90s阈值）
+    cal = [int(datetime.datetime.now().strftime("%Y%m%d"))]
+    svc._watchdog_loop(cal, stale_threshold_sec=90, watchdog_interval_sec=0,
+                       open_time="00:00", close_time="23:59")
+    assert svc.is_active() is False
+    assert svc.deactivation_reason() == "stale"
+
+
+def test_watchdog_first_data_timeout_marks_inactive():
+    """订阅启动后 stale_threshold 内未收到任何数据 → 标记 inactive。"""
+    import datetime
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc._last_snapshot_ts = 0.0
+    svc._watchdog_start_ts = time.time() - 200
+    cal = [int(datetime.datetime.now().strftime("%Y%m%d"))]
+    svc._watchdog_loop(cal, stale_threshold_sec=90, watchdog_interval_sec=0,
+                       open_time="00:00", close_time="23:59")
+    assert svc.is_active() is False
+    assert svc.deactivation_reason() == "stale"
+
+
+def test_watchdog_non_window_does_not_trigger():
+    """非窗口期不判 stale。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc._last_snapshot_ts = time.time() - 200
+    cal = [20231231]
+    svc._watchdog_loop(cal, stale_threshold_sec=90, watchdog_interval_sec=0,
+                       open_time="09:00", close_time="15:20")
+    assert svc.is_active() is True
+
+
+def test_watchdog_calendar_none_does_not_trigger():
+    """calendar 为 None 时不触发。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc._last_snapshot_ts = time.time() - 200
+    svc._watchdog_loop(None, stale_threshold_sec=90, watchdog_interval_sec=0,
+                       open_time="00:00", close_time="23:59")
+    assert svc.is_active() is True
+
+
+def test_stop_watchdog_sets_stop_flag():
+    """stop_watchdog 设置 Event，watchdog 线程应能退出。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc.start_watchdog([20240102], stale_threshold_sec=999, watchdog_interval_sec=999,
+                       open_time="00:00", close_time="23:59")
+    svc.stop_watchdog()
+    assert svc._stop_flag.is_set()
+    if svc._watchdog_thread:
+        svc._watchdog_thread.join(timeout=2)
+        assert not svc._watchdog_thread.is_alive()
+
+
+def test_start_watchdog_idempotent():
+    """重复调用 start_watchdog 不启动多个线程。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc.start_watchdog([20240102], stale_threshold_sec=999, watchdog_interval_sec=999,
+                       open_time="00:00", close_time="23:59")
+    t1 = svc._watchdog_thread
+    svc.start_watchdog([20240102], stale_threshold_sec=999, watchdog_interval_sec=999,
+                       open_time="00:00", close_time="23:59")
+    assert svc._watchdog_thread is t1
+    svc.stop_watchdog()
+    if t1:
+        t1.join(timeout=2)
