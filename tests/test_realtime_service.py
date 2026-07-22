@@ -438,24 +438,29 @@ def test_watchdog_first_data_timeout_marks_inactive():
 
 
 def test_watchdog_non_window_does_not_trigger():
-    """非窗口期不判 stale。"""
+    """非窗口期不判 stale（线程方式：watchdog 空转 continue，stop 可退出）。"""
     svc = RealtimeService(gateway=None)
     svc.set_active(True)
     svc._last_snapshot_ts = time.time() - 200
-    cal = [20231231]
-    svc._watchdog_loop(cal, stale_threshold_sec=90, watchdog_interval_sec=0,
+    svc.start_watchdog([20231231], stale_threshold_sec=90, watchdog_interval_sec=0,
                        open_time="09:00", close_time="15:20")
+    time.sleep(0.05)  # 跑若干次迭代（非窗口期 continue，不判 stale）
     assert svc.is_active() is True
+    svc.stop_watchdog()
+    svc._watchdog_thread.join(timeout=2)
 
 
 def test_watchdog_calendar_none_does_not_trigger():
-    """calendar 为 None 时不触发。"""
+    """calendar 为 None 时不触发（线程方式，避免同步调用死循环）。"""
     svc = RealtimeService(gateway=None)
     svc.set_active(True)
     svc._last_snapshot_ts = time.time() - 200
-    svc._watchdog_loop(None, stale_threshold_sec=90, watchdog_interval_sec=0,
+    svc.start_watchdog(None, stale_threshold_sec=90, watchdog_interval_sec=0,
                        open_time="00:00", close_time="23:59")
+    time.sleep(0.05)
     assert svc.is_active() is True
+    svc.stop_watchdog()
+    svc._watchdog_thread.join(timeout=2)
 
 
 def test_stop_watchdog_sets_stop_flag():

@@ -35,14 +35,22 @@ from app.kline_service import KlineService, MINUTE_PERIODS
 from app.realtime_service import RealtimeService
 from app.subscription_schedule import is_subscription_window
 
+class _ShortNameFormatter(logging.Formatter):
+    """显示 logger 名末段（去 amazingdata. 前缀）：[amazingdata.http] → [http]。"""
+
+    def format(self, record):
+        record.short_name = record.name.split(".")[-1]
+        return super().format(record)
+
+
 # 配置 amazingdata 命名空间日志：带时间戳，独立于 uvicorn 默认日志配置。
 # propagate=False 防止 uvicorn 启动重配 root 后重复输出；
 # 幂等判断 handlers 避免热重载或多次 import 重复添加。
 _ad_root = logging.getLogger("amazingdata")
 if not _ad_root.handlers:
     _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+    _h.setFormatter(_ShortNameFormatter(
+        "%(asctime)s %(levelname)-8s [%(short_name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
     _ad_root.addHandler(_h)
@@ -181,12 +189,12 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         try:
             config.validate_auth()
         except ValueError as e:
-            logger.error("auth config invalid: %s", e)
+            logger.error("认证配置无效: %s", e)
             raise  # 进程退出，uvicorn 启动失败
         if config.is_configured():
             try:
                 gateway.login()
-                logger.info("gateway login succeeded on startup")
+                logger.info("启动登录成功")
                 def _init_subscription(cal):
                     t0 = time.monotonic()
                     try:
@@ -207,12 +215,12 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                         )
                         t2 = time.monotonic()
                         logger.info(
-                            "realtime subscription started: %d symbols "
+                            "实时订阅已启动: %d 只 "
                             "(get_realtime_code_list=%.3fs subscribe=%.3fs)",
                             len(code_list), t1 - t0, t2 - t1,
                         )
                     except Exception as e:
-                        logger.error("realtime subscription start failed: %s: %s", type(e).__name__, e)
+                        logger.error("实时订阅启动失败: %s: %s", type(e).__name__, e)
                 cal = gateway.calendar
                 if cal and is_subscription_window(
                     datetime.datetime.now(), cal,
@@ -224,11 +232,11 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                     )
                     app.state.subscription_thread.start()
                 else:
-                    logger.info("outside subscription window, skipping subscription (SDK query still available)")
+                    logger.info("非订阅时段，跳过订阅（SDK 查询接口仍可用）")
             except Exception as e:
-                logger.error("gateway login failed on startup: %s: %s", type(e).__name__, e)
+                logger.error("启动登录失败: %s: %s", type(e).__name__, e)
         else:
-            logger.warning("config incomplete, skipping startup login")
+            logger.warning("配置不完整，跳过启动登录")
         yield
         # shutdown
         realtime_service.stop_watchdog()
@@ -238,12 +246,12 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         try:
             gateway.stop_subscription()
         except Exception as e:
-            logger.warning("stop subscription on shutdown: %s: %s", type(e).__name__, e)
+            logger.warning("关闭时停止订阅异常: %s: %s", type(e).__name__, e)
         try:
             gateway.logout()
-            logger.info("gateway logout on shutdown")
+            logger.info("关闭时已登出")
         except Exception as e:
-            logger.warning("gateway logout failed on shutdown: %s: %s", type(e).__name__, e)
+            logger.warning("关闭时登出失败: %s: %s", type(e).__name__, e)
 
     app = FastAPI(title="AmazingData HTTP Adapter", lifespan=lifespan)
     # Starlette ≥1.x 的 add_middleware 用 insert(0,...)，后 add 的位于最外层 = 最先执行。
@@ -300,7 +308,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 raise AppError(SERIALIZATION_FAILED, str(e), 502)
             raise AppError(INTERNAL_ERROR, str(e), 500)
         except Exception as e:
-            logger.error("unhandled error: %s: %s", type(e).__name__, e)
+            logger.error("未处理异常: %s: %s", type(e).__name__, e)
             raise AppError(INTERNAL_ERROR, str(e), 500)
         finally:
             app.state.sdk_gate.release()
@@ -335,7 +343,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 raise AppError(SERIALIZATION_FAILED, str(e), 502)
             raise AppError(INTERNAL_ERROR, str(e), 500)
         except Exception as e:
-            logger.error("unhandled error: %s: %s", type(e).__name__, e)
+            logger.error("未处理异常: %s: %s", type(e).__name__, e)
             raise AppError(INTERNAL_ERROR, str(e), 500)
         finally:
             app.state.sdk_gate.release()
@@ -371,7 +379,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 raise AppError(SERIALIZATION_FAILED, str(e), 502)
             raise AppError(INTERNAL_ERROR, str(e), 500)
         except Exception as e:
-            logger.error("unhandled error: %s: %s", type(e).__name__, e)
+            logger.error("未处理异常: %s: %s", type(e).__name__, e)
             raise AppError(INTERNAL_ERROR, str(e), 500)
         finally:
             app.state.sdk_gate.release()
@@ -394,15 +402,15 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             try:
                 data = await asyncio.to_thread(realtime_service.fallback_snapshot, code_list)
             except GatewayNotReadyError as e:
-                logger.info("request_id=%s realtime fallback: SDK not ready",
+                logger.info("request_id=%s realtime fallback: SDK 未就绪",
                             get_request_id(request))
                 raise AppError(SDK_NOT_READY, str(e), 503)
             except Exception as e:
-                logger.warning("request_id=%s realtime fallback failed: %s: %s",
+                logger.warning("request_id=%s realtime fallback 失败: %s: %s",
                                get_request_id(request), type(e).__name__, e)
                 data = []
             else:
-                logger.info("request_id=%s realtime fallback: %d codes -> %d records",
+                logger.info("request_id=%s realtime fallback: %d 代码 -> %d 条",
                             get_request_id(request),
                             len(code_list) if code_list else 0, len(data))
         return {"data": data}
@@ -422,7 +430,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         """请求体校验失败（422）：记录详细错误与原始 body，返回统一错误信封。"""
         request_id = get_request_id(request)
         errors = exc.errors()
-        logger.warning("request_id=%s validation failed: errors=%s body=%s",
+        logger.warning("request_id=%s 请求校验失败: errors=%s body=%s",
                        request_id, errors, repr(exc.body)[:500])
         return JSONResponse(
             status_code=422,

@@ -82,7 +82,7 @@ class KlineService:
             now = datetime.now(_SHANGHAI_TZ)
             begin_date = int((now - timedelta(days=365)).strftime("%Y%m%d"))
             end_date = None
-            logger.info("minute default range: begin_date=%s (last 365 days)", begin_date)
+            logger.debug("minute 默认范围: begin_date=%s (近 365 天)", begin_date)
         else:
             begin_date = to_sdk_date(start_time) if start_time else None
             end_date = to_sdk_date(end_time) if end_time else None

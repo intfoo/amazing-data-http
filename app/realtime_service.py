@@ -71,15 +71,15 @@ class RealtimeService:
             if not self._active:
                 self._active = True
                 self._deactivation_reason = None
-                logger.info("subscription recovered: data received, reactivating")
+                logger.info("订阅已恢复：收到数据，重新激活")
         except Exception as e:
-            logger.warning("on_snapshot convert failed: %s: %s", type(e).__name__, e)
+            logger.warning("快照转换失败: %s: %s", type(e).__name__, e)
 
     def on_subscription_error(self, err=None) -> None:
         """订阅线程崩溃/异常退出回调：标记不活跃，/realtime 将返回 503。"""
         self._active = False
         self._deactivation_reason = "error"
-        logger.error("realtime subscription deactivated due to error: %s", err)
+        logger.error("实时订阅因错误停用: %s", err)
 
     def snapshot(self, codes: list[str] | None = None) -> list[dict]:
         """GET /realtime 读缓存，返回快照列表。
@@ -158,7 +158,7 @@ class RealtimeService:
                 elapsed_since_start = time.time() - self._watchdog_start_ts
                 if elapsed_since_start > stale_threshold_sec:
                     logger.error(
-                        "subscription started but no data received for %.0fs, marking inactive",
+                        "订阅启动后 %.0fs 未收到数据，标记失活",
                         elapsed_since_start,
                     )
                     self._active = False
@@ -168,7 +168,7 @@ class RealtimeService:
             elapsed = time.time() - self._last_snapshot_ts
             if elapsed > stale_threshold_sec:
                 logger.error(
-                    "subscription stale: no data for %.0fs during trading hours, marking inactive",
+                    "订阅失活：盘中 %.0fs 无数据",
                     elapsed,
                 )
                 self._active = False
@@ -206,10 +206,10 @@ class RealtimeService:
         if not self._fallback_lock.acquire(blocking=False):
             # 已有查询在跑：返回旧缓存（哪怕过期）或空，不阻塞、不重复查询
             if self._fallback_cache:
-                logger.info("fallback query in progress, returning stale cache: %d records",
+                logger.info("fallback 查询进行中，返回旧缓存: %d 条",
                             len(self._fallback_cache))
                 return self._filter_fallback(codes)
-            logger.info("fallback query in progress, cache empty, returning []")
+            logger.info("fallback 查询进行中，缓存为空，返回 []")
             return []
         try:
             # 双检：抢锁期间可能已被其他请求填充缓存
@@ -225,7 +225,7 @@ class RealtimeService:
             except GatewayNotReadyError:
                 raise
             except Exception as e:
-                logger.warning("fallback query_snapshot failed: %s: %s", type(e).__name__, e)
+                logger.warning("fallback query_snapshot 失败: %s: %s", type(e).__name__, e)
                 return self._filter_fallback(codes) if self._fallback_cache else []
             # 合并每只股票的最后一行（最新快照），一次 serialize_dataframe 序列化，
             # 避免几千只股票逐只调 serialize_dataframe 的开销。
@@ -237,7 +237,7 @@ class RealtimeService:
                 records = []
             self._fallback_cache = records
             self._fallback_time = time.time()
-            logger.info("fallback query_snapshot: %d records cached", len(records))
+            logger.info("fallback query_snapshot 已缓存: %d 条", len(records))
         finally:
             self._fallback_lock.release()
         return self._filter_fallback(codes)

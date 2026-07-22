@@ -133,8 +133,8 @@ class AmazingDataGateway:
             # 默认项目根/data/adj_factor（gateway.py 在 app/，parent.parent = 项目根）
             local_path = str(Path(__file__).resolve().parent.parent / "data" / "adj_factor")
             logger.warning(
-                "ADJ_FACTOR_LOCAL_PATH not configured, using default: %s. "
-                "Set ADJ_FACTOR_LOCAL_PATH to a persistent absolute path for SDK caching.",
+                "ADJ_FACTOR_LOCAL_PATH 未配置，使用默认路径: %s"
+                "（建议设为持久化绝对路径以供 SDK 缓存）",
                 local_path,
             )
         Path(local_path).mkdir(parents=True, exist_ok=True)
@@ -158,7 +158,7 @@ class AmazingDataGateway:
         try:
             import AmazingData as ad
         except ImportError as e:
-            logger.error("AmazingData import failed: %s", e)
+            logger.error("AmazingData SDK 导入失败: %s", e)
             self._ready = False
             raise GatewayNotReadyError(f"SDK import failed: {e}") from e
 
@@ -180,14 +180,14 @@ class AmazingDataGateway:
             self._calendar = calendar
             self._market_data = ad.MarketData(calendar)
             self._ready = True
-            logger.info("AmazingData gateway login successful")
+            logger.info("SDK 登录成功")
             self._install_tgw_event_logger()
         except Exception as e:
             # ad.login 已成功但后续步骤失败：必须 logout 释放连接，否则连接泄漏
             if sdk_logged_in:
                 self._safe_logout()
             self._ready = False
-            logger.error("AmazingData login failed: %s: %s", type(e).__name__, e)
+            logger.error("SDK 登录失败: %s: %s", type(e).__name__, e)
             raise GatewayNotReadyError(f"login failed: {e}") from e
 
     def _install_tgw_event_logger(self) -> None:
@@ -311,7 +311,7 @@ class AmazingDataGateway:
         try:
             self._ad.logout(username=self._config.username)
         except Exception as e:
-            logger.warning("logout error (ignored): %s: %s", type(e).__name__, e)
+            logger.warning("登出异常（已忽略）: %s: %s", type(e).__name__, e)
         self._ready = False
         self._market_data = None
         self._base_data = None
@@ -338,20 +338,20 @@ class AmazingDataGateway:
         t_enter = time.perf_counter()
         with self._lock:
             t_lock = time.perf_counter()
-            logger.info(
-                "get_code_list(security_type=%s) calling SDK (lock_wait=%.3fs)",
+            logger.debug(
+                "get_code_list(security_type=%s) 调用 SDK (lock_wait=%.3fs)",
                 security_type, t_lock - t_enter,
             )
             t0 = time.perf_counter()
             try:
                 result = self._base_data.get_code_list(security_type=security_type)
             except Exception as e:
-                logger.error("get_code_list failed: %s: %s", type(e).__name__, e)
+                logger.error("get_code_list 失败: %s: %s", type(e).__name__, e)
                 raise GatewayQueryError(f"get_code_list failed: {e}") from e
             sdk_elapsed = time.perf_counter() - t0
             total_elapsed = time.perf_counter() - t_lock
             logger.info(
-                "get_code_list(security_type=%s) returned %d codes "
+                "get_code_list(security_type=%s) 返回 %d 个代码 "
                 "(sdk=%.3fs total=%.3fs)",
                 security_type, len(result), sdk_elapsed, total_elapsed,
             )
@@ -373,17 +373,17 @@ class AmazingDataGateway:
             t_index = time.perf_counter() - t0
         except Exception as e:
             logger.warning(
-                "get_code_list(EXTRA_INDEX_A) failed, degrading to stock-only: %s: %s",
+                "get_code_list(EXTRA_INDEX_A) 失败，降级为仅股票: %s: %s",
                 type(e).__name__, e,
             )
             logger.info(
-                "get_realtime_code_list done: %d stocks in %.3fs (index failed, total %.3fs)",
+                "实时代码列表就绪: %d 只股票 (%.3fs，指数失败，总计 %.3fs)",
                 len(stock_codes), t_stock, time.perf_counter() - t_total,
             )
             return stock_codes
         total = time.perf_counter() - t_total
         logger.info(
-            "get_realtime_code_list: %d stocks + %d indices = %d total "
+            "实时代码列表: %d 股票 + %d 指数 = %d "
             "(stock=%.3fs index=%.3fs total=%.3fs)",
             len(stock_codes), len(index_codes), len(stock_codes) + len(index_codes),
             t_stock, t_index, total,
@@ -421,16 +421,16 @@ class AmazingDataGateway:
             try:
                 result = self._market_data.query_snapshot(codes, **kwargs)
             except Exception as e:
-                logger.error("query_snapshot failed: %s: %s (codes=%d, date=%s)",
+                logger.error("query_snapshot 失败: %s: %s (codes=%d, date=%s)",
                              type(e).__name__, e, len(codes), trade_date)
                 if _is_connection_error(e):
-                    logger.warning("query_snapshot connection error, attempting relogin: %s", e)
+                    logger.warning("query_snapshot 连接错误，尝试重连: %s", e)
                     try:
                         self._do_login()
                         result = self._market_data.query_snapshot(codes, **kwargs)
-                        logger.info("query_snapshot succeeded after relogin")
+                        logger.info("query_snapshot 重连后成功")
                     except Exception as e2:
-                        logger.error("query_snapshot failed after reconnect: %s: %s", type(e2).__name__, e2)
+                        logger.error("query_snapshot 重连后仍失败: %s: %s", type(e2).__name__, e2)
                         raise GatewayQueryError(f"query_snapshot failed after reconnect: {e2}") from e2
                 else:
                     raise GatewayQueryError(f"query_snapshot failed: {e}") from e
@@ -484,21 +484,21 @@ class AmazingDataGateway:
                 return result if isinstance(result, dict) else {"_all": result}
             except Exception as e:
                 logger.error(
-                    "query_kline failed: %s: %s (codes=%d, begin=%s, end=%s, period=%s)",
+                    "query_kline 失败: %s: %s (codes=%d, begin=%s, end=%s, period=%s)",
                     type(e).__name__, e, len(codes),
                     begin_date if begin_date is not None else "default",
                     end_date if end_date is not None else "default",
                     period,
                 )
                 if _is_connection_error(e):
-                    logger.warning("query_kline connection error, attempting relogin: %s", e)
+                    logger.warning("query_kline 连接错误，尝试重连: %s", e)
                     try:
                         self._do_login()
                         result = self._market_data.query_kline(codes, **kwargs)
-                        logger.info("query_kline succeeded after relogin")
+                        logger.info("query_kline 重连后成功")
                         return result if isinstance(result, dict) else {"_all": result}
                     except Exception as e2:
-                        logger.error("query_kline failed after reconnect: %s: %s", type(e2).__name__, e2)
+                        logger.error("query_kline 重连后仍失败: %s: %s", type(e2).__name__, e2)
                         raise GatewayQueryError(f"query failed after reconnect: {e2}") from e2
                 raise GatewayQueryError(f"query failed: {e}") from e
 
@@ -527,7 +527,7 @@ class AmazingDataGateway:
             try:
                 on_data(data)
             except Exception as e:
-                logger.warning("snapshot callback error: %s: %s", type(e).__name__, e)
+                logger.warning("快照回调异常: %s: %s", type(e).__name__, e)
 
         self._subscribe_data = sub
 
@@ -536,14 +536,14 @@ class AmazingDataGateway:
                 sub.run()
                 # sub.run() 是无限循环(time.sleep(10))，正常情况下永不返回。
                 # 如果返回了，说明 SDK 内部出了问题（会话被踢/内部错误等）。
-                logger.error("SubscribeData.run() returned unexpectedly — session may have been kicked")
+                logger.error("SubscribeData.run() 异常返回（会话可能被踢）")
                 if on_error:
                     try:
                         on_error(RuntimeError("SubscribeData.run() returned unexpectedly"))
                     except Exception:
                         pass
             except Exception as e:
-                logger.error("subscription thread crashed: %s: %s", type(e).__name__, e)
+                logger.error("订阅线程崩溃: %s: %s", type(e).__name__, e)
                 if on_error:
                     try:
                         on_error(e)
@@ -552,7 +552,7 @@ class AmazingDataGateway:
 
         self._sub_thread = threading.Thread(target=_run, daemon=True, name="snapshot-sub")
         self._sub_thread.start()
-        logger.info("snapshot subscription started: %d symbols", len(code_list))
+        logger.info("快照订阅已启动: %d 只", len(code_list))
 
     def stop_subscription(self) -> None:
         """停止订阅。SDK 若有 stop() 则调用，daemon 线程随进程退出。清理引用。"""
@@ -562,7 +562,7 @@ class AmazingDataGateway:
                 if stop:
                     stop()
             except Exception as e:
-                logger.warning("stop subscription error (ignored): %s: %s", type(e).__name__, e)
+                logger.warning("停止订阅异常（已忽略）: %s: %s", type(e).__name__, e)
         self._subscribe_data = None
         self._sub_thread = None
 
@@ -583,10 +583,10 @@ class AmazingDataGateway:
                     is_local=False,
                 )
             except Exception as e:
-                logger.error("get_adj_factor failed: %s: %s (codes=%d)",
+                logger.error("get_adj_factor 失败: %s: %s (codes=%d)",
                              type(e).__name__, e, len(codes))
                 if _is_connection_error(e):
-                    logger.warning("get_adj_factor connection error, attempting relogin: %s", e)
+                    logger.warning("get_adj_factor 连接错误，尝试重连: %s", e)
                     try:
                         self._do_login()
                         result = self._base_data.get_adj_factor(
@@ -594,10 +594,10 @@ class AmazingDataGateway:
                             local_path=self._adj_factor_local_path,
                             is_local=False,
                         )
-                        logger.info("get_adj_factor succeeded after relogin")
+                        logger.info("get_adj_factor 重连后成功")
                         return result
                     except Exception as e2:
-                        logger.error("get_adj_factor failed after reconnect: %s: %s",
+                        logger.error("get_adj_factor 重连后仍失败: %s: %s",
                                      type(e2).__name__, e2)
                         raise GatewayQueryError(f"get_adj_factor failed after reconnect: {e2}") from e2
                 raise GatewayQueryError(f"get_adj_factor failed: {e}") from e
