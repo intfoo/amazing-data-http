@@ -114,15 +114,17 @@ def make_daily_df(code: str = "000001.SZ", rows: int = 1) -> pd.DataFrame:
 
 
 def make_adj_factor_df() -> pd.DataFrame:
-    """模拟 SDK get_adj_factor 返回的宽表：index=交易日期, columns=股票代码。
+    """模拟 SDK get_adj_factor 返回的**密集宽表**：index=交易日期, columns=股票代码。
 
-    含 NaN 单元格模拟非除权日（dropna 后被过滤）。与 SDK 手册 3.5.2.6 输出格式一致。
+    SDK 实测返回密集表（每个交易日一行），非除权日 adj_factor=1.0（A 股无除权事件的标准约定），
+    而非稀疏表（NaN 表示非除权日）。AdjFactorService._filter_non_event_rows 会过滤掉 1.0 行。
+    与 SDK 手册 3.5.2.6 输出格式一致，且符合实际 SDK 行为（实测 8687 行/股，99.6% 为 1.0）。
     """
     dates = pd.date_range("2024-05-30", periods=2, freq="D")
     return pd.DataFrame(
         {
-            "000001.SZ": [1.05, None],
-            "600000.SH": [None, 1.10],
+            "000001.SZ": [1.05, 1.0],   # 5-30 除权事件, 5-31 非除权日
+            "600000.SH": [1.0, 1.10],   # 5-30 非除权日, 5-31 除权事件
         },
         index=pd.Index(dates, name="trade_date"),
     )

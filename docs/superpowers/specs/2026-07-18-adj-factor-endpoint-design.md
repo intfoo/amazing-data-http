@@ -229,7 +229,7 @@ adj_factor_local_path=os.environ.get("ADJ_FACTOR_LOCAL_PATH", "") or "",
 | SDK 接口 | 3.5.2.6 `get_adj_factor`（单次） | stocker 需单次除权事件因子做前复权，schema 长表匹配 |
 | `is_local` | `False` | 每次从服务端取最新数据（`True` 会返回陈旧本地数据，与 stocker 增量同步冲突）。注意 SDK `is_local=False` 仍会写入 `local_path` 缓存（手册注(2)），非纯实时查询，与 `/daily` 的无落盘查询不完全同构 |
 | 日期过滤 | service 层按 `trade_date` 过滤 | SDK `get_adj_factor` 不支持日期参数，必须服务端过滤 |
-| 非除权日处理 | `dropna` 兜底 | 假设 SDK 只返回除权事件；若实测返回稀疏宽表，dropna 收敛到事件长表 |
+| 非除权日处理 | `dropna` + 过滤 `adj_factor != 1.0` | 实测 SDK 返回**密集宽表**（每个交易日一行），非除权日 adj_factor=1.0；dropna 兜底稀疏表，`!= 1.0` 过滤密集表非除权日。用精确 `!= 1.0` 而非 `np.isclose`：实测有 0.9955 等 <1.0 真事件，isclose 会误删。详见 `adj_factor_service._filter_non_event_rows` |
 | 进程内缓存 | 不做（YAGNI） | 先简单正确；性能问题实测后再加 |
 | 字段命名 | `code`/`trade_date`/`adj_factor` | 中性，与 `/daily` 的 `code` 一致；stocker 通过 field_map 适配 |
 | 参数命名 | `codes`/`start_time`/`end_time` | 与 `/daily` 一致；stocker 配 `symbols_param: codes` 适配 |

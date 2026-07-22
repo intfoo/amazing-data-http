@@ -24,13 +24,19 @@ def test_query_melts_wide_dataframe():
         assert row["trade_date"] in ("2024-05-30", "2024-05-31")
 
 
-def test_query_dropna_filters_non_event_rows():
-    """宽表含 NaN 的非除权日行被 dropna 过滤。"""
+def test_query_filters_non_event_rows_adj_factor_eq_1():
+    """密集宽表中 adj_factor==1.0 的非除权日行被过滤，只保留真除权事件。
+
+    SDK 实测返回密集表（非除权日 adj_factor=1.0，非 NaN）。AdjFactorService._filter_non_event_rows
+    先 dropna（兜底）再过滤 1.0，使返回结果与契约"每次除权除息事件一行"一致。
+    """
     gw = FakeGateway(ready=True, adj_factor_result=make_adj_factor_df())
     svc = AdjFactorService(gw)
     data = svc.query(["000001.SZ", "600000.SH"])
-    # 宽表 2 日期 × 2 代码 = 4 单元格，2 个 NaN，dropna 后剩 2 行
+    # 密集表 2 日期 × 2 代码 = 4 行，2 行 1.0 + 2 行非 1.0，过滤后剩 2 行
     assert len(data) == 2
+    for row in data:
+        assert row["adj_factor"] != 1.0
 
 
 def test_query_date_filter_start_only():
@@ -118,6 +124,49 @@ def test_query_passes_codes_to_gateway():
     svc = AdjFactorService(gw)
     svc.query(["000001.SZ", "600000.SH"])
     assert gw.adj_factor_query_calls[0]["codes"] == ["000001.SZ", "600000.SH"]
+
+
+def test_query_dense_table_filters_all_unit_rows():
+    """密集宽表（多日期多 1.0 行）只保留真除权事件，验证 1.0 过滤不误删 <1.0 边界事件。
+
+    SDK 实测样本含 0.9955、0.9791 等 <1.0 的真除权事件（反向拆股/股本变更），
+    必须用精确 != 1.0 而非 np.isclose，避免误删这些边界事件。
+    """
+    # 模拟真实 SDK 密集表：5 个交易日，000001.SZ 有 2 个除权事件（1.05, 0.9955），其余 1.0
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    df = pd.DataFrame(
+        {
+            "000001.SZ": [1.0, 1.05, 1.0, 0.9955, 1.0],
+        },
+        index=pd.Index(dates, name="trade_date"),
+    )
+    gw = FakeGateway(ready=True, adj_factor_result=df)
+    svc = AdjFactorService(gw)
+    data = svc.query(["000001.SZ"])
+    assert len(data) == 2  # 1.05 和 0.9955，1.0 行被过滤
+    values = sorted(r["adj_factor"] for r in data)
+    assert values == [0.9955, 1.05]  # 验证 <1.0 事件未被误删
+
+
+def test_query_sparse_table_dropna_path():
+    """稀疏宽表（NaN 表示非除权日）也能被正确过滤（dropna 兜底 + != 1.0）。
+
+    SDK 实测返回密集表（1.0），但 _filter_non_event_rows 保留 dropna 兜底稀疏表。
+    此测试验证稀疏表路径仍工作（防御性，SDK 未来可能改回稀疏表）。
+    """
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    df = pd.DataFrame(
+        {
+            "000001.SZ": [1.05, None, 1.0],  # 除权事件, NaN(稀疏), 非除权日
+        },
+        index=pd.Index(dates, name="trade_date"),
+    )
+    gw = FakeGateway(ready=True, adj_factor_result=df)
+    svc = AdjFactorService(gw)
+    data = svc.query(["000001.SZ"])
+    # dropna 过滤 NaN 行，!= 1.0 过滤非除权日，只剩 1.05
+    assert len(data) == 1
+    assert data[0]["adj_factor"] == 1.05
 
 
 # ========== HTTP 端到端测试 ==========

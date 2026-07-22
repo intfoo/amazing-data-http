@@ -13,8 +13,10 @@ services:
     env_file:
       - .env
     volumes:
-      # 复权因子缓存目录：SDK get_adj_factor 的 local_path 缓存，
-      - ./data/adj_factor:/app/data/adj_factor
+      # 复权因子缓存基目录：SDK get_adj_factor 的 local_path 缓存。
+      # SDK 内部用字符串拼接 local_path + 'basedata/adj_factor/' 构造缓存路径（非 os.path.join），
+      # 因此挂载整个 data 目录而非 data/adj_factor，确保 SDK 自建的 basedata/adj_factor/ 子目录持久化。
+      - ./data:/app/data
     restart: unless-stopped
     deploy:
       resources:

@@ -1,6 +1,26 @@
-"""带超时测试 query_snapshot，确认能否作为盘后 fallback。"""
-import json, os, sys, threading, time
-cfg = json.load(open(os.path.join(os.path.dirname(__file__), "..", "local.config.json")))
+"""带超时测试 query_snapshot，确认能否作为盘后 fallback。读 .env 获取凭据。"""
+import os, sys, threading, time
+
+
+def _load_env_creds():
+    """读 .env 注入 os.environ 并返回凭据 dict（替代 local.config.json）。"""
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip())
+    return {
+        "AMAZINGDATA_USERNAME": os.environ.get("AMAZINGDATA_USERNAME", ""),
+        "AMAZINGDATA_PASSWORD": os.environ.get("AMAZINGDATA_PASSWORD", ""),
+        "AMAZINGDATA_HOST": os.environ.get("AMAZINGDATA_HOST", ""),
+        "AMAZINGDATA_PORT": os.environ.get("AMAZINGDATA_PORT", ""),
+    }
+
+
+cfg = _load_env_creds()
 import AmazingData as ad
 ad.login(username=cfg["AMAZINGDATA_USERNAME"], password=cfg["AMAZINGDATA_PASSWORD"],
          host=cfg["AMAZINGDATA_HOST"], port=int(cfg["AMAZINGDATA_PORT"]))

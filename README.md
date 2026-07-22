@@ -96,7 +96,7 @@ python scripts/run.py
 # 选模式 1=本地
 ```
 
-首次运行会逐项询问用户名 / IP / 端口 / 密码（密码隐藏输入），probe 登录验证通过后写入 `local.config.json`（gitignored），随后每次启动自动读取并重跑 probe 门禁。
+首次运行会逐项询问用户名 / IP / 端口 / 密码（密码隐藏输入），probe 登录验证通过后写入 `.env`（gitignored），随后每次启动自动读取并重跑 probe 门禁。
 
 > SDK wheel 按 Python 解释器版本自动选 `cp313` / `cp314`；`import AmazingData` 失败时会询问是否自动 `pip install`。启动 uvicorn 前还会检查 `tables`（pytables，复权因子缓存依赖），缺失时提示自动安装。
 
@@ -107,7 +107,7 @@ curl http://localhost:3021/health
 curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d "{\"symbols\":[\"000001.SZ\"],\"start_time\":\"2024-01-02\",\"end_time\":\"2024-01-31\"}"
 ```
 
-> 本地模式凭据存 `local.config.json`，Docker 模式存 `.env`，二者互不读取。
+> 本地模式和 Docker 模式均统一用 `.env` 存储凭据。
 
 ## 验证方式三：Docker 完整链路（需要 Docker + 凭据）
 
@@ -134,14 +134,14 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 
 ## 配置说明
 
-服务通过环境变量读取配置。两种启动模式对应不同配置文件，互不读取：
+服务通过环境变量读取配置。本地模式和 Docker 模式统一使用 `.env` 文件：
 
 | 模式 | 配置文件 | 注入方式 | 启动入口 |
 |------|---------|---------|---------|
-| 本地模式 | `local.config.json`（JSON） | `scripts/run.py` 模式 1 读取后注入 `os.environ` | `python scripts/run.py` 选 1 |
+| 本地模式 | `.env`（KEY=VALUE） | `scripts/run.py` 模式 1 读取后注入 `os.environ` | `python scripts/run.py` 选 1 |
 | Docker/Podman 模式 | `.env`（KEY=VALUE） | `docker-compose.yml` 的 `env_file` 注入容器 | `python scripts/run.py` 选 2/3 |
 
-`scripts/run.py` 交互式向导只写入 4 项 SDK 凭据 + `HTTP_HOST` + `HTTP_PORT`；认证、并发限制等字段需手动编辑配置文件追加。`local.config.json` 的所有键值都会被注入环境变量，JSON 字段名必须与环境变量名一致。
+`scripts/run.py` 交互式向导只写入 4 项 SDK 凭据 + `HTTP_HOST` + `HTTP_PORT`；认证、并发限制等字段需手动编辑 `.env` 追加。`.env` 的所有键值都会被注入环境变量。
 
 ### 字段参考
 
@@ -157,6 +157,7 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 | `AUTH_TOKEN` | 视情况 | `""` | Bearer token。`AUTH_REQUIRED=true` 时必填，客户端需带 `Authorization: Bearer <token>`。强度要求：长度 > 12 且同时含字母和数字，弱 token 阻止启动 |
 | `AUTH_REQUIRED` | 否 | `true` | 认证开关。`false` 时认证彻底关闭，所有请求直接放行，`AUTH_TOKEN` 被忽略。仅本地调试用，生产必须保持 `true` |
 | `ADJ_FACTOR_LOCAL_PATH` | 否 | `""` | SDK `get_adj_factor` 的 `local_path` 参数，必须为绝对路径。留空由 SDK 自行管理 HDF5 缓存 |
+| `ADJ_FACTOR_IS_LOCAL` | 否 | `false` | 复权因子是否使用本地缓存。`true` 时优先读本地 HDF5 文件，`false` 时从服务端拉取 |
 | `SUBSCRIPTION_OPEN` | 否 | `09:00` | 订阅窗口开始（HH:MM）。仅在交易日窗口内启动快照订阅，非交易时段不持有订阅会话以降 CPU。SDK 查询接口不受影响 |
 | `SUBSCRIPTION_CLOSE` | 否 | `15:20` | 订阅窗口结束（HH:MM） |
 | `STALE_THRESHOLD_SEC` | 否 | `90` | watchdog 失活阈值（秒）。窗口期内连续 N 秒未收到快照即判定订阅失活，`/health` 返回 503 触发容器重启 |
@@ -166,21 +167,7 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 
 ### 配置文件示例
 
-`local.config.json`（本地模式）：
-
-```json
-{
-  "AMAZINGDATA_USERNAME": "your_account",
-  "AMAZINGDATA_PASSWORD": "your_password",
-  "AMAZINGDATA_HOST": "1.2.3.4",
-  "AMAZINGDATA_PORT": "8600",
-  "HTTP_HOST": "0.0.0.0",
-  "HTTP_PORT": "3021",
-  "AUTH_TOKEN": "your_token_with_letters_and_digits_123"
-}
-```
-
-`.env`（Docker 模式）：
+`.env`（本地模式和 Docker 模式通用）：
 
 ```ini
 AMAZINGDATA_USERNAME=your_account
@@ -198,4 +185,4 @@ STALE_THRESHOLD_SEC=90
 WATCHDOG_INTERVAL_SEC=60
 ```
 
-两个文件均含凭据，不应提交到版本库（`.env.example` 是可提交的脱敏模板）。
+`.env` 含凭据，不应提交到版本库（`.env.example` 是可提交的脱敏模板）。

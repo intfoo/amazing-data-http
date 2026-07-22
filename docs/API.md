@@ -117,7 +117,12 @@
 
 **空结果**（HTTP 200）：`{"data": []}`
 
-> SDK `get_adj_factor` 返回宽表（index=交易日期, columns=股票代码），服务端 `melt` 成长表并 `dropna` 过滤非除权日。字段命名中性（`code`/`trade_date`/`adj_factor`），外部项目通过自身 YAML `field_map` 适配为内部字段（如 stocker 的 `symbol`/`trade_date`/`ex_factor`）。
+> SDK `get_adj_factor` 返回**密集宽表**（index=交易日期, columns=股票代码），每个交易日一行，
+> 非除权日 adj_factor=1.0（A 股无除权事件的标准约定）。服务端 `melt` 成长表后，
+> `_filter_non_event_rows` 先 `dropna`（兜底稀疏表）再过滤 `adj_factor != 1.0`（实测密集表
+> 非除权日值），使返回结果与契约"每次除权除息事件一行"一致。实测单只股票全量 8687 行中
+> 仅 32 行是真除权事件。字段命名中性（`code`/`trade_date`/`adj_factor`），外部项目通过自身
+> YAML `field_map` 适配为内部字段（如 stocker 的 `symbol`/`trade_date`/`ex_factor`）。
 
 ## GET /realtime
 

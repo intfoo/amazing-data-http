@@ -1,6 +1,5 @@
 """run.py 纯函数测试，不依赖真实 SDK / docker。"""
 import importlib.util
-import json
 import os
 import sys
 from pathlib import Path
@@ -18,26 +17,6 @@ def _load_run():
     return mod
 
 
-def test_write_load_local_config_roundtrip(tmp_path):
-    run = _load_run()
-    p = tmp_path / "local.config.json"
-    creds = {"AMAZINGDATA_USERNAME": "u", "AMAZINGDATA_PASSWORD": "p",
-             "AMAZINGDATA_HOST": "1.2.3.4", "AMAZINGDATA_PORT": "8600"}
-    run.write_local_config(p, creds)
-    data = run.load_local_config(p)
-    assert data["AMAZINGDATA_USERNAME"] == "u"
-    assert data["HTTP_HOST"] == "0.0.0.0"
-    assert data["HTTP_PORT"] == "3021"
-
-
-def test_load_local_config_corrupt_json_raises(tmp_path):
-    run = _load_run()
-    p = tmp_path / "bad.json"
-    p.write_text("{not json", encoding="utf-8")
-    with pytest.raises(json.JSONDecodeError):
-        run.load_local_config(p)
-
-
 def test_write_env_file_format(tmp_path):
     run = _load_run()
     p = tmp_path / ".env"
@@ -50,6 +29,36 @@ def test_write_env_file_format(tmp_path):
     assert lines[3] == "AMAZINGDATA_PORT=8600"
     assert lines[4] == "HTTP_HOST=0.0.0.0"
     assert lines[5] == "HTTP_PORT=3021"
+
+
+def test_write_env_file_merges_preserving_extras(tmp_path):
+    """write_env_file 合并模式：保留现有 .env 的扩展配置（AUTH_TOKEN 等），只更新凭据键。"""
+    run = _load_run()
+    p = tmp_path / ".env"
+    p.write_text(
+        "# comment\n"
+        "AMAZINGDATA_USERNAME=olduser\n"
+        "AMAZINGDATA_PASSWORD=oldpw\n"
+        "AUTH_TOKEN=secrettoken123\n"
+        "ADJ_FACTOR_IS_LOCAL=true\n"
+        "AMAZINGDATA_HOST=oldhost\n",
+        encoding="utf-8",
+    )
+    creds = {"AMAZINGDATA_USERNAME": "newuser", "AMAZINGDATA_PASSWORD": "newpw",
+             "AMAZINGDATA_HOST": "newhost", "AMAZINGDATA_PORT": "9999"}
+    run.write_env_file(p, creds)
+    content = p.read_text(encoding="utf-8")
+    # 凭据已更新
+    assert "AMAZINGDATA_USERNAME=newuser" in content
+    assert "AMAZINGDATA_HOST=newhost" in content
+    assert "AMAZINGDATA_PORT=9999" in content
+    # 扩展配置保留
+    assert "AUTH_TOKEN=secrettoken123" in content
+    assert "ADJ_FACTOR_IS_LOCAL=true" in content
+    # 注释保留
+    assert "# comment" in content
+    # 旧值不存在
+    assert "olduser" not in content
 
 
 def test_build_container_build_cmd_has_tag():
@@ -188,9 +197,50 @@ def test_summarize_config_hides_password(capsys):
     assert "已隐藏" in out
 
 
-def test_run_local_exits_after_3_probe_failures(monkeypatch, tmp_path):
+def test_collect_credentials_reuses_complete_env(monkeypatch, tmp_path):
+    """.env 存在且字段完整时复用，不进向导。"""
     run = _load_run()
-    monkeypatch.setattr(run, "LOCAL_CONFIG", tmp_path / "local.config.json")
+    monkeypatch.setattr(run, "ENV_FILE", tmp_path / ".env")
+    run.write_env_file(tmp_path / ".env", {
+        "AMAZINGDATA_USERNAME": "keptuser", "AMAZINGDATA_PASSWORD": "keptpw",
+        "AMAZINGDATA_HOST": "9.9.9.9", "AMAZINGDATA_PORT": "8600",
+    })
+
+    def fail_input(prompt):
+        raise AssertionError("不应进入凭据向导，.env 完整应被复用")
+
+    creds = run._collect_credentials(
+        input_fn=fail_input,
+        getpass_fn=fail_input,
+        confirm_fn=lambda p: True,  # 复用现有 .env
+    )
+    assert creds["AMAZINGDATA_USERNAME"] == "keptuser"
+    assert creds["AMAZINGDATA_HOST"] == "9.9.9.9"
+
+
+def test_collect_credentials_wizard_when_env_missing(monkeypatch, tmp_path):
+    """.env 不存在时进向导 + 写 .env。"""
+    run = _load_run()
+    monkeypatch.setattr(run, "ENV_FILE", tmp_path / ".env")
+    inputs = iter(["newuser", "5.6.7.8", "9999"])
+    passes = iter(["newpw"])
+
+    creds = run._collect_credentials(
+        input_fn=lambda p: next(inputs),
+        getpass_fn=lambda p: next(passes),
+        confirm_fn=lambda p: True,
+    )
+    assert creds["AMAZINGDATA_USERNAME"] == "newuser"
+    # .env 应被写入
+    written = run.load_env_file(tmp_path / ".env")
+    assert written["AMAZINGDATA_USERNAME"] == "newuser"
+    assert written["AMAZINGDATA_HOST"] == "5.6.7.8"
+
+
+def test_run_local_exits_on_probe_failure(monkeypatch, tmp_path):
+    """probe 失败 1 次即退出（不再重试 3 次），.env 已由向导写入。"""
+    run = _load_run()
+    monkeypatch.setattr(run, "ENV_FILE", tmp_path / ".env")
     monkeypatch.setattr(run, "PROBE_REPORT", tmp_path / "probe.json")
     monkeypatch.setattr(run, "ensure_sdk", lambda *a, **k: None)
 
@@ -218,14 +268,14 @@ def test_run_local_exits_after_3_probe_failures(monkeypatch, tmp_path):
                       confirm_fn=lambda p: True,
                       install_fn=lambda pkgs: None,
                       runner=fake_runner)
-    assert calls["n"] == 3
-    assert not (tmp_path / "local.config.json").exists()
+    assert calls["n"] == 1  # probe 只调用 1 次（失败即退出，不重试）
+    assert (tmp_path / ".env").exists()  # 向导已写入 .env
 
 
-def test_run_local_success_writes_config_and_calls_uvicorn(monkeypatch, tmp_path):
+def test_run_local_success_writes_env_and_calls_uvicorn(monkeypatch, tmp_path):
     import types as _types
     run = _load_run()
-    monkeypatch.setattr(run, "LOCAL_CONFIG", tmp_path / "local.config.json")
+    monkeypatch.setattr(run, "ENV_FILE", tmp_path / ".env")
     monkeypatch.setattr(run, "PROBE_REPORT", tmp_path / "probe.json")
     monkeypatch.setattr(run, "ensure_sdk", lambda *a, **k: None)
     inputs = iter(["user", "1.2.3.4", "8600"])
@@ -261,7 +311,7 @@ def test_run_local_success_writes_config_and_calls_uvicorn(monkeypatch, tmp_path
                   runner=fake_runner)
     assert called["run"] is True
     assert called["app_str"] == "app.http_app:app"
-    assert (tmp_path / "local.config.json").exists()
+    assert (tmp_path / ".env").exists()  # 向导写入 .env
 
 
 def test_run_container_build_fail_exits(monkeypatch, tmp_path):

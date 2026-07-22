@@ -2,13 +2,13 @@
 
 职责边界：
 - 调用 gateway.get_adj_factor 获取 SDK 宽表 DataFrame（index=交易日期, columns=股票代码）
-- melt 成长表 [{code, trade_date, adj_factor}]，dropna 过滤非除权日
+- melt 成长表 [{code, trade_date, adj_factor}]，过滤非除权日（dropna 兜底 + adj_factor != 1.0）
 - 按 start_time/end_time 过滤 trade_date（SDK get_adj_factor 不支持日期参数，服务端过滤）
 - 委托 serializer 处理 NumPy/datetime/NaN 类型转换
 
 不负责：字段重命名、单位换算、复权计算（由主项目 YAML field_map 完成）
 
-性能：melt/dropna/过滤在 DataFrame 层向量化完成，避免逐条 dict 操作。
+性能：melt/过滤在 DataFrame 层向量化完成，避免逐条 dict 操作。
 """
 
 import logging
@@ -81,7 +81,7 @@ class AdjFactorService:
 
     @staticmethod
     def _melt_and_normalize(df: pd.DataFrame) -> pd.DataFrame:
-        """SDK 宽表/长表 → code/trade_date/adj_factor 长表。dropna 过滤非除权日。
+        """SDK 宽表/长表 → code/trade_date/adj_factor 长表。非除权日过滤由 _filter_non_event_rows 完成。
 
         判定顺序：先看是否已是长表（含 code + adj_factor 列），否则按宽表处理。
         """
@@ -94,16 +94,33 @@ class AdjFactorService:
                     break
             if rename:
                 df = df.rename(columns=rename)
-            df = df.dropna(subset=["adj_factor"])
         else:
             # 宽表形态：index=交易日期, columns=股票代码
             df = df.reset_index()
             date_col = df.columns[0]  # 按位置取日期列（index 可能无名）
             df = df.melt(id_vars=[date_col], var_name="code", value_name="adj_factor")
             df = df.rename(columns={date_col: "trade_date"})
-            df = df.dropna(subset=["adj_factor"])
         df = AdjFactorService._normalize_trade_date_str(df)
+        df = AdjFactorService._filter_non_event_rows(df)
         return df[["code", "trade_date", "adj_factor"]]
+
+    @staticmethod
+    def _filter_non_event_rows(df: pd.DataFrame) -> pd.DataFrame:
+        """过滤非除权事件行：dropna（兜底稀疏表）+ 排除 adj_factor==1.0（实测密集表非除权日值）。
+
+        SDK get_adj_factor 返回**密集宽表**（每个交易日一行），非除权日的 adj_factor
+        恒为 1.0（A 股无除权事件的标准约定）。实测单只股票全量 8687 行中仅 32 行
+        是真除权事件，其余 8655 行均为 1.0。此处过滤掉 1.0 行，使返回结果与接口契约
+        "每次除权除息事件一行"一致，同时把 melt/serialize 的内存峰值从 N×交易日降到
+        N×事件数（约 1/270）。
+
+        用精确 `!= 1.0` 而非 `np.isclose(., 1.0)`：实测样本有 0.9955、0.9791 等 <1.0
+        的真除权事件（反向拆股/特殊股本变更），isclose 会误删这些边界事件。
+        1.0 在 IEEE754 是精确表示，密集表所有非除权日值都是精确 1.0，比较可靠。
+        """
+        df = df.dropna(subset=["adj_factor"])
+        df = df[df["adj_factor"] != 1.0]
+        return df
 
     @staticmethod
     def _normalize_trade_date_str(df: pd.DataFrame) -> pd.DataFrame:

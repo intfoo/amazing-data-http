@@ -8,7 +8,7 @@
 3. （仅盘中有效）回调是否同时收到 Snapshot 与 SnapshotIndex
    → 非交易时段此项为空，不影响退出码
 
-自包含：读 local.config.json 注入 env（同 run.py 模式）。
+自包含：读 .env 注入 env（同 run.py 模式）。
 退出码 0 = 两个核心测试都执行完成（结果看 report，不因结论"不支持"而判失败）。
 运行：python scripts/probe_index_mixed.py [--out docs/probe-index-mixed.json] [--sub-timeout 15]
 """
@@ -24,18 +24,20 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = "docs/probe-index-mixed.json"
-LOCAL_CONFIG = PROJECT_ROOT / "local.config.json"
+ENV_PATH = PROJECT_ROOT / ".env"
 
 
-def load_env_from_local_config():
-    """读 local.config.json 注入 os.environ（与 run.py 一致）。"""
-    if not LOCAL_CONFIG.exists():
+def _load_env_creds():
+    """读 .env 注入 os.environ（替代 local.config.json，与 run.py 一致）。"""
+    if not ENV_PATH.exists():
         return False
     try:
-        with open(LOCAL_CONFIG, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        for k, v in cfg.items():
-            os.environ[k] = str(v)
+        with open(ENV_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip())
         return True
     except Exception:
         return False
@@ -74,8 +76,8 @@ def probe(out_path=DEFAULT_OUT, sub_timeout=15):
     report = {"errors": [], "started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     _log("start")
 
-    if not load_env_from_local_config():
-        report["errors"].append("local.config.json not found or unreadable")
+    if not _load_env_creds():
+        report["errors"].append(".env not found or unreadable")
         return _finish(report, out_path)
 
     try:

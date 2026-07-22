@@ -6,7 +6,7 @@ get_code_list 全量拉取约 20s/次（股票+指数共 40s），启动慢。
 1. get_code_info 是否比 get_code_list 快（若快可用 df.index.tolist() 替代，额外拿简称）
 2. 两者返回的代码集合是否一致（确认可替代）
 
-自包含：读 local.config.json 注入 env（同 probe_index_mixed.py）。
+自包含：读 .env 注入 env（同 probe_index_mixed.py）。
 运行：python scripts/probe_code_info.py [--out docs/probe-code-info.json]
 """
 import argparse
@@ -19,17 +19,20 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = "docs/probe-code-info.json"
-LOCAL_CONFIG = PROJECT_ROOT / "local.config.json"
+ENV_PATH = PROJECT_ROOT / ".env"
 
 
-def load_env_from_local_config():
-    if not LOCAL_CONFIG.exists():
+def _load_env_creds():
+    """读 .env 注入 os.environ 并返回凭据 dict（替代 local.config.json）。"""
+    if not ENV_PATH.exists():
         return False
     try:
-        with open(LOCAL_CONFIG, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        for k, v in cfg.items():
-            os.environ[k] = str(v)
+        with open(ENV_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip())
         return True
     except Exception:
         return False
@@ -79,8 +82,8 @@ def probe(out_path=DEFAULT_OUT):
     report = {"errors": [], "started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     _log("start")
 
-    if not load_env_from_local_config():
-        report["errors"].append("local.config.json not found or unreadable")
+    if not _load_env_creds():
+        report["errors"].append(".env not found or unreadable")
         return _finish(report, out_path)
 
     try:

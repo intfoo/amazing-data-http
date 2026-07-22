@@ -121,22 +121,39 @@ class AmazingDataGateway:
         self._adj_factor_local_path = self._resolve_adj_factor_local_path()
 
     def _resolve_adj_factor_local_path(self) -> str:
-        """解析 adj_factor 本地缓存目录：配置非空用配置，否则用项目根 data/adj_factor 兜底 + 警告。
+        """解析 adj_factor 本地缓存基目录：配置非空用配置，否则用项目根 data 兜底 + 警告。
 
-        启动时（实例化）调用，目录不存在则自动创建。SDK 要求绝对路径。
+        启动时（实例化）调用，目录不存在则自动创建。SDK 要求绝对路径，且**末尾必须带分隔符**。
+
+        SDK 字符串拼接坑（详见 base_data.pyc get_adj_factor 反汇编 + LocalDataFolder enum）：
+        SDK 内部构造缓存路径用 `local_path + 'basedata/adj_factor/'`（字符串 +，非 os.path.join）：
+            folder_name = LocalDataFolder.BASEDATA.value + '/' + LocalDataFolder.ADJ_FACTOR.value
+            path = local_path + folder_name + '/'
+        - local_path 末尾无分隔符（如 'D:/.../data/adj_factor'）→ 拼成 'D:/.../data/adj_factorbasedata/adj_factor/'
+          （'adj_factor' 与 'basedata' 粘在一起，目录名错乱但能工作）
+        - local_path 末尾带分隔符（如 'D:/.../data/'）→ 拼成 'D:/.../data/basedata/adj_factor/'（正确）
+        手册 3.5.2.6 注(1) 示例 'D://AmazingData_local_data//' 末尾双斜杠正是为此设计。
+        本方法强制末尾带分隔符，避免依赖调用方记忆此坑。
+
+        兜底路径用 `项目根/data`（不带 `adj_factor` 后缀）：SDK 会自动在下面建
+        `basedata/adj_factor/` 子目录，不需要在 local_path 里预设。若预设 `adj_factor` 后缀
+        且末尾带分隔符，SDK 会拼出 `data/adj_factor/basedata/adj_factor/`（多一层 adj_factor）。
         """
         from pathlib import Path
         configured = self._config.adj_factor_local_path
         if configured:
             local_path = str(Path(configured).resolve())
         else:
-            # 默认项目根/data/adj_factor（gateway.py 在 app/，parent.parent = 项目根）
-            local_path = str(Path(__file__).resolve().parent.parent / "data" / "adj_factor")
+            # 默认项目根/data（gateway.py 在 app/，parent.parent = 项目根）
+            local_path = str(Path(__file__).resolve().parent.parent / "data")
             logger.warning(
                 "ADJ_FACTOR_LOCAL_PATH 未配置，使用默认路径: %s"
                 "（建议设为持久化绝对路径以供 SDK 缓存）",
                 local_path,
             )
+        # SDK 字符串拼接要求末尾带分隔符，否则 'data/adj_factor' + 'basedata' → 'adj_factorbasedata'
+        if not local_path.endswith(('/', '\\')):
+            local_path = local_path + '/'
         Path(local_path).mkdir(parents=True, exist_ok=True)
         return local_path
 
@@ -248,7 +265,17 @@ class AmazingDataGateway:
             elif any(kw in msg_str for kw in DISCONNECT_KEYWORDS):
                 logger.warning("tgw disconnect: [%s] %s", level_name, msg_str)
             elif level == 3:  # kError
-                logger.error("tgw error: [%s] %s", level_name, msg_str)
+                # PushImpl/PushDecoder 的 queue size 是 SDK 内部 push 队列状态打印
+                # （/adj_factor 等查询请求触发数据传输，push 队列短暂堆积后消化；
+                # queue size 与 codes 数量正相关，如 codes=1→2, codes=500→26）。
+                # SDK 标为 kError 但实际是常规状态，非真错误，降级到 debug 避免刷屏。
+                # 关键词：PushImpl | totoal dgw pakage in queue:N / PushDecoder | queue size:N,...
+                # 收窄过滤：只过滤队列状态打印（"queue size" / "in queue"），
+                # 避免 PushImpl/PushDecoder 前缀的其他真错误被误降级。
+                if "queue size" in msg_str or "in queue" in msg_str:
+                    logger.debug("tgw push status: [%s] %s", level_name, msg_str)
+                else:
+                    logger.error("tgw error: [%s] %s", level_name, msg_str)
             else:
                 # kWarn/kInfo 含大量心跳日志，降级到 debug 避免刷屏
                 logger.debug("tgw [%s] %s", level_name, msg_str)
@@ -570,21 +597,26 @@ class AmazingDataGateway:
         """获取单次复权因子（手册 3.5.2.6）。返回 SDK 原始 DataFrame（宽表：index=交易日期, columns=股票代码）。
 
         SDK 签名 get_adj_factor(code_list, local_path, is_local)，无日期参数。
-        is_local=False：从服务端取最新，但仍会更新 local_path 缓存（手册注(2)）。
-        local_path 在启动时由 _resolve_adj_factor_local_path 解析（配置优先，否则项目根 data/adj_factor 兜底）。
+        is_local 由 Config.adj_factor_is_local 控制（环境变量 ADJ_FACTOR_IS_LOCAL）：
+        - False（默认）：每次从服务端取最新，仍会更新 local_path 缓存（手册注(2)）。每次 ~21s。
+        - True：本地有缓存则读本地（<1s），本地无则远程取 + 写本地（首次 ~21s）。
+          风险：本地缓存可能陈旧（adj_factor 除权事件一年几次，风险低但不为零）。
+        local_path 在启动时由 _resolve_adj_factor_local_path 解析（配置优先，否则项目根 data 兜底，
+        SDK 会自建 basedata/adj_factor/ 子目录）。
         """
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
+        is_local = self._config.adj_factor_is_local
         with self._lock:
             try:
                 return self._base_data.get_adj_factor(
                     codes,
                     local_path=self._adj_factor_local_path,
-                    is_local=False,
+                    is_local=is_local,
                 )
             except Exception as e:
-                logger.error("get_adj_factor 失败: %s: %s (codes=%d)",
-                             type(e).__name__, e, len(codes))
+                logger.error("get_adj_factor 失败: %s: %s (codes=%d, is_local=%s)",
+                             type(e).__name__, e, len(codes), is_local)
                 if _is_connection_error(e):
                     logger.warning("get_adj_factor 连接错误，尝试重连: %s", e)
                     try:
@@ -592,7 +624,7 @@ class AmazingDataGateway:
                         result = self._base_data.get_adj_factor(
                             codes,
                             local_path=self._adj_factor_local_path,
-                            is_local=False,
+                            is_local=is_local,
                         )
                         logger.info("get_adj_factor 重连后成功")
                         return result

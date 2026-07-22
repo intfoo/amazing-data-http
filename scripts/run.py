@@ -1,11 +1,10 @@
 """统一本地 & Docker/Podman 启动入口。
 
 交互式向导收集凭据 → 可选装 SDK → probe 门禁 → 本地起 uvicorn 或编排容器。
-本地模式凭据写 local.config.json（注入 os.environ，零改动 app 代码）；
-容器模式（Docker/Podman）凭据写 .env。二者互不读取。
+凭据统一写 .env（local 模式与 docker 模式共用），注入 os.environ，零改动 app 代码。
+扩展配置（ADJ_FACTOR_LOCAL_PATH、ADJ_FACTOR_IS_LOCAL、SUBSCRIPTION_* 等）也在 .env 里。
 """
 import getpass
-import json
 import os
 import shutil
 import signal
@@ -18,7 +17,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-LOCAL_CONFIG = PROJECT_ROOT / "local.config.json"
 ENV_FILE = PROJECT_ROOT / ".env"
 PROBE_REPORT = PROJECT_ROOT / "docs" / "probe-report.json"
 PROBE_SCRIPT = PROJECT_ROOT / "scripts" / "probe_sdk.py"
@@ -54,13 +52,13 @@ def pick_sdk_wheels():
     return [str(tgw[0]), str(ad[0])]
 
 
-def load_local_config(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def write_env_file(path, creds):
+    """写 .env：合并模式。保留现有 .env 的注释和扩展配置，只更新凭据键 + HTTP 配置。
 
-
-def write_local_config(path, creds):
-    data = {
+    避免向导覆盖 .env 时丢失 AUTH_TOKEN、ADJ_FACTOR_IS_LOCAL、SUBSCRIPTION_* 等扩展配置。
+    .env 不存在时（首次运行）只写 6 个基本键，用户需手动配置 AUTH_TOKEN 等。
+    """
+    cred_updates = {
         "AMAZINGDATA_USERNAME": creds["AMAZINGDATA_USERNAME"],
         "AMAZINGDATA_PASSWORD": creds["AMAZINGDATA_PASSWORD"],
         "AMAZINGDATA_HOST": creds["AMAZINGDATA_HOST"],
@@ -68,22 +66,27 @@ def write_local_config(path, creds):
         "HTTP_HOST": DEFAULT_HTTP_HOST,
         "HTTP_PORT": DEFAULT_HTTP_PORT,
     }
+    p = Path(path)
+    existing_lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    updated_keys = set()
+    new_lines = []
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k = stripped.partition("=")[0].strip()
+            if k in cred_updates:
+                new_lines.append(f"{k}={cred_updates[k]}")
+                updated_keys.add(k)
+                continue
+        new_lines.append(line)
+    # 追加 .env 中不存在的凭据键
+    for k, v in cred_updates.items():
+        if k not in updated_keys:
+            new_lines.append(f"{k}={v}")
+    if not new_lines or new_lines[-1] != "":
+        new_lines.append("")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def write_env_file(path, creds):
-    lines = [
-        f"AMAZINGDATA_USERNAME={creds['AMAZINGDATA_USERNAME']}",
-        f"AMAZINGDATA_PASSWORD={creds['AMAZINGDATA_PASSWORD']}",
-        f"AMAZINGDATA_HOST={creds['AMAZINGDATA_HOST']}",
-        f"AMAZINGDATA_PORT={creds['AMAZINGDATA_PORT']}",
-        f"HTTP_HOST={DEFAULT_HTTP_HOST}",
-        f"HTTP_PORT={DEFAULT_HTTP_PORT}",
-        "",
-    ]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write("\n".join(new_lines))
 
 
 ENV_REQUIRED_KEYS = ("AMAZINGDATA_USERNAME", "AMAZINGDATA_PASSWORD",
@@ -113,7 +116,7 @@ def inject_env(config):
         os.environ[k] = str(v)
 
 
-def summarize_config(creds, source="local.config.json"):
+def summarize_config(creds, source=".env"):
     """打印已读取的配置摘要（密码隐藏）。"""
     print(f"已读取 {source}：")
     print(f"  账号   AMAZINGDATA_USERNAME = {creds.get('AMAZINGDATA_USERNAME', '<空>')}")
@@ -196,6 +199,37 @@ def ask_credentials(input_fn=input, getpass_fn=getpass.getpass):
     }
 
 
+def _collect_credentials(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm):
+    """收集凭据：.env 存在且字段完整则复用，否则进向导收集 + 写 .env。返回 creds dict。
+
+    local 模式与 docker 模式共用此函数，统一凭据来源为 .env。
+    .env 存在且四项必填凭据完整时，默认复用（避免重复输入）；缺失/不完整/不可读才进向导。
+    向导收集后写 .env（覆盖前先 backup .env.bak）。
+    """
+    creds = None
+    if ENV_FILE.exists():
+        try:
+            existing = load_env_file(ENV_FILE)
+            if env_credentials_complete(existing):
+                summarize_config(existing, source=".env")
+                if confirm_fn("复用现有 .env 配置？"):
+                    creds = existing
+                else:
+                    print("进入凭据向导重新输入（密码输入时不回显）。")
+            else:
+                print(".env 字段不完整，进入凭据向导补全。")
+        except OSError:
+            print(".env 不可读，进入凭据向导重新配置。")
+    else:
+        print("未找到 .env，进入凭据向导（密码输入时不回显）。")
+    if creds is None:
+        creds = ask_credentials(input_fn, getpass_fn)
+        backup_env(ENV_FILE)
+        write_env_file(ENV_FILE, creds)
+    print(f".env 已就绪：账号={creds['AMAZINGDATA_USERNAME']} 服务器={creds['AMAZINGDATA_HOST']}:{creds['AMAZINGDATA_PORT']}")
+    return creds
+
+
 def ensure_sdk(install_fn, confirm_fn):
     try:
         import AmazingData  # noqa: F401
@@ -249,39 +283,22 @@ def _rc(proc):
 
 def run_local(input_fn=input, getpass_fn=getpass.getpass, confirm_fn=confirm,
               install_fn=_pip_install, runner=subprocess.run):
-    config_ok = False
-    creds = None
-    if LOCAL_CONFIG.exists():
-        try:
-            creds = load_local_config(LOCAL_CONFIG)
-            config_ok = True
-            summarize_config(creds)
-        except (json.JSONDecodeError, OSError):
-            print("local.config.json 损坏或不可读，进入向导重新配置")
-    if not config_ok:
-        print("未找到可用的 local.config.json，进入凭据向导（密码输入时不回显）。")
-        for _ in range(3):
-            creds = ask_credentials(input_fn, getpass_fn)
-            ensure_sdk(install_fn, confirm_fn)
-            inject_env(creds)
-            print("正在进行 probe 登录验证（约数秒，请稍候）...")
-            rc = run_probe(str(PROBE_REPORT), runner=runner)
-            if rc == 0:
-                break
-            print("凭据或网络有问题，请重试")
-        else:
-            print("连续 3 次验证失败，退出。")
-            sys.exit(1)
-        write_local_config(LOCAL_CONFIG, creds)
-        print("验证通过，凭据已保存到 local.config.json。")
-    else:
-        ensure_sdk(install_fn, confirm_fn)
-        inject_env(creds)
-        print("正在进行 probe 门禁验证（约数秒，请稍候）...")
-        rc = run_probe(str(PROBE_REPORT), runner=runner)
-        if rc != 0:
-            print("probe 门禁失败，请检查凭据/网络后重跑。")
-            sys.exit(1)
+    """本地模式：收集凭据（.env）→ 装 SDK → probe 门禁 → 起 uvicorn。
+
+    凭据统一写 .env（与 docker 模式共用），扩展配置（ADJ_FACTOR_*、SUBSCRIPTION_* 等）
+    也在 .env 里，inject_env 一次性注入 os.environ。
+    probe 失败直接退出（用户修正 .env 后重跑）。
+    """
+    creds = _collect_credentials(input_fn, getpass_fn, confirm_fn)
+    ensure_sdk(install_fn, confirm_fn)
+    # 注入完整 .env（含 AUTH_TOKEN、ADJ_FACTOR_IS_LOCAL 等扩展配置），
+    # 而非只注入 creds（向导路径下 creds 只有 4 项凭据 + 2 项 HTTP 配置）。
+    inject_env(load_env_file(ENV_FILE))
+    print("正在进行 probe 门禁验证（约数秒，请稍候）...")
+    rc = run_probe(str(PROBE_REPORT), runner=runner)
+    if rc != 0:
+        print("probe 门禁失败，请检查凭据/网络后重跑。")
+        sys.exit(1)
 
     ensure_tables(install_fn, confirm_fn)
     host = creds.get("HTTP_HOST", DEFAULT_HTTP_HOST)
@@ -305,35 +322,14 @@ def run_container(engine="docker", input_fn=input, getpass_fn=getpass.getpass, c
                   runner=subprocess.run):
     """通用容器引擎启动流程（Docker 模式 2 / Podman 模式 3）。
 
-    流程：读取/收集凭据 → 写 .env → build 镜像 → 容器内 probe 门禁 → compose up。
-    .env 存在且字段完整时默认复用，避免重复输入；缺失或不完整才进凭据向导。
-    engine 为 "docker" 或 "podman"，命令构造与提示信息自动适配。
+    流程：收集凭据（.env，复用 _collect_credentials）→ build 镜像 → 容器内 probe 门禁 → compose up。
+    凭据收集与 local 模式统一，避免两套配置来源。
     """
     if not container_engine_available(engine):
         engine_labels = {"docker": "Docker Desktop", "podman": "podman"}
         print(f"{engine} 未安装或未运行，请先安装 {engine_labels.get(engine, engine)}。")
         sys.exit(1)
-    creds = None
-    if ENV_FILE.exists():
-        try:
-            existing = load_env_file(ENV_FILE)
-            if env_credentials_complete(existing):
-                summarize_config(existing, source=".env")
-                if confirm_fn("复用现有 .env 配置？"):
-                    creds = existing
-                else:
-                    print("进入凭据向导重新输入（密码输入时不回显）。")
-            else:
-                print(".env 字段不完整，进入凭据向导补全。")
-        except OSError:
-            print(".env 不可读，进入凭据向导重新配置。")
-    else:
-        print("未找到 .env，进入凭据向导（密码输入时不回显）。")
-    if creds is None:
-        creds = ask_credentials(input_fn, getpass_fn)
-        backup_env(ENV_FILE)
-        write_env_file(ENV_FILE, creds)
-    print(f".env 已就绪：账号={creds['AMAZINGDATA_USERNAME']} 服务器={creds['AMAZINGDATA_HOST']}:{creds['AMAZINGDATA_PORT']}")
+    creds = _collect_credentials(input_fn, getpass_fn, confirm_fn)
 
     if confirm_fn(f"执行 {engine} build？"):
         print("正在构建镜像（首次较慢，可能数分钟）...")
