@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -18,8 +20,6 @@ def make_test_app(gateway=None, auth_token="", auth_required=False,
     app = create_app(config=config, gateway=gateway)
     return TestClient(app)
 
-
-import datetime
 
 def _today_cal():
     return [int(datetime.datetime.now().strftime("%Y%m%d"))]
@@ -111,111 +111,6 @@ def test_daily_optional_dates_both_missing():
     client = make_test_app()
     resp = client.post("/daily", json={"codes": ["000001.SZ"]})
     assert resp.status_code == 200
-
-
-def test_lifespan_skips_subscription_outside_window():
-    """非窗口期启动：不创建 subscription_thread，不调 start_snapshot_subscription。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="23:58", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        assert gw.sub_start_called == 0
-    assert gw.logout_called >= 1
-
-
-def test_lifespan_starts_subscription_in_window():
-    """窗口期启动：创建 subscription_thread，调用 start_snapshot_subscription。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        assert gw.sub_start_called == 1
-        assert app.state.realtime_service.is_active() is True
-
-
-def test_lifespan_starts_watchdog_in_window():
-    """窗口期启动订阅后应启动 watchdog 线程。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59",
-                    watchdog_interval_sec=999)
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        rt_svc = app.state.realtime_service
-        assert rt_svc._watchdog_thread is not None
-        assert rt_svc._watchdog_thread.is_alive()
-
-
-def test_lifespan_skips_subscription_no_calendar():
-    """calendar=None（gateway 未 login）时不启动订阅。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=None)
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        assert gw.sub_start_called == 0
-
-
-def test_health_503_when_stale_in_window():
-    """窗口期内订阅 stale → /health 返回 503。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        rt_svc = app.state.realtime_service
-        rt_svc.set_active(False)
-        rt_svc._deactivation_reason = "stale"
-        resp = client.get("/health")
-        assert resp.status_code == 503
-        assert resp.json()["realtime_detail"] == "inactive_stale"
-
-
-def test_health_200_offhours_inactive():
-    """非窗口期 inactive → /health 返回 200 + realtime_detail=inactive_offhours。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="23:58", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        assert resp.json()["realtime_detail"] == "inactive_offhours"
-
-
-def test_shutdown_stops_watchdog():
-    """lifespan shutdown 应调用 stop_watchdog。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59",
-                    watchdog_interval_sec=999)
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        rt_svc = app.state.realtime_service
-        assert rt_svc._watchdog_thread is not None
-    assert rt_svc._stop_flag.is_set()
-    assert "data" in resp.json()
 
 
 def test_daily_optional_dates_one_side():
@@ -711,107 +606,5 @@ def test_shutdown_stops_watchdog():
         rt_svc = app.state.realtime_service
         assert rt_svc._watchdog_thread is not None
     assert rt_svc._stop_flag.is_set()
-
-
-def test_lifespan_skips_subscription_outside_window():
-    """非窗口期启动：不创建 subscription_thread，不调 start_snapshot_subscription。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="23:58", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        assert gw.sub_start_called == 0
-    assert gw.logout_called >= 1
-
-
-def test_lifespan_starts_subscription_in_window():
-    """窗口期启动：创建 subscription_thread，调用 start_snapshot_subscription。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        assert gw.sub_start_called == 1
-        assert app.state.realtime_service.is_active() is True
-
-
-def test_lifespan_starts_watchdog_in_window():
-    """窗口期启动订阅后应启动 watchdog 线程。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59",
-                    watchdog_interval_sec=999)
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        rt_svc = app.state.realtime_service
-        assert rt_svc._watchdog_thread is not None
-        assert rt_svc._watchdog_thread.is_alive()
-
-
-def test_lifespan_skips_subscription_no_calendar():
-    """calendar=None（gateway 未 login）时不启动订阅。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=None)
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        assert gw.sub_start_called == 0
-
-
-def test_health_503_when_stale_in_window():
-    """窗口期内订阅 stale → /health 返回 503。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        rt_svc = app.state.realtime_service
-        rt_svc.set_active(False)
-        rt_svc._deactivation_reason = "stale"
-        resp = client.get("/health")
-        assert resp.status_code == 503
-        assert resp.json()["realtime_detail"] == "inactive_stale"
-
-
-def test_health_200_offhours_inactive():
-    """非窗口期 inactive → /health 返回 200 + realtime_detail=inactive_offhours。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="23:58", subscription_close="23:59")
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        assert resp.json()["realtime_detail"] == "inactive_offhours"
-
-
-def test_shutdown_stops_watchdog():
-    """lifespan shutdown 应调用 stop_watchdog。"""
-    gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
-                     calendar=_today_cal())
-    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59",
-                    watchdog_interval_sec=999)
-    app = create_app(config=config, gateway=gw)
-    with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
-        rt_svc = app.state.realtime_service
-        assert rt_svc._watchdog_thread is not None
-    assert rt_svc._stop_flag.is_set()
+    rt_svc._watchdog_thread.join(timeout=2)
+    assert not rt_svc._watchdog_thread.is_alive()
