@@ -9,6 +9,7 @@ AmazingDataGateway 是真实实现，FakeGateway（tests/conftest.py）用于自
 """
 
 import logging
+import sys
 import threading
 import time
 from typing import Any, Protocol, runtime_checkable
@@ -180,6 +181,7 @@ class AmazingDataGateway:
             self._market_data = ad.MarketData(calendar)
             self._ready = True
             logger.info("AmazingData gateway login successful")
+            self._install_tgw_event_logger()
         except Exception as e:
             # ad.login 已成功但后续步骤失败：必须 logout 释放连接，否则连接泄漏
             if sdk_logged_in:
@@ -187,6 +189,59 @@ class AmazingDataGateway:
             self._ready = False
             logger.error("AmazingData login failed: %s: %s", type(e).__name__, e)
             raise GatewayNotReadyError(f"login failed: {e}") from e
+
+    def _install_tgw_event_logger(self) -> None:
+        """Monkey-patch tgw.g_spi.OnLog 和 OnEvent 以捕获断线/force-logout 事件。
+
+        tgw 原生层收到 force-logout 时调 OnLog（不是 OnEvent），消息含 "RspForceLogout"，
+        然后 native 线程直接调 ExitProcess() 杀进程。Python 的 atexit/faulthandler/signal
+        都无法拦截 ExitProcess，但 OnLog 在 ExitProcess 之前被调用，可以在此打日志。
+        """
+        try:
+            import tgw
+        except ImportError:
+            return
+
+        spi = getattr(tgw, "g_spi", None)
+        if spi is None:
+            logger.warning("tgw.g_spi not found, cannot install event logger")
+            return
+
+        # 避免重复安装
+        if getattr(spi, "_event_logger_installed", False):
+            return
+
+        original_on_log = spi.OnLog
+        original_on_event = spi.OnEvent
+
+        def logged_on_log(level, log_msg=None, *args):
+            """OnLog 回调：tgw 的日志/事件都走这个回调，包括 force-logout。"""
+            msg_str = str(log_msg or "")
+            # RspForceLogout 是 tgw 被挤掉时的消息
+            if "ForceLogout" in msg_str or "force_logout" in msg_str.lower():
+                logger.error("tgw FORCE-LOGOUT: %s (process will exit)", msg_str)
+            elif "Disconnect" in msg_str or "disconnect" in msg_str:
+                logger.warning("tgw disconnect: %s", msg_str)
+            else:
+                logger.info("tgw log: [%s] %s", level, msg_str)
+            sys.stderr.flush()  # 确保 ExitProcess 前日志已落盘
+            try:
+                original_on_log(level, log_msg, *args)
+            except Exception:
+                pass
+
+        def logged_on_event(level, code, event_msg=None):
+            logger.error("tgw event: level=%s code=%s msg=%s", level, code, event_msg or "")
+            sys.stderr.flush()
+            try:
+                original_on_event(level, code, event_msg)
+            except Exception:
+                pass
+
+        spi.OnLog = logged_on_log
+        spi.OnEvent = logged_on_event
+        spi._event_logger_installed = True
+        logger.info("tgw event logger installed on OnLog + OnEvent (will log force-logout before process exit)")
 
     def logout(self) -> None:
         """线程安全的登出入口。"""
@@ -423,6 +478,14 @@ class AmazingDataGateway:
         def _run():
             try:
                 sub.run()
+                # sub.run() 是无限循环(time.sleep(10))，正常情况下永不返回。
+                # 如果返回了，说明 SDK 内部出了问题（会话被踢/内部错误等）。
+                logger.error("SubscribeData.run() returned unexpectedly — session may have been kicked")
+                if on_error:
+                    try:
+                        on_error(RuntimeError("SubscribeData.run() returned unexpectedly"))
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error("subscription thread crashed: %s: %s", type(e).__name__, e)
                 if on_error:
