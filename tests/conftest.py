@@ -11,7 +11,8 @@ _UNSET = object()
 
 class FakeGateway:
     def __init__(self, ready: bool = True, result: dict[str, pd.DataFrame] | None = _UNSET,
-                 adj_factor_result: pd.DataFrame | None = None):
+                 adj_factor_result: pd.DataFrame | None = None,
+                 calendar: list[int] | None = None):
         self._ready = ready
         self._result = result if result is not _UNSET else {}
         self._adj_factor_result = adj_factor_result
@@ -25,6 +26,7 @@ class FakeGateway:
         self.sub_start_called = 0
         self.sub_stop_called = 0
         self._sub_code_list = None
+        self._calendar = calendar
 
     def login(self) -> None:
         self.login_called += 1
@@ -38,6 +40,10 @@ class FakeGateway:
 
     def is_ready(self) -> bool:
         return self._ready
+
+    @property
+    def calendar(self) -> list[int] | None:
+        return self._calendar
 
     def query_kline(self, codes, begin_date, end_date, period):
         self.query_calls.append({

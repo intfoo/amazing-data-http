@@ -57,3 +57,20 @@ def test_fake_gateway_subscription_noop():
     assert gw.sub_start_called == 1
     gw.stop_subscription()
     assert gw.sub_stop_called == 1
+
+
+def test_fake_gateway_has_calendar_property():
+    """FakeGateway 必须暴露 calendar 属性以满足 Gateway Protocol。"""
+    gw = FakeGateway(ready=True)
+    assert hasattr(gw, "calendar")
+    assert gw.calendar is None  # default None
+
+
+def test_fake_gateway_calendar_injectable():
+    gw = FakeGateway(ready=True, calendar=[20240102, 20240103])
+    assert gw.calendar == [20240102, 20240103]
+
+
+def test_fake_gateway_satisfies_protocol_with_calendar():
+    gw = FakeGateway(ready=True)
+    assert isinstance(gw, Gateway)

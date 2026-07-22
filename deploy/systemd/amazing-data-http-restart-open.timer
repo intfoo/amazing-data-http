@@ -1,0 +1,9 @@
+[Unit]
+Description=Restart amazing-data-http at market open
+
+[Timer]
+OnCalendar=Mon..Fri 08:55:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

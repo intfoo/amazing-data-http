@@ -22,6 +22,10 @@ class Config:
     adj_factor_local_path: str = ""  # SDK get_adj_factor 的 local_path 参数，必须为绝对路径
     auth_token: str = ""  # Bearer token；AUTH_REQUIRED=true 时客户端必须携带
     auth_required: bool = False  # 字段默认 False（测试便利）；env 默认 "true"（生产安全）
+    subscription_open: str = "09:00"       # 订阅窗口开始 HH:MM
+    subscription_close: str = "15:20"      # 订阅窗口结束 HH:MM
+    stale_threshold_sec: int = 90          # watchdog 失活阈值（秒）
+    watchdog_interval_sec: int = 60        # watchdog 检查间隔（秒）
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -38,6 +42,10 @@ class Config:
             auth_token=os.environ.get("AUTH_TOKEN", ""),
             auth_required=os.environ.get("AUTH_REQUIRED", "true").lower()
             in ("1", "true", "yes", "on"),
+            subscription_open=os.environ.get("SUBSCRIPTION_OPEN", "09:00") or "09:00",
+            subscription_close=os.environ.get("SUBSCRIPTION_CLOSE", "15:20") or "15:20",
+            stale_threshold_sec=int(os.environ.get("STALE_THRESHOLD_SEC", "90") or "90"),
+            watchdog_interval_sec=int(os.environ.get("WATCHDOG_INTERVAL_SEC", "60") or "60"),
         )
 
     def is_configured(self) -> bool:

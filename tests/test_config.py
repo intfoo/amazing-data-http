@@ -52,3 +52,43 @@ def test_config_reads_adj_factor_local_path(monkeypatch):
     monkeypatch.setenv("ADJ_FACTOR_LOCAL_PATH", "D://cache//adj//")
     cfg = Config.from_env()
     assert cfg.adj_factor_local_path == "D://cache//adj//"
+
+
+def test_config_default_subscription_window(monkeypatch):
+    monkeypatch.delenv("SUBSCRIPTION_OPEN", raising=False)
+    monkeypatch.delenv("SUBSCRIPTION_CLOSE", raising=False)
+    cfg = Config.from_env()
+    assert cfg.subscription_open == "09:00"
+    assert cfg.subscription_close == "15:20"
+
+
+def test_config_reads_subscription_window(monkeypatch):
+    monkeypatch.setenv("SUBSCRIPTION_OPEN", "08:55")
+    monkeypatch.setenv("SUBSCRIPTION_CLOSE", "15:30")
+    cfg = Config.from_env()
+    assert cfg.subscription_open == "08:55"
+    assert cfg.subscription_close == "15:30"
+
+
+def test_config_default_stale_threshold(monkeypatch):
+    monkeypatch.delenv("STALE_THRESHOLD_SEC", raising=False)
+    cfg = Config.from_env()
+    assert cfg.stale_threshold_sec == 90
+
+
+def test_config_reads_stale_threshold(monkeypatch):
+    monkeypatch.setenv("STALE_THRESHOLD_SEC", "120")
+    cfg = Config.from_env()
+    assert cfg.stale_threshold_sec == 120
+
+
+def test_config_default_watchdog_interval(monkeypatch):
+    monkeypatch.delenv("WATCHDOG_INTERVAL_SEC", raising=False)
+    cfg = Config.from_env()
+    assert cfg.watchdog_interval_sec == 60
+
+
+def test_config_reads_watchdog_interval(monkeypatch):
+    monkeypatch.setenv("WATCHDOG_INTERVAL_SEC", "30")
+    cfg = Config.from_env()
+    assert cfg.watchdog_interval_sec == 30

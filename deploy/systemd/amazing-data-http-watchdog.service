@@ -1,0 +1,7 @@
+[Unit]
+Description=Check amazing-data-http health and restart if unhealthy
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'status=$(podman inspect --format "{{.State.Health.Status}}" amazing-data-http 2>/dev/null); if [ "$status" = "unhealthy" ]; then podman restart amazing-data-http; fi'
+User=deployer

@@ -80,6 +80,9 @@ class Gateway(Protocol):
     def stop_subscription(self) -> None: ...
     def get_adj_factor(self, codes: list[str]) -> "pd.DataFrame": ...
 
+    @property
+    def calendar(self) -> list[int] | None: ...
+
 
 class GatewayError(Exception):
     """Gateway 层所有异常的基类。"""
@@ -206,6 +209,11 @@ class AmazingDataGateway:
     def is_ready(self) -> bool:
         """SDK 是否已登录且 MarketData 已初始化。"""
         return self._ready
+
+    @property
+    def calendar(self) -> list[int] | None:
+        """交易日历 list[int]（login 后可用，logout 后为 None）。"""
+        return self._calendar
 
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]:
         """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。

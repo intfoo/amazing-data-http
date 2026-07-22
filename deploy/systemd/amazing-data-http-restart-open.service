@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart amazing-data-http (enter subscription mode)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman restart amazing-data-http
+User=deployer
