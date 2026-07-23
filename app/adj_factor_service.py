@@ -1,21 +1,27 @@
-"""AdjFactorService：HTTP 日期参数 → SDK get_adj_factor → 宽表 melt → 日期过滤 → 序列化。
+"""AdjFactorService：HTTP 日期参数 → SDK get_adj_factor → 宽表过滤 → 序列化。
 
 职责边界：
 - 调用 gateway.get_adj_factor 获取 SDK 宽表 DataFrame（index=交易日期, columns=股票代码）
-- melt 成长表 [{code, trade_date, adj_factor}]，过滤非除权日（dropna 兜底 + adj_factor != 1.0）
+- 宽表层面过滤列(codes)+日期(index)+非1.0值(stack)，避免 melt 全表导致内存峰值爆炸
 - 按 start_time/end_time 过滤 trade_date（SDK get_adj_factor 不支持日期参数，服务端过滤）
 - 委托 serializer 处理 NumPy/datetime/NaN 类型转换
 
 不负责：字段重命名、单位换算、复权计算（由主项目 YAML field_map 完成）
 
-性能：melt/过滤在 DataFrame 层向量化完成，避免逐条 dict 操作。
+性能：过滤在 DataFrame 层向量化完成（where+stack），避免 melt 全表（43M 行 ~1GB）。
+内存：先过滤列（全市场350MB→请求codes14MB），再过滤日期行，最后 stack 提取事件行（几百行）。
 """
 
+from __future__ import annotations
+
+import gc
 import logging
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
 
 from app.gateway import Gateway
 from app.serializer import serialize_dataframe
@@ -60,7 +66,14 @@ class AdjFactorService:
         t0 = time.monotonic()
         df = self._gw.get_adj_factor(codes)
         t1 = time.monotonic()
-        records = self._process(df, start_dt, end_dt)
+        try:
+            records = self._process(df, start_dt, end_dt, codes=codes)
+        finally:
+            # SDK 返回的宽表可能很大（is_local=True 且本地无缓存时，SDK 远程拉取
+            # 全市场写本地，返回全市场宽表 5000+ 股 × 8687 交易日 ≈ 350MB）。
+            # 显式 del + gc.collect 防止多次调用累积导致 OOM。
+            del df
+            gc.collect()
         t2 = time.monotonic()
         logger.info(
             "adj_factor query: gateway=%.3fs process=%.3fs codes=%d records=%d",
@@ -69,15 +82,112 @@ class AdjFactorService:
         return records
 
     @staticmethod
-    def _process(df: pd.DataFrame, start_dt, end_dt) -> list[dict]:
-        """SDK DataFrame → melt → 日期过滤 → 序列化。"""
+    def _process(
+        df: pd.DataFrame, start_dt, end_dt, codes: list[str] | None = None,
+    ) -> list[dict]:
+        """SDK DataFrame → 过滤 → 序列化。
+
+        宽表路径优化：先在宽表层面过滤列(codes)+日期(index)+非1.0值(stack)，
+        避免 melt 全表（全市场 43M 行）导致内存峰值爆炸（~1.7GB → ~30MB）。
+        """
         if df is None or df.empty:
             return []
-        long_df = AdjFactorService._melt_and_normalize(df)
-        long_df = AdjFactorService._filter_by_date(long_df, start_dt, end_dt)
+        is_wide = not ("code" in df.columns and "adj_factor" in df.columns)
+        if is_wide:
+            long_df = AdjFactorService._wide_to_event_rows(df, start_dt, end_dt, codes)
+        else:
+            long_df = AdjFactorService._melt_and_normalize(df)
+            long_df = AdjFactorService._filter_by_date(long_df, start_dt, end_dt)
         if long_df.empty:
             return []
         return serialize_dataframe(long_df)
+
+    @staticmethod
+    def _wide_to_event_rows(
+        df: pd.DataFrame, start_dt, end_dt, codes: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """宽表 → 事件行长表。先过滤列/日期，再 stack 提取非 1.0 值。
+
+        内存优化核心：避免 melt 全表（全市场 5000 股 × 8687 日 = 43M 行长表 ~1GB）。
+        改为：1) 过滤列只保留请求的 codes（350MB→14MB）；2) 过滤日期行；
+        3) where(df!=1.0).stack() 只提取非 1.0 事件行（结果几百行）。
+        峰值从 ~1.7GB 降到 ~30MB。
+
+        stack 逻辑：where(≠1.0) 把 1.0→NaN（非除权日），NaN 保持 NaN（稀疏表兜底），
+        stack().dropna() 丢弃所有 NaN，结果只含真除权事件（adj_factor≠1.0 且非 NaN）。
+        """
+        import pandas as pd  # 延迟加载：空闲时不占内存
+        # 1. 过滤列：SDK is_local=True 且本地无缓存时返回全市场宽表，只保留请求的 codes
+        if codes is not None and len(codes) > 0:
+            code_set = {str(c) for c in codes}
+            cols_to_keep = [c for c in df.columns if str(c) in code_set]
+            if cols_to_keep:
+                df = df[cols_to_keep]
+            else:
+                logger.warning(
+                    "列过滤未匹配任何 codes，使用全量宽表（可能影响内存）: "
+                    "codes_sample=%s columns_sample=%s",
+                    codes[:3], list(df.columns[:3]),
+                )
+
+        # 2. 过滤日期行（index = 交易日期），在宽表层面过滤比 melt 后省内存
+        df = AdjFactorService._filter_wide_by_date(df, start_dt, end_dt)
+
+        if df.empty:
+            return pd.DataFrame(columns=["code", "trade_date", "adj_factor"])
+
+        # 3. 将 index 转为 YYYY-MM-DD 字符串，避免 stack 后 trade_date 列类型问题
+        #    （int index 如 20240101 经 pd.to_datetime 会被误解析为纳秒时间戳）
+        df.index = AdjFactorService._index_to_date_str(df.index)
+
+        # 4. stack 提取非 1.0 值：where(≠1.0) 把 1.0→NaN，stack 转长表，dropna 丢 NaN
+        #    结果只有除权事件行（每只股票一年几次），远小于 melt 全表
+        #    pandas 2.1+ stack() 新实现不自动丢 NaN（与旧实现不同），需显式 dropna
+        long_series = df.where(df != 1.0).stack().dropna()
+        if long_series.empty:
+            return pd.DataFrame(columns=["code", "trade_date", "adj_factor"])
+
+        long_df = long_series.reset_index()
+        long_df.columns = ["trade_date", "code", "adj_factor"]
+
+        # 4. normalize trade_date → YYYY-MM-DD string
+        long_df = AdjFactorService._normalize_trade_date_str(long_df)
+
+        return long_df[["code", "trade_date", "adj_factor"]]
+
+    @staticmethod
+    def _index_to_date_str(idx) -> "pd.Index":
+        """Index(交易日期) → YYYY-MM-DD 字符串 Index。处理 datetime/int/string 三种类型。
+
+        int 类型（如 20240101）不能用 pd.to_datetime 直接解析（会被解释为纳秒时间戳，
+        得到 1970-01-01 而非 2024-01-01），需先转字符串再用 format="%Y%m%d" 解析。
+        """
+        import pandas as pd
+        if pd.api.types.is_datetime64_any_dtype(idx):
+            return idx.strftime("%Y-%m-%d")
+        if pd.api.types.is_integer_dtype(idx):
+            return pd.to_datetime(
+                idx.astype(str), format="%Y%m%d", errors="coerce"
+            ).strftime("%Y-%m-%d")
+        return pd.to_datetime(idx, errors="coerce").strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _filter_wide_by_date(df: pd.DataFrame, start_dt, end_dt) -> pd.DataFrame:
+        """宽表层面按 index(交易日期) 过滤行。start/end 为 None 时该侧不过滤。
+
+        在宽表层面过滤 8687 行 index，比 melt 后过滤 43M 行长表省几个数量级内存。
+        """
+        import pandas as pd
+        if (start_dt is None and end_dt is None) or df.empty:
+            return df
+        idx_str = AdjFactorService._index_to_date_str(df.index)
+        idx_series = pd.Series(idx_str)
+        mask = pd.Series(True, index=idx_series.index)
+        if start_dt is not None:
+            mask &= idx_series >= start_dt.strftime("%Y-%m-%d")
+        if end_dt is not None:
+            mask &= idx_series <= end_dt.strftime("%Y-%m-%d")
+        return df[mask.values]
 
     @staticmethod
     def _melt_and_normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -130,6 +240,7 @@ class AdjFactorService:
         同 _truncate_kline_time_in_df（kline_service.py:131-141）模式：serialize_dataframe
         会把 datetime 转 ISO datetime，需在此显式截断为日期。
         """
+        import pandas as pd
         col = df["trade_date"]
         if pd.api.types.is_datetime64_any_dtype(col):
             df["trade_date"] = col.dt.strftime("%Y-%m-%d")
@@ -143,6 +254,7 @@ class AdjFactorService:
     @staticmethod
     def _filter_by_date(df: pd.DataFrame, start_dt, end_dt) -> pd.DataFrame:
         """按 trade_date（YYYY-MM-DD 字符串）过滤。start/end 为 None 时该侧不过滤。"""
+        import pandas as pd
         if df.empty:
             return df
         mask = pd.Series([True] * len(df), index=df.index)

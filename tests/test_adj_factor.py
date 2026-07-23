@@ -169,6 +169,48 @@ def test_query_sparse_table_dropna_path():
     assert data[0]["adj_factor"] == 1.05
 
 
+def test_query_int_index_date_filter():
+    """SDK 返回 int 格式日期 index（如 20240101）时，日期过滤正确工作。
+
+    int index 不能用 pd.to_datetime 直接解析（会被解释为纳秒时间戳），
+    _index_to_date_str 用 format="%Y%m%d" 正确处理。
+    """
+    df = pd.DataFrame(
+        {
+            "000001.SZ": [1.05, 1.0],   # 20240530 除权事件, 20240531 非除权日
+            "600000.SH": [1.0, 1.10],   # 20240530 非除权日, 20240531 除权事件
+        },
+        index=pd.Index([20240530, 20240531], name="trade_date"),
+    )
+    gw = FakeGateway(ready=True, adj_factor_result=df)
+    svc = AdjFactorService(gw)
+    data = svc.query(["000001.SZ", "600000.SH"], start_time="2024-05-31")
+    assert len(data) == 1
+    assert data[0]["trade_date"] == "2024-05-31"
+    assert data[0]["code"] == "600000.SH"
+    assert data[0]["adj_factor"] == 1.10
+
+
+def test_query_int_index_full_query():
+    """int index 全量查询（无日期过滤）正确返回事件行 + trade_date 格式化为 YYYY-MM-DD。"""
+    df = pd.DataFrame(
+        {
+            "000001.SZ": [1.0, 1.05, 1.0, 0.9955, 1.0],
+        },
+        index=pd.Index([20240101, 20240102, 20240103, 20240104, 20240105], name="trade_date"),
+    )
+    gw = FakeGateway(ready=True, adj_factor_result=df)
+    svc = AdjFactorService(gw)
+    data = svc.query(["000001.SZ"])
+    assert len(data) == 2  # 1.05 和 0.9955
+    values = sorted(r["adj_factor"] for r in data)
+    assert values == [0.9955, 1.05]
+    # trade_date 应为 YYYY-MM-DD 字符串，非 int
+    for row in data:
+        assert "-" in row["trade_date"]
+        assert len(row["trade_date"]) == 10
+
+
 # ========== HTTP 端到端测试 ==========
 
 from app.config import Config
