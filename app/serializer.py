@@ -5,12 +5,15 @@ SDK 返回的 pandas DataFrame 含 NumPy 标量和 datetime 索引，
 NaN/NaT 转为 None（JSON null），不重命名字段。
 """
 
+from __future__ import annotations
+
 import math
 from datetime import date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
-import pandas as pd
+if TYPE_CHECKING:
+    import numpy as np
+    import pandas as pd
 
 
 def serialize_value(v: Any) -> Any:
@@ -21,6 +24,8 @@ def serialize_value(v: Any) -> Any:
     - NumPy 标量先于 Python 原生类型检查（np.int64 不是 Python int）
     - 末尾的 pd.isna 兜底处理未显式列出的缺失值类型
     """
+    import numpy as np
+    import pandas as pd
     if v is None:
         return None
     if isinstance(v, float) and math.isnan(v):
@@ -63,6 +68,7 @@ def serialize_dataframe(df: pd.DataFrame) -> list[dict]:
     - 原生 object dtype 列可能残留 datetime/date/np 标量 → map(serialize_value) 兜底
     - NaN/NaT → None（where 向量化填充）
     """
+    import pandas as pd
     if df is None or df.empty:
         return []
     df_to_use = df.reset_index() if df.index.name is not None else df

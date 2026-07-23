@@ -8,13 +8,16 @@ AmazingDataGateway 是真实实现，FakeGateway（tests/conftest.py）用于自
 因为 tgw 原生库的线程安全性未知，保守起见不支持并发查询。
 """
 
+from __future__ import annotations
+
 import logging
 import sys
 import threading
 import time
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
 
 from app.config import Config
 
@@ -256,31 +259,28 @@ class AmazingDataGateway:
                                "LogonFailed", "logon_failed")
 
         def logged_on_log(level, log_msg=None, *args):
-            """OnLog 回调：tgw 所有日志都走这里，包括 force-logout。"""
+            """OnLog 回调：tgw 所有日志都走这里，包括 force-logout。
+
+            sys.stderr.flush 仅在 FATAL/error 级别调用（确保 ExitProcess 前日志落盘），
+            心跳/debug 级别不 flush，避免高频日志回调的系统调用开销。
+            """
             msg_str = str(log_msg or "")
             level_name = level_names.get(level, str(level))
 
             if any(kw in msg_str for kw in EXIT_KEYWORDS):
                 logger.error("tgw FATAL: [%s] %s (process may exit)", level_name, msg_str)
+                sys.stderr.flush()
             elif any(kw in msg_str for kw in DISCONNECT_KEYWORDS):
                 logger.warning("tgw disconnect: [%s] %s", level_name, msg_str)
             elif level == 3:  # kError
-                # PushImpl/PushDecoder 的 queue size 是 SDK 内部 push 队列状态打印
-                # （/adj_factor 等查询请求触发数据传输，push 队列短暂堆积后消化；
-                # queue size 与 codes 数量正相关，如 codes=1→2, codes=500→26）。
-                # SDK 标为 kError 但实际是常规状态，非真错误，降级到 debug 避免刷屏。
-                # 关键词：PushImpl | totoal dgw pakage in queue:N / PushDecoder | queue size:N,...
-                # 收窄过滤：只过滤队列状态打印（"queue size" / "in queue"），
-                # 避免 PushImpl/PushDecoder 前缀的其他真错误被误降级。
                 if "queue size" in msg_str or "in queue" in msg_str:
                     logger.debug("tgw push status: [%s] %s", level_name, msg_str)
                 else:
                     logger.error("tgw error: [%s] %s", level_name, msg_str)
+                    sys.stderr.flush()
             else:
-                # kWarn/kInfo 含大量心跳日志，降级到 debug 避免刷屏
                 logger.debug("tgw [%s] %s", level_name, msg_str)
 
-            sys.stderr.flush()  # 确保 ExitProcess 前日志已落盘
             try:
                 original_on_log(level, log_msg, *args)
             except Exception:

@@ -12,11 +12,15 @@
 向量化完成，避免逐条 dict 操作。NaT → strftime 返回 NaN → serializer 转 None。
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
 
 from app.gateway import Gateway
 from app.serializer import serialize_dataframe

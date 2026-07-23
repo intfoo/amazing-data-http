@@ -18,7 +18,7 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.14/site-packages/tgw/common_linux_lib
 # 设置国内镜像源
 RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && \
     sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata libgomp1 libkrb5-3 libgssapi-krb5-2 && \
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata libgomp1 libkrb5-3 libgssapi-krb5-2 curl && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*

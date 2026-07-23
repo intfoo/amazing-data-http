@@ -8,13 +8,17 @@
 缓存语义：dict[code, dict] 覆盖写入，每个 code 只保留最新快照，无需淘汰策略。
 """
 
+from __future__ import annotations
+
 import dataclasses
 import logging
 import threading
 import time
 import datetime
+from typing import TYPE_CHECKING
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
 
 from app.subscription_schedule import is_subscription_window
 
@@ -229,6 +233,7 @@ class RealtimeService:
                 return self._filter_fallback(codes) if self._fallback_cache else []
             # 合并每只股票的最后一行（最新快照），一次 serialize_dataframe 序列化，
             # 避免几千只股票逐只调 serialize_dataframe 的开销。
+            import pandas as pd
             tails = [df.tail(1) for df in result.values() if df is not None and not df.empty]
             if tails:
                 merged = pd.concat(tails, ignore_index=True)
