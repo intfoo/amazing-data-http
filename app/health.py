@@ -30,6 +30,7 @@ class HealthService:
             now, cal,
             open_time=self._config.subscription_open,
             close_time=self._config.subscription_close,
+            calendar_fallback_weekday=self._config.calendar_fallback_weekday,
         ):
             return "inactive_offhours"
         # 窗口期内 inactive
@@ -72,6 +73,7 @@ class HealthService:
             now, cal,
             open_time=self._config.subscription_open,
             close_time=self._config.subscription_close,
+            calendar_fallback_weekday=self._config.calendar_fallback_weekday,
         ):
             return self._realtime_svc.is_active() if self._realtime_svc else False
         return True

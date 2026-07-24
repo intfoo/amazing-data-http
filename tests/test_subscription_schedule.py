@@ -41,9 +41,31 @@ def test_is_window_boundary_close():
 
 
 def test_is_window_non_trading_day():
+    """日历不含今天 + calendar_fallback_weekday=False → False（严格按日历）。"""
     cal = [20240102, 20240103]
     now = datetime.datetime(2024, 1, 4, 10, 30)  # not in calendar
-    assert is_subscription_window(now, cal) is False
+    assert is_subscription_window(now, cal, calendar_fallback_weekday=False) is False
+
+
+def test_is_window_calendar_fallback_weekday_true():
+    """日历不含今天但工作日 + fallback=True → True（weekday 兜底）。"""
+    cal = [20240102, 20240103]
+    now = datetime.datetime(2024, 1, 4, 10, 30)  # Thursday, not in calendar
+    assert is_subscription_window(now, cal, calendar_fallback_weekday=True) is True
+
+
+def test_is_window_calendar_fallback_weekday_weekend():
+    """日历不含今天且周末 + fallback=True → False。"""
+    cal = [20240102, 20240103]
+    now = datetime.datetime(2024, 1, 6, 10, 30)  # Saturday, not in calendar
+    assert is_subscription_window(now, cal, calendar_fallback_weekday=True) is False
+
+
+def test_is_window_calendar_fallback_default_true():
+    """默认 calendar_fallback_weekday=True（不传参数）。"""
+    cal = [20240102, 20240103]
+    now = datetime.datetime(2024, 1, 4, 10, 30)  # Thursday, not in calendar
+    assert is_subscription_window(now, cal) is True
 
 
 def test_is_window_calendar_none():

@@ -25,6 +25,13 @@ def _today_cal():
     return [int(datetime.datetime.now().strftime("%Y%m%d"))]
 
 
+def _wait_scheduler(app, timeout=5):
+    """等待订阅调度器完成首次 tick（启动或跳过订阅）。"""
+    scheduler = getattr(app.state, "subscription_scheduler", None)
+    if scheduler:
+        scheduler._first_tick_done.wait(timeout=timeout)
+
+
 def test_daily_success():
     client = make_test_app()
     resp = client.post("/daily", json={
@@ -395,10 +402,7 @@ def test_realtime_startup_activates_subscription():
                     subscription_open="00:00", subscription_close="23:59")
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
-        # subscription 初始化在后台线程，join 等待完成后再断言
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
+        _wait_scheduler(app)
         # startup 已执行：FakeGateway.start_snapshot_subscription 被调用 + set_active(True)
         assert gw.sub_start_called == 1
         assert app.state.realtime_service.is_active() is True
@@ -421,10 +425,7 @@ def test_realtime_not_active_after_startup_failure():
                     subscription_open="00:00", subscription_close="23:59")
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
-        # subscription 初始化在后台线程，join 等待完成（异常被 catch，is_active 保持 False）
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
+        _wait_scheduler(app)
         # startup 中 get_realtime_code_list 抛异常被 try/except 捕获，is_active 保持 False
         assert app.state.realtime_service.is_active() is False
         # /realtime codes=None：fallback 短路返回空（不调 get_realtime_code_list），SDK 就绪 → 200
@@ -434,7 +435,7 @@ def test_realtime_not_active_after_startup_failure():
 
 
 def test_realtime_startup_subscribes_combined_list_with_index():
-    """startup 事件应触发 _init_subscription 传入合并 code_list（股票+指数），含指数代码。
+    """startup 事件应触发订阅启动传入合并 code_list（股票+指数），含指数代码。
 
     FakeGateway.start_snapshot_subscription 会记录 code_list 到 _sub_code_list，
     验证该列表同时包含股票代码和指数代码。
@@ -445,9 +446,7 @@ def test_realtime_startup_subscribes_combined_list_with_index():
                     subscription_open="00:00", subscription_close="23:59")
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
+        _wait_scheduler(app)
         # 订阅已启动
         assert gw.sub_start_called == 1
         # _sub_code_list 应包含股票 + 指数代码
@@ -505,28 +504,27 @@ def test_sdk_gate_allows_under_limit():
 
 
 def test_lifespan_skips_subscription_outside_window():
-    """非窗口期启动：不创建 subscription_thread，不调 start_snapshot_subscription。"""
+    """非窗口期启动：调度器不启动订阅，sub_start_called 保持 0。"""
     gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
                      calendar=_today_cal())
     config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
                     subscription_open="23:58", subscription_close="23:59")
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
+        _wait_scheduler(app)
         assert gw.sub_start_called == 0
     assert gw.logout_called >= 1
 
 
 def test_lifespan_starts_subscription_in_window():
-    """窗口期启动：创建 subscription_thread，调用 start_snapshot_subscription。"""
+    """窗口期启动：调度器启动订阅，调用 start_snapshot_subscription。"""
     gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
                      calendar=_today_cal())
     config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
                     subscription_open="00:00", subscription_close="23:59")
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
+        _wait_scheduler(app)
         assert gw.sub_start_called == 1
         assert app.state.realtime_service.is_active() is True
 
@@ -540,9 +538,7 @@ def test_lifespan_starts_watchdog_in_window():
                     watchdog_interval_sec=999)
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
+        _wait_scheduler(app)
         rt_svc = app.state.realtime_service
         assert rt_svc._watchdog_thread is not None
         assert rt_svc._watchdog_thread.is_alive()
@@ -556,6 +552,7 @@ def test_lifespan_skips_subscription_no_calendar():
                     subscription_open="00:00", subscription_close="23:59")
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
+        _wait_scheduler(app)
         assert gw.sub_start_called == 0
 
 
@@ -567,9 +564,7 @@ def test_health_503_when_stale_in_window():
                     subscription_open="00:00", subscription_close="23:59")
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
+        _wait_scheduler(app)
         rt_svc = app.state.realtime_service
         rt_svc.set_active(False)
         rt_svc._deactivation_reason = "stale"
@@ -600,9 +595,7 @@ def test_shutdown_stops_watchdog():
                     watchdog_interval_sec=999)
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread:
-            sub_thread.join(timeout=5)
+        _wait_scheduler(app)
         rt_svc = app.state.realtime_service
         assert rt_svc._watchdog_thread is not None
     assert rt_svc._stop_flag.is_set()

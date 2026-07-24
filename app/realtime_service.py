@@ -108,6 +108,11 @@ class RealtimeService:
         if active:
             self._deactivation_reason = None
 
+    def clear_cache(self) -> None:
+        """清空订阅缓存（调度器停止订阅时调用）。"""
+        with self._lock:
+            self._cache.clear()
+
     def deactivation_reason(self) -> str | None:
         """供 HealthService 区分 inactive_stale / inactive_not_started / inactive_error。"""
         return self._deactivation_reason
@@ -123,6 +128,7 @@ class RealtimeService:
         watchdog_interval_sec: int = 60,
         open_time: str = "09:00",
         close_time: str = "15:20",
+        calendar_fallback_weekday: bool = True,
     ) -> None:
         """启动后台 watchdog 线程。lifespan 订阅启动后调用。"""
         if self._watchdog_thread and self._watchdog_thread.is_alive():
@@ -131,7 +137,8 @@ class RealtimeService:
         self._watchdog_start_ts = time.time()
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop,
-            args=(calendar, stale_threshold_sec, watchdog_interval_sec, open_time, close_time),
+            args=(calendar, stale_threshold_sec, watchdog_interval_sec,
+                  open_time, close_time, calendar_fallback_weekday),
             daemon=True, name="sub-watchdog",
         )
         self._watchdog_thread.start()
@@ -147,6 +154,7 @@ class RealtimeService:
         watchdog_interval_sec: int,
         open_time: str,
         close_time: str,
+        calendar_fallback_weekday: bool = True,
     ) -> None:
         """watchdog 主循环：每 watchdog_interval_sec 检查一次订阅存活状态。"""
         while self._active and not self._stop_flag.is_set():
@@ -155,7 +163,9 @@ class RealtimeService:
             if not self._active:
                 break
             now = datetime.datetime.now()
-            if not is_subscription_window(now, calendar, open_time, close_time):
+            if not is_subscription_window(
+                now, calendar, open_time, close_time, calendar_fallback_weekday,
+            ):
                 continue
             if self._last_snapshot_ts == 0:
                 # 从未收到数据：检查启动后是否超过阈值

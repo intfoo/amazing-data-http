@@ -32,12 +32,12 @@ def test_realtime_detail_active():
 
 
 def test_realtime_detail_inactive_offhours():
-    """非窗口期（calendar 不含今天）→ inactive_offhours。"""
+    """非窗口期（calendar 不含今天 + 严格日历模式）→ inactive_offhours。"""
     gw = MagicMock()
     gw.is_ready.return_value = True
     gw.calendar = [20231231]  # not today
     rt = _make_realtime_svc(active=False)
-    hs = HealthService(_make_config(), gw, rt)
+    hs = HealthService(_make_config(calendar_fallback_weekday=False), gw, rt)
     assert hs._realtime_detail() == "inactive_offhours"
 
 
@@ -80,7 +80,7 @@ def test_is_ok_offhours_inactive_returns_true():
     gw.is_ready.return_value = True
     gw.calendar = [20231231]
     rt = _make_realtime_svc(active=False)
-    hs = HealthService(_make_config(), gw, rt)
+    hs = HealthService(_make_config(calendar_fallback_weekday=False), gw, rt)
     assert hs.is_ok() is True
 
 
@@ -131,7 +131,7 @@ def test_status_includes_realtime_detail():
     gw.is_ready.return_value = True
     gw.calendar = [20231231]
     rt = _make_realtime_svc(active=False)
-    hs = HealthService(_make_config(), gw, rt)
+    hs = HealthService(_make_config(calendar_fallback_weekday=False), gw, rt)
     status = hs.status()
     assert "realtime_detail" in status
     assert status["realtime_detail"] == "inactive_offhours"

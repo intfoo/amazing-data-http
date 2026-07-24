@@ -39,6 +39,15 @@ def test_snapshot_empty_cache():
     assert svc.snapshot() == []
 
 
+def test_clear_cache_empties_cache():
+    """clear_cache 清空订阅缓存。"""
+    svc = RealtimeService(gateway=None)
+    svc.on_snapshot(_snap(last=10.0))
+    assert len(svc.snapshot()) == 1
+    svc.clear_cache()
+    assert svc.snapshot() == []
+
+
 def test_snapshot_overwrites_same_code():
     svc = RealtimeService(gateway=None)
     svc.on_snapshot(_snap(last=10.0))
@@ -443,7 +452,8 @@ def test_watchdog_non_window_does_not_trigger():
     svc.set_active(True)
     svc._last_snapshot_ts = time.time() - 200
     svc.start_watchdog([20231231], stale_threshold_sec=90, watchdog_interval_sec=0,
-                       open_time="09:00", close_time="15:20")
+                       open_time="09:00", close_time="15:20",
+                       calendar_fallback_weekday=False)
     time.sleep(0.05)  # 跑若干次迭代（非窗口期 continue，不判 stale）
     assert svc.is_active() is True
     svc.stop_watchdog()

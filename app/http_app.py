@@ -9,10 +9,8 @@
 """
 
 import asyncio
-import datetime
 import logging
 import threading
-import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -33,7 +31,7 @@ from app.health import HealthService
 from app.adj_factor_service import AdjFactorService
 from app.kline_service import KlineService, MINUTE_PERIODS
 from app.realtime_service import RealtimeService
-from app.subscription_schedule import is_subscription_window
+from app.subscription_scheduler import SubscriptionScheduler
 
 class _ShortNameFormatter(logging.Formatter):
     """显示 logger 名末段（去 amazingdata. 前缀）：[amazingdata.http] → [http]。"""
@@ -195,54 +193,25 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             try:
                 gateway.login()
                 logger.info("启动登录成功")
-                def _init_subscription(cal):
-                    t0 = time.monotonic()
-                    try:
-                        code_list = gateway.get_realtime_code_list()
-                        t1 = time.monotonic()
-                        gateway.start_snapshot_subscription(
-                            code_list,
-                            on_data=realtime_service.on_snapshot,
-                            on_error=realtime_service.on_subscription_error,
-                        )
-                        realtime_service.set_active(True)
-                        realtime_service.start_watchdog(
-                            cal,
-                            stale_threshold_sec=config.stale_threshold_sec,
-                            watchdog_interval_sec=config.watchdog_interval_sec,
-                            open_time=config.subscription_open,
-                            close_time=config.subscription_close,
-                        )
-                        t2 = time.monotonic()
-                        logger.info(
-                            "实时订阅已启动: %d 只 "
-                            "(get_realtime_code_list=%.3fs subscribe=%.3fs)",
-                            len(code_list), t1 - t0, t2 - t1,
-                        )
-                    except Exception as e:
-                        logger.error("实时订阅启动失败: %s: %s", type(e).__name__, e)
-                cal = gateway.calendar
-                if cal and is_subscription_window(
-                    datetime.datetime.now(), cal,
-                    open_time=config.subscription_open,
-                    close_time=config.subscription_close,
-                ):
-                    app.state.subscription_thread = threading.Thread(
-                        target=_init_subscription, args=(cal,), daemon=True, name="sub-init"
-                    )
-                    app.state.subscription_thread.start()
-                else:
-                    logger.info("非订阅时段，跳过订阅（SDK 查询接口仍可用）")
+                # 订阅调度器：后台线程定期检查窗口，自动启动/停止订阅。
+                # 解决 lifespan 只检查一次窗口的问题（非交易时段启动后进入交易时段无自动启动）。
+                scheduler = SubscriptionScheduler(gateway, realtime_service, config)
+                app.state.subscription_scheduler = scheduler
+                scheduler.start()
             except Exception as e:
                 logger.error("启动登录失败: %s: %s", type(e).__name__, e)
         else:
             logger.warning("配置不完整，跳过启动登录")
         yield
         # shutdown
+        scheduler = getattr(app.state, "subscription_scheduler", None)
+        if scheduler:
+            scheduler.stop()
+            # 等待当前 tick 完成，防止 scheduler 正在 start_subscription 时
+            # shutdown 同时 stop_subscription 造成竞态（两者都不走 gateway._lock）
+            if scheduler._thread:
+                scheduler._thread.join(timeout=5)
         realtime_service.stop_watchdog()
-        sub_thread = getattr(app.state, "subscription_thread", None)
-        if sub_thread and sub_thread.is_alive():
-            sub_thread.join(timeout=10)
         try:
             gateway.stop_subscription()
         except Exception as e:

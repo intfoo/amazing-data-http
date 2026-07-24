@@ -27,6 +27,7 @@ class Config:
     subscription_close: str = "15:20"      # 订阅窗口结束 HH:MM
     stale_threshold_sec: int = 90          # watchdog 失活阈值（秒）
     watchdog_interval_sec: int = 60        # watchdog 检查间隔（秒）
+    calendar_fallback_weekday: bool = True  # 日历不含今天时用 weekday 兜底（周一~周五视为交易日）
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -49,6 +50,8 @@ class Config:
             subscription_close=os.environ.get("SUBSCRIPTION_CLOSE", "15:20") or "15:20",
             stale_threshold_sec=int(os.environ.get("STALE_THRESHOLD_SEC", "90") or "90"),
             watchdog_interval_sec=int(os.environ.get("WATCHDOG_INTERVAL_SEC", "60") or "60"),
+            calendar_fallback_weekday=os.environ.get("CALENDAR_FALLBACK_WEEKDAY", "true").lower()
+            in ("1", "true", "yes", "on"),
         )
 
     def is_configured(self) -> bool:

@@ -92,3 +92,15 @@ def test_config_reads_watchdog_interval(monkeypatch):
     monkeypatch.setenv("WATCHDOG_INTERVAL_SEC", "30")
     cfg = Config.from_env()
     assert cfg.watchdog_interval_sec == 30
+
+
+def test_config_default_calendar_fallback_weekday(monkeypatch):
+    monkeypatch.delenv("CALENDAR_FALLBACK_WEEKDAY", raising=False)
+    cfg = Config.from_env()
+    assert cfg.calendar_fallback_weekday is True
+
+
+def test_config_reads_calendar_fallback_weekday(monkeypatch):
+    monkeypatch.setenv("CALENDAR_FALLBACK_WEEKDAY", "false")
+    cfg = Config.from_env()
+    assert cfg.calendar_fallback_weekday is False
