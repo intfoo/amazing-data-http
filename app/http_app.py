@@ -29,6 +29,7 @@ from app.auth import AuthMiddleware
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, AmazingDataGateway
 from app.health import HealthService
 from app.adj_factor_service import AdjFactorService
+from app.etf_flow_service import EtfFlowService
 from app.kline_service import KlineService, MINUTE_PERIODS
 from app.realtime_service import RealtimeService
 from app.subscription_scheduler import SubscriptionScheduler
@@ -135,6 +136,12 @@ class AdjFactorRequest(BaseModel):
         return v
 
 
+class EtfNetInflowRequest(BaseModel):
+    """POST /etf/net_inflow 请求体。start_time/end_time 可选。"""
+    start_time: str | None = None
+    end_time: str | None = None
+
+
 class SdkGate:
     """并发 SDK 调用闸门：在飞调用超过上限时快速失败返回 503，避免线程堆积雪崩。
 
@@ -174,6 +181,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     kline_service = KlineService(gateway)
     realtime_service = RealtimeService(gateway)
     adj_factor_service = AdjFactorService(gateway)
+    etf_flow_service = EtfFlowService(gateway)
     health_service = HealthService(config, gateway, realtime_service)
 
     @asynccontextmanager
@@ -235,6 +243,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     app.state.realtime_service = realtime_service
     app.state.health_service = health_service
     app.state.adj_factor_service = adj_factor_service
+    app.state.etf_flow_service = etf_flow_service
     app.state.sdk_gate = SdkGate(max_concurrent=config.sdk_max_concurrent)
 
     @app.get("/health")
@@ -333,6 +342,41 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             # adj_factor_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
             data = await asyncio.to_thread(
                 app.state.adj_factor_service.query, req.codes, req.start_time, req.end_time
+            )
+            return {"data": data}
+        except AppError:
+            raise
+        except ValueError as e:
+            raise AppError(INVALID_REQUEST, str(e), 422)
+        except GatewayNotReadyError as e:
+            raise AppError(SDK_NOT_READY, str(e), 503)
+        except GatewayQueryError as e:
+            raise AppError(SDK_QUERY_FAILED, str(e), 502)
+        except (TypeError, OverflowError) as e:
+            if "serialize" in str(e).lower() or "json" in str(e).lower():
+                raise AppError(SERIALIZATION_FAILED, str(e), 502)
+            raise AppError(INTERNAL_ERROR, str(e), 500)
+        except Exception as e:
+            logger.error("未处理异常: %s: %s", type(e).__name__, e)
+            raise AppError(INTERNAL_ERROR, str(e), 500)
+        finally:
+            app.state.sdk_gate.release()
+
+    @app.post("/etf/net_inflow")
+    async def etf_net_inflow(req: EtfNetInflowRequest, request: Request):
+        """宽基 ETF 净流入统计。返回 {"data": [...]}。
+
+        start_time / end_time 可选；未传时返回全量数据。
+        日期格式校验与 start<=end 校验在 EtfFlowService 内完成，ValueError 转 422。
+        """
+        logger.info("request_id=%s /etf/net_inflow %s..%s",
+                    get_request_id(request),
+                    req.start_time or "(default)", req.end_time or "(default)")
+        if not app.state.sdk_gate.try_acquire():
+            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
+        try:
+            data = await asyncio.to_thread(
+                app.state.etf_flow_service.query, req.start_time, req.end_time
             )
             return {"data": data}
         except AppError:

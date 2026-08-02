@@ -83,6 +83,17 @@ class Gateway(Protocol):
     ) -> None: ...
     def stop_subscription(self) -> None: ...
     def get_adj_factor(self, codes: list[str]) -> "pd.DataFrame": ...
+    def get_code_info(self, security_type: str = "EXTRA_STOCK_A") -> "pd.DataFrame": ...
+    def get_fund_share(
+        self, codes: list[str],
+        is_local: bool = False,
+        begin_date: int | None = None, end_date: int | None = None,
+    ) -> dict[str, "pd.DataFrame"]: ...
+    def get_fund_nav(
+        self, codes: list[str],
+        is_local: bool = False,
+        begin_date: int | None = None, end_date: int | None = None,
+    ) -> dict[str, "pd.DataFrame"]: ...
 
     @property
     def calendar(self) -> list[int] | None: ...
@@ -122,6 +133,8 @@ class AmazingDataGateway:
         self._subscribe_data = None  # ad.SubscribeData 实例
         self._sub_thread = None      # 订阅 daemon 线程
         self._adj_factor_local_path = self._resolve_adj_factor_local_path()
+        self._info_data = None  # ad.InfoData 实例（供 get_fund_share/get_fund_nav）
+        self._fund_local_path = self._resolve_fund_local_path()
 
     def _resolve_adj_factor_local_path(self) -> str:
         """解析 adj_factor 本地缓存基目录：配置非空用配置，否则用项目根 data 兜底 + 警告。
@@ -155,6 +168,30 @@ class AmazingDataGateway:
                 local_path,
             )
         # SDK 字符串拼接要求末尾带分隔符，否则 'data/adj_factor' + 'basedata' → 'adj_factorbasedata'
+        if not local_path.endswith(('/', '\\')):
+            local_path = local_path + '/'
+        Path(local_path).mkdir(parents=True, exist_ok=True)
+        return local_path
+
+    def _resolve_fund_local_path(self) -> str:
+        """解析 fund 本地缓存基目录：配置非空用配置，否则用项目根 data 兜底 + 警告。
+
+        逻辑完全对标 _resolve_adj_factor_local_path()，读 self._config.fund_local_path。
+        SDK get_fund_share/get_fund_nav 的 local_path 同样要求绝对路径且末尾带分隔符。
+        """
+        from pathlib import Path
+        configured = self._config.fund_local_path
+        if configured:
+            local_path = str(Path(configured).resolve())
+        else:
+            # 默认项目根/data（gateway.py 在 app/，parent.parent = 项目根）
+            local_path = str(Path(__file__).resolve().parent.parent / "data")
+            logger.warning(
+                "FUND_LOCAL_PATH 未配置，使用默认路径: %s"
+                "（建议设为持久化绝对路径以供 SDK 缓存）",
+                local_path,
+            )
+        # SDK 字符串拼接要求末尾带分隔符
         if not local_path.endswith(('/', '\\')):
             local_path = local_path + '/'
         Path(local_path).mkdir(parents=True, exist_ok=True)
@@ -199,6 +236,7 @@ class AmazingDataGateway:
             calendar = base.get_calendar()
             self._calendar = calendar
             self._market_data = ad.MarketData(calendar)
+            self._info_data = ad.InfoData()
             self._ready = True
             logger.info("SDK 登录成功")
             self._install_tgw_event_logger()
@@ -342,6 +380,7 @@ class AmazingDataGateway:
         self._ready = False
         self._market_data = None
         self._base_data = None
+        self._info_data = None
         self._calendar = None
 
     def is_ready(self) -> bool:
@@ -381,6 +420,37 @@ class AmazingDataGateway:
                 "get_code_list(security_type=%s) 返回 %d 个代码 "
                 "(sdk=%.3fs total=%.3fs)",
                 security_type, len(result), sdk_elapsed, total_elapsed,
+            )
+            return result
+
+    def get_code_info(self, security_type: str = "EXTRA_STOCK_A") -> "pd.DataFrame":
+        """获取证券代码信息，委托 BaseData.get_code_info。未就绪抛 GatewayNotReadyError。
+
+        模式同 get_code_list：检查 _ready/_base_data → 加 _lock 串行化 → 委托 SDK → 计时日志。
+        返回 SDK 原始 DataFrame（index=证券代码, columns 含 symbol 等）。
+        """
+        if not self._ready or self._base_data is None:
+            raise GatewayNotReadyError("gateway not ready")
+        t_enter = time.perf_counter()
+        with self._lock:
+            t_lock = time.perf_counter()
+            logger.debug(
+                "get_code_info(security_type=%s) 调用 SDK (lock_wait=%.3fs)",
+                security_type, t_lock - t_enter,
+            )
+            t0 = time.perf_counter()
+            try:
+                result = self._base_data.get_code_info(security_type=security_type)
+            except Exception as e:
+                logger.error("get_code_info 失败: %s: %s", type(e).__name__, e)
+                raise GatewayQueryError(f"get_code_info failed: {e}") from e
+            sdk_elapsed = time.perf_counter() - t0
+            total_elapsed = time.perf_counter() - t_lock
+            row_count = len(result) if result is not None else 0
+            logger.info(
+                "get_code_info(security_type=%s) 返回 %d 行 "
+                "(sdk=%.3fs total=%.3fs)",
+                security_type, row_count, sdk_elapsed, total_elapsed,
             )
             return result
 
@@ -633,3 +703,98 @@ class AmazingDataGateway:
                                      type(e2).__name__, e2)
                         raise GatewayQueryError(f"get_adj_factor failed after reconnect: {e2}") from e2
                 raise GatewayQueryError(f"get_adj_factor failed: {e}") from e
+
+    def get_fund_share(
+        self,
+        codes: list[str],
+        is_local: bool = False,
+        begin_date: int | None = None,
+        end_date: int | None = None,
+    ) -> dict[str, "pd.DataFrame"]:
+        """获取基金/ETF 份额历史时序，委托 InfoData.get_fund_share。
+
+        模式对标 get_adj_factor：检查 _ready/_info_data → 加 _lock 串行化 → 委托 SDK → 连接错误重连。
+        local_path 由 Gateway 内部从 Config.fund_local_path 读取（_resolve_fund_local_path 解析），
+        is_local 由 Config.fund_is_local 控制（Protocol 签名保留 is_local 仅为接口契约明确性）。
+        返回 dict[code, DataFrame]（DataFrame 含 FUND_SHARE, CHANGE_DATE 等列）。
+        """
+        if not self._ready or self._info_data is None:
+            raise GatewayNotReadyError("gateway not ready")
+        is_local = self._config.fund_is_local
+        with self._lock:
+            try:
+                return self._info_data.get_fund_share(
+                    codes,
+                    local_path=self._fund_local_path,
+                    is_local=is_local,
+                    begin_date=begin_date,
+                    end_date=end_date,
+                )
+            except Exception as e:
+                logger.error("get_fund_share 失败: %s: %s (codes=%d, is_local=%s)",
+                             type(e).__name__, e, len(codes), is_local)
+                if _is_connection_error(e):
+                    logger.warning("get_fund_share 连接错误，尝试重连: %s", e)
+                    try:
+                        self._do_login()
+                        result = self._info_data.get_fund_share(
+                            codes,
+                            local_path=self._fund_local_path,
+                            is_local=is_local,
+                            begin_date=begin_date,
+                            end_date=end_date,
+                        )
+                        logger.info("get_fund_share 重连后成功")
+                        return result
+                    except Exception as e2:
+                        logger.error("get_fund_share 重连后仍失败: %s: %s",
+                                     type(e2).__name__, e2)
+                        raise GatewayQueryError(f"get_fund_share failed after reconnect: {e2}") from e2
+                raise GatewayQueryError(f"get_fund_share failed: {e}") from e
+
+    def get_fund_nav(
+        self,
+        codes: list[str],
+        is_local: bool = False,
+        begin_date: int | None = None,
+        end_date: int | None = None,
+    ) -> dict[str, "pd.DataFrame"]:
+        """获取基金/ETF 净值历史时序，委托 InfoData.get_fund_nav。
+
+        模式同 get_fund_share：检查 _ready/_info_data → 加 _lock 串行化 → 委托 SDK → 连接错误重连。
+        local_path 由 Gateway 内部从 Config.fund_local_path 读取，is_local 由 Config.fund_is_local 控制。
+        返回 dict[code, DataFrame]（DataFrame 含 UNIT_NAV, PRICE_DATE 等列）。
+        """
+        if not self._ready or self._info_data is None:
+            raise GatewayNotReadyError("gateway not ready")
+        is_local = self._config.fund_is_local
+        with self._lock:
+            try:
+                return self._info_data.get_fund_nav(
+                    codes,
+                    local_path=self._fund_local_path,
+                    is_local=is_local,
+                    begin_date=begin_date,
+                    end_date=end_date,
+                )
+            except Exception as e:
+                logger.error("get_fund_nav 失败: %s: %s (codes=%d, is_local=%s)",
+                             type(e).__name__, e, len(codes), is_local)
+                if _is_connection_error(e):
+                    logger.warning("get_fund_nav 连接错误，尝试重连: %s", e)
+                    try:
+                        self._do_login()
+                        result = self._info_data.get_fund_nav(
+                            codes,
+                            local_path=self._fund_local_path,
+                            is_local=is_local,
+                            begin_date=begin_date,
+                            end_date=end_date,
+                        )
+                        logger.info("get_fund_nav 重连后成功")
+                        return result
+                    except Exception as e2:
+                        logger.error("get_fund_nav 重连后仍失败: %s: %s",
+                                     type(e2).__name__, e2)
+                        raise GatewayQueryError(f"get_fund_nav failed after reconnect: {e2}") from e2
+                raise GatewayQueryError(f"get_fund_nav failed: {e}") from e

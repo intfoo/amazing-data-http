@@ -21,6 +21,8 @@ class Config:
     sdk_max_concurrent: int = 5  # SDK 最大并发调用数，超出返回 503
     adj_factor_local_path: str = ""  # SDK get_adj_factor 的 local_path 参数，必须为绝对路径
     adj_factor_is_local: bool = False  # SDK get_adj_factor 的 is_local：False=每次远程取最新，True=本地优先无则远程
+    fund_local_path: str = ""    # SDK get_fund_share/get_fund_nav 的 local_path，必须为绝对路径
+    fund_is_local: bool = False  # SDK is_local：False=每次远程取最新，True=本地优先无则远程
     auth_token: str = ""  # Bearer token；AUTH_REQUIRED=true 时客户端必须携带
     auth_required: bool = False  # 字段默认 False（测试便利）；env 默认 "true"（生产安全）
     subscription_open: str = "09:00"       # 订阅窗口开始 HH:MM
@@ -42,6 +44,9 @@ class Config:
             sdk_max_concurrent=int(os.environ.get("SDK_MAX_CONCURRENT", "5") or "5"),
             adj_factor_local_path=os.environ.get("ADJ_FACTOR_LOCAL_PATH", "") or "",
             adj_factor_is_local=os.environ.get("ADJ_FACTOR_IS_LOCAL", "false").lower()
+            in ("1", "true", "yes", "on"),
+            fund_local_path=os.environ.get("FUND_LOCAL_PATH", "") or "",
+            fund_is_local=os.environ.get("FUND_IS_LOCAL", "false").lower()
             in ("1", "true", "yes", "on"),
             auth_token=os.environ.get("AUTH_TOKEN", ""),
             auth_required=os.environ.get("AUTH_REQUIRED", "true").lower()

@@ -124,6 +124,63 @@
 > 仅 32 行是真除权事件。字段命名中性（`code`/`trade_date`/`adj_factor`），外部项目通过自身
 > YAML `field_map` 适配为内部字段（如 stocker 的 `symbol`/`trade_date`/`ex_factor`）。
 
+## POST /etf/net_inflow
+
+查询宽基 ETF 净流入数据。基于 SDK 3.5.11 ETF 接口（`get_fund_share` + `get_fund_nav`），计算各宽基 ETF 的每日资金净流入。
+
+**净流入口径**：一级市场申赎资金净流入 = (当日份额 − 前一日份额) × 当日单位净值。份额增加为流入（正值），减少为流出（负值）。
+
+**宽基识别**：通过 ETF 简称关键词匹配（上证50/沪深300/中证500/中证800/中证1000/中证2000/创业板/科创/上证180/深证100/中证A50/A500/国证2000 等），排除行业/主题/策略/增强类 ETF。每次请求实时匹配，新发宽基自动纳入。当前覆盖约 150 只宽基 ETF。
+
+**请求体**：
+```json
+{
+  "start_time": "2024-01-01",
+  "end_time": "2024-01-31"
+}
+```
+
+| 字段 | 类型 | 约束 |
+|------|------|------|
+| `start_time` | string | 可选。ISO 日期/日期时间格式（`YYYY-MM-DD`、`YYYY-MM-DDTHH:MM:SS`、`YYYYMMDD`）。**`start_time` 与 `end_time` 均缺省时默认近 30 天**，避免返回全量历史数据导致响应过大 |
+| `end_time` | string | 可选。格式同上。仅当两者都提供时校验 `start_time <= end_time`（按日期比较） |
+
+> **日期语义**（沪深差异，重要）：
+>
+> `date` 字段代表**份额变动的实际交易日 T**（资金实际流入/流出的日期），与净值的 `PRICE_DATE`（净值计算日）对齐。
+>
+> - **沪市**（`.SH`）：SDK `CHANGE_DATE` 即变动日 T，`ANN_DATE` = T+1（公告日），两者差一天，`CHANGE_DATE` 可信。
+> - **深市**（`.SZ`）：SDK `CHANGE_DATE` 和 `ANN_DATE` 相同，均填公告日 T+1，`CHANGE_DATE` 不可信。服务端用交易日历将其 snap 到前一交易日还原为真实变动日 T。
+>
+> **深市 T+1 公告时滞**：深市 T 日收盘后的申赎结果，T+1 日才公告。若 T 为周五，T+1 为周一；若 T 为节前最后一天，T+1 为节后第一天。因此查询最近数据时，**深市最新交易日的数据可能尚未入库**（需等下一交易日 SDK 更新）。
+>
+> **拉取区间扩展**：为保证 `diff()` 首日不为 NaN 并覆盖深市 T+1 公告时滞，服务端实际拉取区间会前后扩展——前扩 1 个交易日（用交易日历 `bisect` 精准定位），后扩 10 天（覆盖春节/国庆长假）。计算完成后用用户原始区间过滤，返回结果不受影响。
+
+**成功响应**（HTTP 200）：
+```json
+{"data": [{"code": "510300.SH", "name": "300ETF", "date": "2024-01-02", "share": 2594748.77, "nav": 4.6568, "net_inflow_share": 61290.0, "net_inflow_amount": 285415.27}]}
+```
+
+响应 `data` 数组元素字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `code` | string | ETF 代码+市场，如 `510300.SH` |
+| `name` | string | ETF 简称 |
+| `date` | string | 份额变动的实际交易日 T（`CHANGE_DATE` 修正后），`yyyy-MM-dd` 格式。沪市 = SDK `CHANGE_DATE`；深市 = SDK `CHANGE_DATE` snap 到前一交易日。与 `nav` 的净值计算日对齐 |
+| `share` | float | 当日基金份额（万份） |
+| `nav` | float | 单位净值。来自 `date` 对应交易日；若该日净值未公布则用最近可得净值（`ffill` 前值填充） |
+| `net_inflow_share` | float \| null | 份额变动（万份）= 当日份额 − 前一日份额。正值=申购流入，负值=赎回流出。首条记录为 `null`（无前一日数据） |
+| `net_inflow_amount` | float \| null | 净流入金额（万元）= `net_inflow_share × nav`。首条记录为 `null` |
+
+> - 结果按 `date` 升序排列，同日内多只 ETF 无特定顺序。
+> - 并非每只 ETF 每天都有份额变动数据。只有发生申赎的交易日才有记录；无变动的日期不返回行。
+> - `NaN`/缺失值序列化为 `null`。
+
+**空结果**（HTTP 200）：`{"data": []}`
+
+> **性能提示**：单次请求涉及 3 次 SDK 调用（`get_code_info` + `get_fund_share` + `get_fund_nav`），宽基 ETF 约 150 只，总耗时 20-40 秒。客户端应设置 ≥60 秒超时。`is_local=False` 每次从服务端取最新数据并更新本地缓存。
+
 ## GET /realtime
 
 返回实时行情快照。**优先读订阅缓存**（盘中 SDK 实时推送，每个 code 保留最新一笔），**缓存空时 fallback 查当日历史快照**（`query_snapshot` 取收盘快照，覆盖非交易时段）。
@@ -204,7 +261,7 @@ GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
 
 ## 认证
 
-`/daily`、`/minute`、`/adj_factor`、`/realtime` 接口需要 Bearer Token 认证。客户端必须在请求头中携带：
+`/daily`、`/minute`、`/adj_factor`、`/etf/net_inflow`、`/realtime` 接口需要 Bearer Token 认证。客户端必须在请求头中携带：
 
 ```
 Authorization: Bearer <AUTH_TOKEN>

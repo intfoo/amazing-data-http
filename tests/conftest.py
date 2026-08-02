@@ -12,7 +12,10 @@ _UNSET = object()
 class FakeGateway:
     def __init__(self, ready: bool = True, result: dict[str, pd.DataFrame] | None = _UNSET,
                  adj_factor_result: pd.DataFrame | None = None,
-                 calendar: list[int] | None = None):
+                 calendar: list[int] | None = None,
+                 code_info_result: pd.DataFrame | None = None,
+                 fund_share_result: dict[str, pd.DataFrame] | None = None,
+                 fund_nav_result: dict[str, pd.DataFrame] | None = None):
         self._ready = ready
         self._result = result if result is not _UNSET else {}
         self._adj_factor_result = adj_factor_result
@@ -21,6 +24,11 @@ class FakeGateway:
         self.logout_called = 0
         self.query_calls: list[dict] = []
         self.adj_factor_query_calls: list[dict] = []
+        self._code_info_result = code_info_result
+        self._fund_share_result = fund_share_result or {}
+        self._fund_nav_result = fund_nav_result or {}
+        self.fund_share_calls: list[dict] = []
+        self.fund_nav_calls: list[dict] = []
         self._code_list = ["000001.SZ", "600000.SH"]
         self._index_code_list = ["000001.SH", "399001.SZ"]
         self.sub_start_called = 0
@@ -94,6 +102,29 @@ class FakeGateway:
         if self._adj_factor_result is None:
             return pd.DataFrame()
         return self._adj_factor_result
+
+    def get_code_info(self, security_type="EXTRA_STOCK_A"):
+        if not self._ready:
+            raise GatewayNotReadyError("fake not ready")
+        return self._code_info_result
+
+    def get_fund_share(self, codes, is_local=False, begin_date=None, end_date=None):
+        if not self._ready:
+            raise GatewayNotReadyError("fake not ready")
+        self.fund_share_calls.append({
+            "codes": codes, "is_local": is_local,
+            "begin_date": begin_date, "end_date": end_date,
+        })
+        return self._fund_share_result
+
+    def get_fund_nav(self, codes, is_local=False, begin_date=None, end_date=None):
+        if not self._ready:
+            raise GatewayNotReadyError("fake not ready")
+        self.fund_nav_calls.append({
+            "codes": codes, "is_local": is_local,
+            "begin_date": begin_date, "end_date": end_date,
+        })
+        return self._fund_nav_result
 
 
 def make_daily_df(code: str = "000001.SZ", rows: int = 1) -> pd.DataFrame:
