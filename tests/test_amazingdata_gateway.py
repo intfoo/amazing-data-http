@@ -320,3 +320,33 @@ def test_get_adj_factor_reconnect_none_still_guarded(monkeypatch):
     result = gw.get_adj_factor(["000001.SZ"])
     assert calls == [True, True, False]
     assert result is expected
+
+
+def test_is_sdk_corruption_keywords():
+    from app.gateway import _is_sdk_corruption
+
+    assert _is_sdk_corruption(Exception("查询失败"))
+    assert _is_sdk_corruption(TypeError("'NoneType' object is not subscriptable"))
+    assert not _is_sdk_corruption(ValueError("invalid code"))
+    assert not _is_sdk_corruption(RuntimeError("Connection reset by peer"))
+
+
+def test_query_kline_rebuilds_session_on_sdk_corruption(monkeypatch):
+    """SDK 抛 '查询失败'（内部锁已泄漏）时应 _do_login 重建会话，然后原样报错。"""
+    from app.gateway import AmazingDataGateway, GatewayQueryError
+
+    gw = AmazingDataGateway(make_config())
+    gw._ready = True
+    calls = {"login": 0}
+
+    class FakeMarketData:
+        def query_kline(self, codes, **kwargs):
+            raise RuntimeError("查询失败")
+
+    gw._market_data = FakeMarketData()
+    monkeypatch.setattr(
+        gw, "_do_login", lambda: calls.__setitem__("login", calls["login"] + 1)
+    )
+    with pytest.raises(GatewayQueryError, match="query failed"):
+        gw.query_kline(["000001.SZ"], 20240101, 20240131, "day")
+    assert calls["login"] == 1

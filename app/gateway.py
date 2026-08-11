@@ -63,6 +63,19 @@ def _is_connection_error(exc: Exception) -> bool:
     return any(kw in msg for kw in _CONNECTION_KEYWORDS)
 
 
+# SDK 内部状态损坏关键词（'查询失败' 是 SDK pyc 内硬编码的中文异常消息，
+# 见 market_data.pyc 反汇编；'NoneType' 见于 get_code_list/get_adj_factor 内部状态错乱）。
+# 命中说明 SDK 内部状态机/锁已损坏（SDK 异常路径不释放内部 lock），
+# 必须 _do_login() 重建会话（新实例=新锁），否则后续所有查询永久挂起。
+_SDK_CORRUPTION_KEYWORDS: tuple[str, ...] = ("查询失败", "NoneType")
+
+
+def _is_sdk_corruption(exc: Exception) -> bool:
+    """判断异常是否是 SDK 内部状态损坏（非网络问题，重试无意义，需重建会话）。"""
+    msg = str(exc)
+    return any(kw in msg for kw in _SDK_CORRUPTION_KEYWORDS)
+
+
 @runtime_checkable
 class Gateway(Protocol):
     """Gateway 接口契约。HTTP 层只依赖此接口，测试用 FakeGateway 替换。"""
@@ -624,7 +637,8 @@ class AmazingDataGateway:
                 result = self._market_data.query_snapshot(codes, **kwargs)
             except Exception as e:
                 logger.error("query_snapshot 失败: %s: %s (codes=%d, date=%s)",
-                             type(e).__name__, e, len(codes), trade_date)
+                             type(e).__name__, e, len(codes), trade_date,
+                             exc_info=True)
                 if _is_connection_error(e):
                     logger.warning("query_snapshot 连接错误，尝试重连: %s", e)
                     try:
@@ -632,9 +646,16 @@ class AmazingDataGateway:
                         result = self._market_data.query_snapshot(codes, **kwargs)
                         logger.info("query_snapshot 重连后成功")
                     except Exception as e2:
-                        logger.error("query_snapshot 重连后仍失败: %s: %s", type(e2).__name__, e2)
+                        logger.error("query_snapshot 重连后仍失败: %s: %s",
+                                     type(e2).__name__, e2, exc_info=True)
                         raise GatewayQueryError(f"query_snapshot failed after reconnect: {e2}") from e2
                 else:
+                    if _is_sdk_corruption(e):
+                        logger.warning("检测到 SDK 内部状态损坏，重建会话释放 SDK 内部锁: %s", e)
+                        try:
+                            self._do_login()
+                        except Exception as e3:
+                            logger.error("SDK 会话重建失败: %s: %s", type(e3).__name__, e3)
                     raise GatewayQueryError(f"query_snapshot failed: {e}") from e
         # 展平嵌套 {date: {code: DataFrame}} → {code: DataFrame}
         flat: dict[str, pd.DataFrame] = {}
@@ -699,6 +720,7 @@ class AmazingDataGateway:
                     begin_date if begin_date is not None else "default",
                     end_date if end_date is not None else "default",
                     period,
+                    exc_info=True,
                 )
                 if _is_connection_error(e):
                     logger.warning("query_kline 连接错误，尝试重连: %s", e)
@@ -708,8 +730,17 @@ class AmazingDataGateway:
                         logger.info("query_kline 重连后成功")
                         return result if isinstance(result, dict) else {"_all": result}
                     except Exception as e2:
-                        logger.error("query_kline 重连后仍失败: %s: %s", type(e2).__name__, e2)
+                        logger.error("query_kline 重连后仍失败: %s: %s",
+                                     type(e2).__name__, e2, exc_info=True)
                         raise GatewayQueryError(f"query failed after reconnect: {e2}") from e2
+                if _is_sdk_corruption(e):
+                    # SDK 异常路径不释放内部 lock（market_data.pyc 字节码证实），
+                    # 不重建会让后续所有查询在 SDK lock.acquire() 上永久挂起。
+                    logger.warning("检测到 SDK 内部状态损坏，重建会话释放 SDK 内部锁: %s", e)
+                    try:
+                        self._do_login()
+                    except Exception as e3:
+                        logger.error("SDK 会话重建失败: %s: %s", type(e3).__name__, e3)
                 raise GatewayQueryError(f"query failed: {e}") from e
 
     def start_snapshot_subscription(
@@ -830,6 +861,12 @@ class AmazingDataGateway:
                                      type(e2).__name__, e2, exc_info=True)
                         raise GatewayQueryError(f"get_adj_factor failed after reconnect: {e2}") from e2
                 else:
+                    if _is_sdk_corruption(e):
+                        logger.warning("检测到 SDK 内部状态损坏，重建会话释放 SDK 内部锁: %s", e)
+                        try:
+                            self._do_login()
+                        except Exception as e3:
+                            logger.error("SDK 会话重建失败: %s: %s", type(e3).__name__, e3)
                     raise GatewayQueryError(f"get_adj_factor failed: {e}") from e
             # SDK 内部状态损坏时可能静默返回 None（如本地 HDF5 缓存损坏，
             # 下游 df[...] 直接 TypeError）。is_local=True 时回退远程重试一次。
@@ -883,7 +920,8 @@ class AmazingDataGateway:
                 )
             except Exception as e:
                 logger.error("get_fund_share 失败: %s: %s (codes=%d, is_local=%s)",
-                             type(e).__name__, e, len(codes), is_local)
+                             type(e).__name__, e, len(codes), is_local,
+                             exc_info=True)
                 if _is_connection_error(e):
                     logger.warning("get_fund_share 连接错误，尝试重连: %s", e)
                     try:
@@ -899,8 +937,14 @@ class AmazingDataGateway:
                         return result
                     except Exception as e2:
                         logger.error("get_fund_share 重连后仍失败: %s: %s",
-                                     type(e2).__name__, e2)
+                                     type(e2).__name__, e2, exc_info=True)
                         raise GatewayQueryError(f"get_fund_share failed after reconnect: {e2}") from e2
+                if _is_sdk_corruption(e):
+                    logger.warning("检测到 SDK 内部状态损坏，重建会话释放 SDK 内部锁: %s", e)
+                    try:
+                        self._do_login()
+                    except Exception as e3:
+                        logger.error("SDK 会话重建失败: %s: %s", type(e3).__name__, e3)
                 raise GatewayQueryError(f"get_fund_share failed: {e}") from e
 
     def get_fund_nav(
@@ -930,7 +974,8 @@ class AmazingDataGateway:
                 )
             except Exception as e:
                 logger.error("get_fund_nav 失败: %s: %s (codes=%d, is_local=%s)",
-                             type(e).__name__, e, len(codes), is_local)
+                             type(e).__name__, e, len(codes), is_local,
+                             exc_info=True)
                 if _is_connection_error(e):
                     logger.warning("get_fund_nav 连接错误，尝试重连: %s", e)
                     try:
@@ -946,6 +991,12 @@ class AmazingDataGateway:
                         return result
                     except Exception as e2:
                         logger.error("get_fund_nav 重连后仍失败: %s: %s",
-                                     type(e2).__name__, e2)
+                                     type(e2).__name__, e2, exc_info=True)
                         raise GatewayQueryError(f"get_fund_nav failed after reconnect: {e2}") from e2
+                if _is_sdk_corruption(e):
+                    logger.warning("检测到 SDK 内部状态损坏，重建会话释放 SDK 内部锁: %s", e)
+                    try:
+                        self._do_login()
+                    except Exception as e3:
+                        logger.error("SDK 会话重建失败: %s: %s", type(e3).__name__, e3)
                 raise GatewayQueryError(f"get_fund_nav failed: {e}") from e
