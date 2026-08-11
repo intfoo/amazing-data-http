@@ -51,6 +51,9 @@ _CONNECTION_KEYWORDS: tuple[str, ...] = (
     "broken pipe", "eof occurred", "reset", "unreachable", "refused", "closed",
 )
 
+_RECONNECT_COOLDOWN_SEC = 60    # 主动重连冷却（heartbeat 每 30s 报一次，避免频繁 relogin）
+_DISCONNECT_DEDUP_SEC = 300     # 相同断线 WARNING 去重窗口
+
 
 def _is_connection_error(exc: Exception) -> bool:
     """判断异常是否可能是网络/连接类错误（应触发重连）。"""
@@ -135,6 +138,11 @@ class AmazingDataGateway:
         self._adj_factor_local_path = self._resolve_adj_factor_local_path()
         self._info_data = None  # ad.InfoData 实例（供 get_fund_share/get_fund_nav）
         self._fund_local_path = self._resolve_fund_local_path()
+        # 主动重连状态（tgw 断线回调触发，后台线程执行）
+        self._reconnect_lock = threading.Lock()
+        self._reconnect_in_progress = False
+        self._last_reconnect_attempt = 0.0
+        self._last_disconnect_log: dict = {"msg": None, "ts": 0.0}
 
     def _resolve_adj_factor_local_path(self) -> str:
         """解析 adj_factor 本地缓存基目录：配置非空用配置，否则用项目根 data 兜底 + 警告。
@@ -248,6 +256,47 @@ class AmazingDataGateway:
             logger.error("SDK 登录失败: %s: %s", type(e).__name__, e)
             raise GatewayNotReadyError(f"login failed: {e}") from e
 
+    def _schedule_reconnect(self, reason: str) -> None:
+        """tgw 断线回调触发主动重连：后台线程执行 _do_login()，不阻塞 tgw 回调线程。
+
+        防重入（同时只有一个重连线程）+ 冷却（60s 内不重复尝试）。
+        重连成功会顺带刷新交易日历（_do_login 重新 get_calendar）。
+        """
+        with self._reconnect_lock:
+            if self._reconnect_in_progress:
+                return
+            now = time.time()
+            if now - self._last_reconnect_attempt < _RECONNECT_COOLDOWN_SEC:
+                return
+            self._reconnect_in_progress = True
+            self._last_reconnect_attempt = now
+
+        def _do() -> None:
+            try:
+                logger.info("tgw 断线触发主动重连: %s", reason)
+                with self._lock:
+                    self._do_login()
+                logger.info("tgw 主动重连成功")
+            except Exception as e:
+                logger.error("tgw 主动重连失败: %s: %s", type(e).__name__, e, exc_info=True)
+            finally:
+                with self._reconnect_lock:
+                    self._reconnect_in_progress = False
+
+        threading.Thread(target=_do, daemon=True, name="tgw-reconnect").start()
+
+    def _should_log_disconnect(self, msg: str) -> bool:
+        """断线 WARNING 去重：相同消息 _DISCONNECT_DEDUP_SEC 内只打一次。
+        tgw 回调可能多线程分发，read-modify-write 需锁保护。"""
+        with self._reconnect_lock:
+            now = time.time()
+            last = self._last_disconnect_log
+            if msg == last["msg"] and now - last["ts"] < _DISCONNECT_DEDUP_SEC:
+                return False
+            last["msg"] = msg
+            last["ts"] = now
+            return True
+
     def _install_tgw_event_logger(self) -> None:
         """Monkey-patch tgw.g_spi 的 OnLog/OnEvent/OnLogon 以捕获所有可能导致进程退出的事件。
 
@@ -309,7 +358,11 @@ class AmazingDataGateway:
                 logger.error("tgw FATAL: [%s] %s (process may exit)", level_name, msg_str)
                 sys.stderr.flush()
             elif any(kw in msg_str for kw in DISCONNECT_KEYWORDS):
-                logger.warning("tgw disconnect: [%s] %s", level_name, msg_str)
+                if self._should_log_disconnect(msg_str):
+                    logger.warning("tgw disconnect: [%s] %s", level_name, msg_str)
+                # 断线主动重连：原设计只有惰性重连（需新请求触发），
+                # 非交易时段无请求时断线可挂 1 小时不自愈。
+                self._schedule_reconnect(msg_str)
             elif level == 3:  # kError
                 if "queue size" in msg_str or "in queue" in msg_str:
                     logger.debug("tgw push status: [%s] %s", level_name, msg_str)

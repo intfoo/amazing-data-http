@@ -128,3 +128,48 @@ def test_stop_subscription_joins_thread():
     assert not t.is_alive()
     assert gw._subscribe_data is None
     assert gw._sub_thread is None
+
+
+def test_schedule_reconnect_triggers_do_login(monkeypatch):
+    """断线回调应触发后台线程重连，且防重入。"""
+    import time as _time
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(make_config())
+    calls = {"login": 0}
+    monkeypatch.setattr(
+        gw, "_do_login", lambda: calls.__setitem__("login", calls["login"] + 1)
+    )
+    gw._schedule_reconnect("test heartbeat timeout")
+    for _ in range(50):
+        if calls["login"] >= 1:
+            break
+        _time.sleep(0.05)
+    assert calls["login"] == 1
+    # 等重连线程收尾
+    for _ in range(50):
+        if not gw._reconnect_in_progress:
+            break
+        _time.sleep(0.05)
+    assert gw._reconnect_in_progress is False
+
+
+def test_schedule_reconnect_cooldown(monkeypatch):
+    """冷却期内不重复重连（heartbeat 每 30s 报一次，不能每次都重连）。"""
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(make_config())
+    monkeypatch.setattr(gw, "_do_login", lambda: None)
+    gw._last_reconnect_attempt = 999999999999.0  # 刚尝试过 → 冷却中
+    gw._schedule_reconnect("test")
+    assert gw._reconnect_in_progress is False  # 未启动新线程
+
+
+def test_disconnect_log_dedup():
+    """相同断线消息 300s 内只打一次 WARNING。"""
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(make_config())
+    assert gw._should_log_disconnect("heartbeat timeout") is True
+    assert gw._should_log_disconnect("heartbeat timeout") is False
+    assert gw._should_log_disconnect("another error") is True
