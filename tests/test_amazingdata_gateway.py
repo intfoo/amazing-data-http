@@ -350,3 +350,28 @@ def test_query_kline_rebuilds_session_on_sdk_corruption(monkeypatch):
     with pytest.raises(GatewayQueryError, match="query failed"):
         gw.query_kline(["000001.SZ"], 20240101, 20240131, "day")
     assert calls["login"] == 1
+
+
+def test_sdk_lock_timeout_raises():
+    """_lock 被持有时 _sdk_lock 超时应抛 GatewayQueryError（不再无限排队）。"""
+    from app.gateway import AmazingDataGateway, GatewayQueryError
+
+    gw = AmazingDataGateway(make_config())
+    assert gw._lock.acquire(blocking=False)
+    try:
+        with pytest.raises(GatewayQueryError, match="竞争超时"):
+            with gw._sdk_lock(timeout_sec=0.1):
+                pass
+    finally:
+        gw._lock.release()
+
+
+def test_sdk_lock_normal_acquire_release():
+    """无竞争时 _sdk_lock 正常进出并释放锁。"""
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(make_config())
+    with gw._sdk_lock(timeout_sec=1):
+        pass
+    assert gw._lock.acquire(blocking=False)
+    gw._lock.release()

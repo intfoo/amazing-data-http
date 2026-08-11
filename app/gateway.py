@@ -14,6 +14,7 @@ import logging
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -55,6 +56,8 @@ _RECONNECT_COOLDOWN_SEC = 60    # 主动重连冷却（heartbeat 每 30s 报一�
 _DISCONNECT_DEDUP_SEC = 300     # 相同断线 WARNING 去重窗口
 
 ADJ_FACTOR_TIMEOUT_SEC = 120  # get_adj_factor SDK 调用超时（正常本地 <1s / 远程 ~21s）
+
+SDK_LOCK_TIMEOUT_SEC = 30  # gateway._lock 竞争超时；超时说明有 SDK 调用挂起未释放
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -223,7 +226,7 @@ class AmazingDataGateway:
 
     def login(self) -> None:
         """线程安全的登录入口。"""
-        with self._lock:
+        with self._sdk_lock():
             self._do_login()
 
     def _do_login(self) -> None:
@@ -290,7 +293,7 @@ class AmazingDataGateway:
         def _do() -> None:
             try:
                 logger.info("tgw 断线触发主动重连: %s", reason)
-                with self._lock:
+                with self._sdk_lock():
                     self._do_login()
                 logger.info("tgw 主动重连成功")
             except Exception as e:
@@ -435,7 +438,7 @@ class AmazingDataGateway:
 
     def logout(self) -> None:
         """线程安全的登出入口。"""
-        with self._lock:
+        with self._sdk_lock():
             self._safe_logout()
 
     def _safe_logout(self) -> None:
@@ -471,7 +474,7 @@ class AmazingDataGateway:
         """
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
-        with self._lock:
+        with self._sdk_lock():
             calendar = self._base_data.get_calendar()
             self._calendar = calendar
             if self._market_data is not None:
@@ -510,6 +513,19 @@ class AmazingDataGateway:
             raise holder["error"]
         return holder.get("result")
 
+    @contextmanager
+    def _sdk_lock(self, timeout_sec: float = SDK_LOCK_TIMEOUT_SEC):
+        """self._lock 的超时版本：挂起的 SDK 调用不再让后续请求无限排队假死。"""
+        acquired = self._lock.acquire(timeout=timeout_sec)
+        if not acquired:
+            raise GatewayQueryError(
+                f"gateway lock 竞争超时（{timeout_sec}s），存在挂起的 SDK 调用"
+            )
+        try:
+            yield
+        finally:
+            self._lock.release()
+
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]:
         """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。
 
@@ -520,7 +536,7 @@ class AmazingDataGateway:
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
         t_enter = time.perf_counter()
-        with self._lock:
+        with self._sdk_lock():
             t_lock = time.perf_counter()
             logger.debug(
                 "get_code_list(security_type=%s) 调用 SDK (lock_wait=%.3fs)",
@@ -550,7 +566,7 @@ class AmazingDataGateway:
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
         t_enter = time.perf_counter()
-        with self._lock:
+        with self._sdk_lock():
             t_lock = time.perf_counter()
             logger.debug(
                 "get_code_info(security_type=%s) 调用 SDK (lock_wait=%.3fs)",
@@ -632,7 +648,7 @@ class AmazingDataGateway:
             kwargs["begin_time"] = begin_time
         if end_time is not None:
             kwargs["end_time"] = end_time
-        with self._lock:
+        with self._sdk_lock():
             try:
                 result = self._market_data.query_snapshot(codes, **kwargs)
             except Exception as e:
@@ -709,7 +725,7 @@ class AmazingDataGateway:
         if end_date is not None:
             kwargs["end_date"] = end_date
 
-        with self._lock:
+        with self._sdk_lock():
             try:
                 result = self._market_data.query_kline(codes, **kwargs)
                 return result if isinstance(result, dict) else {"_all": result}
@@ -828,7 +844,7 @@ class AmazingDataGateway:
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
         is_local = self._config.adj_factor_is_local
-        with self._lock:
+        with self._sdk_lock():
             try:
                 result = self._call_sdk_with_timeout(
                     lambda: self._base_data.get_adj_factor(
@@ -909,7 +925,7 @@ class AmazingDataGateway:
         if not self._ready or self._info_data is None:
             raise GatewayNotReadyError("gateway not ready")
         is_local = self._config.fund_is_local
-        with self._lock:
+        with self._sdk_lock():
             try:
                 return self._info_data.get_fund_share(
                     codes,
@@ -963,7 +979,7 @@ class AmazingDataGateway:
         if not self._ready or self._info_data is None:
             raise GatewayNotReadyError("gateway not ready")
         is_local = self._config.fund_is_local
-        with self._lock:
+        with self._sdk_lock():
             try:
                 return self._info_data.get_fund_nav(
                     codes,
