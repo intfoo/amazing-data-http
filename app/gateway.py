@@ -54,6 +54,8 @@ _CONNECTION_KEYWORDS: tuple[str, ...] = (
 _RECONNECT_COOLDOWN_SEC = 60    # 主动重连冷却（heartbeat 每 30s 报一次，避免频繁 relogin）
 _DISCONNECT_DEDUP_SEC = 300     # 相同断线 WARNING 去重窗口
 
+ADJ_FACTOR_TIMEOUT_SEC = 120  # get_adj_factor SDK 调用超时（正常本地 <1s / 远程 ~21s）
+
 
 def _is_connection_error(exc: Exception) -> bool:
     """判断异常是否可能是网络/连接类错误（应触发重连）。"""
@@ -467,6 +469,34 @@ class AmazingDataGateway:
             )
             return calendar
 
+    @staticmethod
+    def _call_sdk_with_timeout(fn, timeout_sec: float, label: str):
+        """在独立 daemon 线程执行 SDK 同步调用，超时抛 GatewayQueryError。
+
+        SDK 是无限期阻塞的 C 层调用（无 timeout 参数），Python 无法真正中断线程，
+        超时后 SDK 线程作为 daemon 隔离（不再持有 gateway._lock，不阻塞后续调用；
+        极端情况下 SDK 内部可能仍有残留状态，由 _is_sdk_corruption 重建机制兜底）。
+        fn 抛出的异常原样上抛（不包装），保持上层连接错误/损坏检测语义。
+        """
+        holder: dict = {}
+
+        def _run() -> None:
+            try:
+                holder["result"] = fn()
+            except Exception as e:  # noqa: BLE001 - SDK 异常需原样传递
+                holder["error"] = e
+
+        t = threading.Thread(target=_run, daemon=True, name=f"sdk-{label}")
+        t.start()
+        t.join(timeout=timeout_sec)
+        if t.is_alive():
+            raise GatewayQueryError(
+                f"{label} timed out after {timeout_sec}s（SDK 线程已隔离为 daemon）"
+            )
+        if "error" in holder:
+            raise holder["error"]
+        return holder.get("result")
+
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]:
         """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。
 
@@ -769,30 +799,61 @@ class AmazingDataGateway:
         is_local = self._config.adj_factor_is_local
         with self._lock:
             try:
-                return self._base_data.get_adj_factor(
-                    codes,
-                    local_path=self._adj_factor_local_path,
-                    is_local=is_local,
+                result = self._call_sdk_with_timeout(
+                    lambda: self._base_data.get_adj_factor(
+                        codes,
+                        local_path=self._adj_factor_local_path,
+                        is_local=is_local,
+                    ),
+                    ADJ_FACTOR_TIMEOUT_SEC,
+                    "get_adj_factor",
                 )
             except Exception as e:
                 logger.error("get_adj_factor 失败: %s: %s (codes=%d, is_local=%s)",
-                             type(e).__name__, e, len(codes), is_local)
+                             type(e).__name__, e, len(codes), is_local, exc_info=True)
                 if _is_connection_error(e):
                     logger.warning("get_adj_factor 连接错误，尝试重连: %s", e)
                     try:
                         self._do_login()
-                        result = self._base_data.get_adj_factor(
-                            codes,
-                            local_path=self._adj_factor_local_path,
-                            is_local=is_local,
+                        result = self._call_sdk_with_timeout(
+                            lambda: self._base_data.get_adj_factor(
+                                codes,
+                                local_path=self._adj_factor_local_path,
+                                is_local=is_local,
+                            ),
+                            ADJ_FACTOR_TIMEOUT_SEC,
+                            "get_adj_factor",
                         )
                         logger.info("get_adj_factor 重连后成功")
-                        return result
                     except Exception as e2:
                         logger.error("get_adj_factor 重连后仍失败: %s: %s",
-                                     type(e2).__name__, e2)
+                                     type(e2).__name__, e2, exc_info=True)
                         raise GatewayQueryError(f"get_adj_factor failed after reconnect: {e2}") from e2
-                raise GatewayQueryError(f"get_adj_factor failed: {e}") from e
+                else:
+                    raise GatewayQueryError(f"get_adj_factor failed: {e}") from e
+            # SDK 内部状态损坏时可能静默返回 None（如本地 HDF5 缓存损坏，
+            # 下游 df[...] 直接 TypeError）。is_local=True 时回退远程重试一次。
+            if result is None:
+                if is_local:
+                    logger.warning(
+                        "get_adj_factor is_local=True 返回 None（本地缓存可能损坏），"
+                        "回退 is_local=False 远程重试"
+                    )
+                    result = self._call_sdk_with_timeout(
+                        lambda: self._base_data.get_adj_factor(
+                            codes,
+                            local_path=self._adj_factor_local_path,
+                            is_local=False,
+                        ),
+                        ADJ_FACTOR_TIMEOUT_SEC,
+                        "get_adj_factor",
+                    )
+                if result is None:
+                    raise GatewayQueryError(
+                        "get_adj_factor returned None（SDK 内部错误，"
+                        "建议删除本地 adj_factor 缓存后重试）"
+                    )
+            return result
 
     def get_fund_share(
         self,

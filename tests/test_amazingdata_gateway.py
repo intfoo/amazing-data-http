@@ -228,3 +228,95 @@ def test_query_kline_refreshes_stale_calendar():
     result = gw.query_kline(["000001.SZ"], 20240103, 20240103, "day")
     assert gw._calendar == [20240102, 20240103]
     assert "000001.SZ" in result
+
+
+def test_call_sdk_with_timeout_raises_on_hang():
+    """SDK 调用超过 timeout 应抛 GatewayQueryError（线程隔离为 daemon）。"""
+    import time as _t
+    from app.gateway import AmazingDataGateway, GatewayQueryError
+
+    with pytest.raises(GatewayQueryError, match="timed out"):
+        AmazingDataGateway._call_sdk_with_timeout(lambda: _t.sleep(5), 0.1, "probe")
+
+
+def test_call_sdk_with_timeout_passthrough_error():
+    """fn 内部异常应原样上抛（不包装）。"""
+    from app.gateway import AmazingDataGateway
+
+    def _boom():
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        AmazingDataGateway._call_sdk_with_timeout(_boom, 1, "probe")
+
+
+def test_get_adj_factor_none_fallback_to_remote():
+    """is_local=True 返回 None（本地缓存损坏）时回退 is_local=False 重试一次。"""
+    import pandas as pd
+    from app.config import Config
+    from app.gateway import AmazingDataGateway
+
+    cfg = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                 adj_factor_is_local=True)
+    gw = AmazingDataGateway(cfg)
+    gw._ready = True
+    calls = []
+    expected = pd.DataFrame({"000001.SZ": [1.0]})
+
+    class FakeBase:
+        def get_adj_factor(self, codes, local_path=None, is_local=False):
+            calls.append(is_local)
+            return None if is_local else expected
+
+    gw._base_data = FakeBase()
+    result = gw.get_adj_factor(["000001.SZ"])
+    assert calls == [True, False]
+    assert result is expected
+
+
+def test_get_adj_factor_none_stays_none_raises():
+    """本地+远程都返回 None 时显式报错（不再让下游拿到 None 炸 TypeError）。"""
+    from app.config import Config
+    from app.gateway import AmazingDataGateway, GatewayQueryError
+
+    cfg = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                 adj_factor_is_local=True)
+    gw = AmazingDataGateway(cfg)
+    gw._ready = True
+
+    class FakeBase:
+        def get_adj_factor(self, codes, local_path=None, is_local=False):
+            return None
+
+    gw._base_data = FakeBase()
+    with pytest.raises(GatewayQueryError, match="returned None"):
+        gw.get_adj_factor(["000001.SZ"])
+
+
+def test_get_adj_factor_reconnect_none_still_guarded(monkeypatch):
+    """连接错误重连成功但返回 None 时，None 防御仍生效（不直接泄漏给调用方）。"""
+    import pandas as pd
+    from app.config import Config
+    from app.gateway import AmazingDataGateway
+
+    cfg = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                 adj_factor_is_local=True)
+    gw = AmazingDataGateway(cfg)
+    gw._ready = True
+    calls = []
+    expected = pd.DataFrame({"000001.SZ": [1.0]})
+
+    class FakeBase:
+        def get_adj_factor(self, codes, local_path=None, is_local=False):
+            calls.append(is_local)
+            if len(calls) == 1:
+                raise RuntimeError("Connection reset by peer")  # 首次：连接错误
+            if len(calls) == 2:
+                return None  # 重连成功但返回 None（is_local=True）
+            return expected  # None 防御回退 is_local=False 成功
+
+    gw._base_data = FakeBase()
+    monkeypatch.setattr(gw, "_do_login", lambda: None)
+    result = gw.get_adj_factor(["000001.SZ"])
+    assert calls == [True, True, False]
+    assert result is expected
