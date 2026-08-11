@@ -499,3 +499,32 @@ def test_start_watchdog_idempotent():
     svc.stop_watchdog()
     if t1:
         t1.join(timeout=2)
+
+
+def test_on_snapshot_does_not_reactivate_outside_window():
+    """窗口外收到残留帧：数据照收（last_snapshot_ts 更新），但不复活 _active。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_window_params(calendar=None)  # calendar=None → is_subscription_window 恒 False
+    svc.set_active(False)
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
+    assert svc.is_active() is False
+    assert svc.last_snapshot_ts() > 0
+
+
+def test_on_snapshot_reactivates_inside_window():
+    """窗口内恢复逻辑不变（盘中网络抖动恢复场景）。"""
+    import datetime as _dt
+    today = int(_dt.datetime.now().strftime("%Y%m%d"))
+    svc = RealtimeService(gateway=None)
+    svc.set_window_params(calendar=[today], open_time="00:00", close_time="23:59")
+    svc.set_active(False)
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
+    assert svc.is_active() is True
+
+
+def test_on_snapshot_reactivates_when_no_window_params():
+    """未设置窗口参数（订阅从未正式启动）：保持旧行为，允许自动复活。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_active(False)
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
+    assert svc.is_active() is True

@@ -61,6 +61,9 @@ class RealtimeService:
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_start_ts: float = 0.0
         self._stop_flag = threading.Event()
+        # 订阅窗口参数（calendar, open_time, close_time, fallback），
+        # 由 set_window_params/start_watchdog 设置，供 on_snapshot 判断窗口外残留帧不复活。
+        self._window_params: tuple | None = None
 
     def on_snapshot(self, data) -> None:
         """订阅回调：Snapshot → dict → 缓存覆盖。异常吞掉，不影响订阅线程。"""
@@ -71,11 +74,16 @@ class RealtimeService:
                 with self._lock:
                     self._cache[code] = record
             self._last_snapshot_ts = time.time()
-            # 自动恢复：若订阅曾被标记 inactive 但数据又来了，说明已恢复
+            # 自动恢复：仅窗口内恢复（盘中抖动场景）。窗口外收到的帧是退订残留帧
+            # （stop_subscription 后 SDK daemon 线程未退出），复活会与调度器形成
+            # 每分钟 stop→复活→stop 死循环。
             if not self._active:
-                self._active = True
-                self._deactivation_reason = None
-                logger.info("订阅已恢复：收到数据，重新激活")
+                if self._in_recovery_window():
+                    self._active = True
+                    self._deactivation_reason = None
+                    logger.info("订阅已恢复：收到数据，重新激活")
+                else:
+                    logger.debug("非窗口期收到数据帧，忽略自动恢复（退订残留帧）")
         except Exception as e:
             logger.warning("快照转换失败: %s: %s", type(e).__name__, e)
 
@@ -108,6 +116,27 @@ class RealtimeService:
         if active:
             self._deactivation_reason = None
 
+    def set_window_params(
+        self,
+        calendar: list[int] | None,
+        open_time: str = "09:00",
+        close_time: str = "15:20",
+        calendar_fallback_weekday: bool = True,
+    ) -> None:
+        """设置订阅窗口参数，供 on_snapshot 判断窗口外残留帧不自动复活。"""
+        self._window_params = (calendar, open_time, close_time, calendar_fallback_weekday)
+
+    def _in_recovery_window(self) -> bool:
+        """on_snapshot 自动复活前检查当前是否在订阅窗口内。
+        未设置窗口参数（订阅从未正式启动）时保持旧行为（允许恢复）。
+        """
+        if self._window_params is None:
+            return True
+        calendar, open_time, close_time, fallback = self._window_params
+        return is_subscription_window(
+            datetime.datetime.now(), calendar, open_time, close_time, fallback,
+        )
+
     def clear_cache(self) -> None:
         """清空订阅缓存（调度器停止订阅时调用）。"""
         with self._lock:
@@ -131,6 +160,7 @@ class RealtimeService:
         calendar_fallback_weekday: bool = True,
     ) -> None:
         """启动后台 watchdog 线程。lifespan 订阅启动后调用。"""
+        self.set_window_params(calendar, open_time, close_time, calendar_fallback_weekday)
         if self._watchdog_thread and self._watchdog_thread.is_alive():
             return
         self._stop_flag.clear()

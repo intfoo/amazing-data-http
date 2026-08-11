@@ -652,7 +652,7 @@ class AmazingDataGateway:
         logger.info("快照订阅已启动: %d 只", len(code_list))
 
     def stop_subscription(self) -> None:
-        """停止订阅。SDK 若有 stop() 则调用，daemon 线程随进程退出。清理引用。"""
+        """停止订阅。SDK 若有 stop() 则调用，随后 join 订阅线程防止残留帧触发回调。"""
         if self._subscribe_data is not None:
             try:
                 stop = getattr(self._subscribe_data, "stop", None)
@@ -660,6 +660,13 @@ class AmazingDataGateway:
                     stop()
             except Exception as e:
                 logger.warning("停止订阅异常（已忽略）: %s: %s", type(e).__name__, e)
+        # join 订阅线程：sub.run() 是 daemon 无限循环，stop() 可能未真正退出线程。
+        # 不 join 会导致退订后残留帧继续触发 on_snapshot（盘后误复活订阅）。
+        thread = self._sub_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                logger.warning("订阅线程 5s 内未退出（SDK stop() 可能无效），依赖窗口检查兜底")
         self._subscribe_data = None
         self._sub_thread = None
 

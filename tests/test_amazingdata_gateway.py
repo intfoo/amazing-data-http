@@ -102,3 +102,29 @@ def test_is_connection_error_bare_eof_field_name_does_not_match():
     """仅含 'eof' 子串但非连接错误（如字段名 'some_eof_field'）不应误匹配。"""
     from app.gateway import _is_connection_error
     assert not _is_connection_error(ValueError("invalid some_eof_field value"))
+
+
+def test_stop_subscription_joins_thread():
+    """stop_subscription 应调 stop() 并 join 订阅线程，防止残留帧触发回调。"""
+    import threading
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(make_config())
+    stop_flag = threading.Event()
+
+    def _run():
+        stop_flag.wait(timeout=10)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    class FakeSub:
+        def stop(self):
+            stop_flag.set()
+
+    gw._subscribe_data = FakeSub()
+    gw._sub_thread = t
+    gw.stop_subscription()
+    assert not t.is_alive()
+    assert gw._subscribe_data is None
+    assert gw._sub_thread is None
