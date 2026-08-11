@@ -39,14 +39,16 @@ app/gateway/
 ### 2.1 各模块职责与内容清单
 
 **`base.py`** — 无状态共享层：
+- 模块 logger：`logger = logging.getLogger("amazingdata.gateway")`（**所有 mixin 模块 `from app.gateway.base import logger` 复用同一个**，保持日志标签不变）
 - 常量：`PERIOD_MAP`、`_CONNECTION_KEYWORDS`、`_SDK_CORRUPTION_KEYWORDS`、`_RECONNECT_COOLDOWN_SEC`、`_DISCONNECT_DEDUP_SEC`、`ADJ_FACTOR_TIMEOUT_SEC`、`SDK_LOCK_TIMEOUT_SEC`
 - 函数：`_is_connection_error`、`_is_sdk_corruption`
 - 接口：`Gateway` Protocol；异常：`GatewayError` / `GatewayNotReadyError` / `GatewayQueryError`
 
-**`paths.py`** — 模块级函数（从实例方法改造，唯一允许的代码改动点）：
+**`paths.py`** — 模块级函数（从实例方法改造，仅允许的代码改动点）：
 - `resolve_adj_factor_local_path(configured: str) -> str`
 - `resolve_fund_local_path(configured: str) -> str`
 - 逻辑从 `AmazingDataGateway._resolve_*_local_path` 平移，`self._config.xxx` 改为参数传入；docstring 中"本方法"等表述同步微调
+- **⚠️ `__file__` 路径偏移修正**：当前 `app/gateway.py` 里 `Path(__file__).resolve().parent.parent / "data"` 指向项目根；搬到 `app/gateway/paths.py` 后目录多一层，必须改为 `Path(__file__).resolve().parents[2] / "data"`（parents[0]=gateway/、parents[1]=app/、parents[2]=项目根），否则默认兜底路径错指 `app/data`，违反行为零变化
 
 **`session.py`** — `SessionMixin`：`login` / `_do_login` / `_safe_logout` / `logout` / `is_ready` / `calendar` property / `refresh_calendar`
 
@@ -63,7 +65,9 @@ app/gateway/
 **`__init__.py`** — 组合与门面：
 - `class AmazingDataGateway(SessionMixin, TgwEventMixin, ResilienceMixin, QueryMarketMixin, QueryBaseDataMixin, SubscriptionMixin)`
 - `__init__`：全部实例状态一处定义（`_config`/`_lock`/`_ad`/`_market_data`/`_ready`/`_base_data`/`_calendar`/`_subscribe_data`/`_sub_thread`/`_adj_factor_local_path`/`_info_data`/`_fund_local_path`/`_reconnect_lock`/`_reconnect_in_progress`/`_last_reconnect_attempt`/`_last_disconnect_log`），其中两个 local_path 改调 `paths.resolve_*` 模块函数
-- re-export：`AmazingDataGateway`、`Gateway`、`GatewayError`、`GatewayNotReadyError`、`GatewayQueryError`、`_is_connection_error`、`_is_sdk_corruption`（以下划线名为测试所用，需显式导出）
+- re-export（全清单，一个不能少）：`AmazingDataGateway`、`Gateway`、`GatewayError`、`GatewayNotReadyError`、`GatewayQueryError`、`PERIOD_MAP`、`_is_connection_error`、`_is_sdk_corruption`（下划线名与 `PERIOD_MAP` 均为测试直接导入，必须显式导出）
+- 另需 `from app.config import Config`（`__init__(self, config: Config)` 签名注解）
+- 各 mixin 模块按需携带方法体引用的 stdlib import（`threading`/`time`/`sys`/`contextlib`/`typing.Any` 等）+ `from app.gateway.base import logger, ...`（用到的异常/常量/判定函数）
 
 ## 3. 关键机制
 
@@ -74,8 +78,8 @@ app/gateway/
    - `app/realtime_service.py`：`from app.gateway import GatewayNotReadyError`
    - `app/kline_service.py`：`from app.gateway import Gateway`
    - `app/subscription_scheduler.py`：`from app.gateway import Gateway`
-   - `app/adj_factor_service.py`、`app/etf_flow_service.py`、`app/health.py`：待核对
-   - `tests/conftest.py`、`tests/test_amazingdata_gateway.py`、`tests/test_scheduler_calendar_refresh.py` 等
+   - `app/adj_factor_service.py`（Gateway）、`app/etf_flow_service.py`（Gateway）、`app/health.py`（Gateway）
+   - `tests/conftest.py`、`tests/test_amazingdata_gateway.py`（含 `_is_connection_error`/`_is_sdk_corruption`/`AmazingDataGateway` 多处函数内导入）、`tests/test_adj_factor.py`、`tests/test_gateway_interface.py`（含 `PERIOD_MAP`/`GatewayError`）、`tests/test_kline_service.py`、`tests/test_etf_flow_service.py`
 4. **Mixin 间调用走 self**：如 `session._do_login` 调 `self._install_tgw_event_logger()`（TgwEventMixin）、`tgw_events._schedule_reconnect._do` 调 `self._sdk_lock()`（ResilienceMixin）、`query_*` 调 `self._sdk_lock()`/`self._call_sdk_with_timeout()`/`self._do_login()`——`self` 即组合类实例，无 import 依赖
 5. **错误处理不变**：异常类搬入 `base.py`，语义不动；`_is_connection_error`/`_is_sdk_corruption` 同名同行数平移
 
@@ -84,7 +88,7 @@ app/gateway/
 1. 建包骨架：`base.py` → `paths.py`（无依赖，先落地）
 2. 各 mixin 模块平移（互相独立，可并行）：`resilience.py`、`subscription.py`、`session.py`、`tgw_events.py`、`query_market.py`、`query_basedata.py`
 3. `__init__.py` 组合类 + re-export；删除旧 `app/gateway.py`
-4. 全量测试 + import 冒烟（`python -c "from app.gateway import AmazingDataGateway, Gateway, GatewayNotReadyError, GatewayQueryError, _is_connection_error, _is_sdk_corruption"`）
+4. 全量测试 + import 冒烟（`python -c "from app.gateway import AmazingDataGateway, Gateway, GatewayError, GatewayNotReadyError, GatewayQueryError, PERIOD_MAP, _is_connection_error, _is_sdk_corruption"`）
 
 ## 5. 测试策略
 
