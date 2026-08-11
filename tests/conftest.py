@@ -46,6 +46,10 @@ class FakeGateway:
         self._logged_in = False
         self._ready = False
 
+    def refresh_calendar(self):
+        """FakeGateway 日历刷新：返回现有日历（测试用 set 赋值控制）。"""
+        return self._calendar
+
     def is_ready(self) -> bool:
         return self._ready
 

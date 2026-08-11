@@ -96,6 +96,14 @@ class SubscriptionScheduler:
     def _start_subscription(self, cal: list[int]) -> None:
         """启动快照订阅（先 stop 清理旧资源，再 start）。"""
         with self._action_lock:
+            # 交易日历热刷新：SDK 日历是 login 时快照，跨天后不含今天，
+            # 会导致当日 K 线查询静默返回空。每天窗口开启启动订阅时顺带刷新。
+            try:
+                refreshed = self._gw.refresh_calendar()
+                if refreshed:
+                    cal = refreshed
+            except Exception as e:
+                logger.warning("调度器刷新交易日历失败（沿用旧日历）: %s: %s", type(e).__name__, e)
             # 先清理旧的订阅资源（防止重复订阅/线程泄漏）
             try:
                 self._gw.stop_subscription()

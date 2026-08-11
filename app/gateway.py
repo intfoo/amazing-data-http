@@ -75,6 +75,7 @@ class Gateway(Protocol):
         end_date: int | None,
         period: str,
     ) -> dict[str, pd.DataFrame]: ...
+    def refresh_calendar(self) -> list[int]: ...
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]: ...
     def get_realtime_code_list(self) -> list[str]: ...
     def query_snapshot(
@@ -445,6 +446,27 @@ class AmazingDataGateway:
         """交易日历 list[int]（login 后可用，logout 后为 None）。"""
         return self._calendar
 
+    def refresh_calendar(self) -> list[int]:
+        """重新拉取交易日历并热更新到 MarketData.calendar 属性。
+
+        根因背景：SDK query_kline 用 login 时快照的 calendar 本地过滤 date_list
+        （market_data.pyc 字节码证实），日历不含查询日时 date_list 为空 →
+        零网络请求 0.000s 静默返回 {}。长运行服务跨天后必须刷新日历。
+        MarketData.calendar 是普通属性，直接赋值即热生效。
+        """
+        if not self._ready or self._base_data is None:
+            raise GatewayNotReadyError("gateway not ready")
+        with self._lock:
+            calendar = self._base_data.get_calendar()
+            self._calendar = calendar
+            if self._market_data is not None:
+                self._market_data.calendar = calendar
+            logger.info(
+                "交易日历已刷新: %d 天, 最新=%s",
+                len(calendar), calendar[-1] if calendar else None,
+            )
+            return calendar
+
     def get_code_list(self, security_type: str = "EXTRA_STOCK_A") -> list[str]:
         """获取证券代码列表，委托 BaseData.get_code_list。未就绪抛 GatewayNotReadyError。
 
@@ -612,6 +634,14 @@ class AmazingDataGateway:
         """
         if not self._ready or self._market_data is None:
             raise GatewayNotReadyError("gateway not ready")
+        # 日历过期防护：end_date 超出日历最后一天时先热刷新，否则 SDK 本地过滤后
+        # date_list 为空，0.000s 静默返回空（无网络请求、无异常，极难排查）。
+        if end_date is not None and self._calendar and end_date > self._calendar[-1]:
+            logger.info(
+                "query_kline end_date=%s 超出日历最后一天 %s，先刷新交易日历",
+                end_date, self._calendar[-1],
+            )
+            self.refresh_calendar()
         sdk_period_name = PERIOD_MAP.get(period)
         if sdk_period_name is None:
             raise GatewayQueryError(f"unsupported period: {period}")

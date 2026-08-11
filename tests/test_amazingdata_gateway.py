@@ -173,3 +173,58 @@ def test_disconnect_log_dedup():
     assert gw._should_log_disconnect("heartbeat timeout") is True
     assert gw._should_log_disconnect("heartbeat timeout") is False
     assert gw._should_log_disconnect("another error") is True
+
+
+def test_refresh_calendar_updates_market_data():
+    """refresh_calendar 应重新拉取日历并热更新到 MarketData.calendar 属性。"""
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(make_config())
+    gw._ready = True
+
+    class FakeBase:
+        def get_calendar(self):
+            return [20240102, 20240103]
+
+    class FakeMD:
+        def __init__(self):
+            self.calendar = [20240102]
+
+    gw._base_data = FakeBase()
+    gw._market_data = FakeMD()
+    gw._calendar = [20240102]
+    result = gw.refresh_calendar()
+    assert result == [20240102, 20240103]
+    assert gw._calendar == [20240102, 20240103]
+    assert gw._market_data.calendar == [20240102, 20240103]
+
+
+def test_query_kline_refreshes_stale_calendar():
+    """end_date 超出日历最后一天时，query_kline 先刷新日历再查询。
+
+    根因：SDK query_kline 用 login 时快照的 calendar 本地过滤 date_list，
+    日历过期 → date_list 空 → 0.000s 静默返回空 dict（无网络请求、无异常）。
+    """
+    import pandas as pd
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(make_config())
+    gw._ready = True
+    gw._calendar = [20240102]
+
+    class FakeBase:
+        def get_calendar(self):
+            return [20240102, 20240103]
+
+    class FakeMD:
+        def __init__(self):
+            self.calendar = [20240102]
+
+        def query_kline(self, codes, **kwargs):
+            return {"000001.SZ": pd.DataFrame({"code": ["000001.SZ"], "close": [10.3]})}
+
+    gw._base_data = FakeBase()
+    gw._market_data = FakeMD()
+    result = gw.query_kline(["000001.SZ"], 20240103, 20240103, "day")
+    assert gw._calendar == [20240102, 20240103]
+    assert "000001.SZ" in result
