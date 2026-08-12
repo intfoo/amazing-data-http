@@ -107,7 +107,7 @@ class SessionMixin:
             "ts": time.time(),
             "category": category,
             "detail": detail,
-            "events": list(self._login_events)[-20:],
+            "events": list(self._login_events),
         }
 
     @property

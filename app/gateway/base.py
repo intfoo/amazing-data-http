@@ -41,7 +41,7 @@ _CONNECTION_KEYWORDS: tuple[str, ...] = (
 _RECONNECT_COOLDOWN_SEC = 60    # 主动重连冷却（heartbeat 每 30s 报一次，避免频繁 relogin）
 _DISCONNECT_DEDUP_SEC = 300     # 相同断线 WARNING 去重窗口
 
-_RECONNECT_MAX_INTERVAL_SEC = 300   # 主动重连退避上限（Config 默认值同源）
+_RECONNECT_MAX_INTERVAL_SEC = 300   # 文档性默认值标注，实际读取 Config.reconnect_max_interval_sec
 _TGW_NOISE_PATTERNS: tuple[str, ...] = ("HandleFile", "Now use ip", "mdga.json")
 _TGW_NOISE_DEDUP_SEC = 60           # tgw 噪音日志 dedup 窗口
 

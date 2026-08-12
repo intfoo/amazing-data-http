@@ -26,13 +26,11 @@ class TgwEventMixin:
         """
 
         def _do() -> None:
-            # 同步点：等待 _schedule_reconnect 退出 _reconnect_lock 后再执行，
-            # 确保 _reconnect_in_progress=True 已对调用方可见。
+            # 阻塞同步点：等待 _schedule_reconnect 退出 _reconnect_lock 后再继续。
+            # _schedule_reconnect 在持锁状态下启动本线程，此 with 块保证调用方
+            # （tgw 回调 / 测试）在 _reconnect_in_progress=True 对其可见后才放行。
             with self._reconnect_lock:
                 pass
-            # 让出 GIL 一拍，确保调用方线程（tgw 回调 / 测试）有机会读取
-            # _reconnect_in_progress=True 后再继续重连逻辑。
-            time.sleep(0)
             try:
                 logger.info("tgw 断线触发主动重连: %s", reason)
                 with self._sdk_lock():
@@ -101,6 +99,7 @@ class TgwEventMixin:
         try:
             from AmazingData.login import tgw_login
         except ImportError:
+            logger.debug("AmazingData.login.tgw_login 不可导入，spi probe 跳过")
             return
         if getattr(tgw_login, "_spi_probe_installed", False):
             return
@@ -112,7 +111,7 @@ class TgwEventMixin:
             try:
                 gateway._last_login_spi = result[2]  # (cfg, api_mode, log_spi)
             except Exception:
-                pass
+                logger.debug("spi probe: set_cfg 返回值解包失败")
             return result
 
         tgw_login.set_cfg = probed_set_cfg
@@ -186,7 +185,6 @@ class TgwEventMixin:
                 self._login_events.append(
                     {"kind": "log", "level": level_name, "msg": msg_str[:500]}
                 )
-                del self._login_events[:-20]
 
             if any(kw in msg_str for kw in EXIT_KEYWORDS):
                 logger.error("tgw FATAL: [%s] %s (process may exit)", level_name, msg_str)
@@ -244,7 +242,6 @@ class TgwEventMixin:
                     info = " (failed to extract logon info)"
             if self._login_in_progress:
                 self._login_events.append({"kind": "logon", "msg": info[:500]})
-                del self._login_events[:-20]
             logger.warning("tgw logon event:%s", info or " (no details)")
             sys.stderr.flush()
             try:

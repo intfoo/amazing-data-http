@@ -282,10 +282,13 @@ class TestSchedulerSelfHeal:
         scheduler = SubscriptionScheduler(gw, rt, config)
         rt.set_active(False)
 
+        login_call_count = [0]
         def failing_login():
+            login_call_count[0] += 1
             raise GatewayNotReadyError("fake login fail")
 
         gw.login = failing_login
         # _tick 不应抛异常
         scheduler._tick()
+        assert login_call_count[0] == 1  # login 确实被调用了 1 次
         assert gw.sub_start_called == 0

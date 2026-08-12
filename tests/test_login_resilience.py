@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import types
 
@@ -69,8 +70,21 @@ class TestReconnectBackoff:
             exit(0)
         monkeypatch.setitem(sys.modules, "AmazingData", _fake_ad_module(fake_login))
         gw = AmazingDataGateway(_make_config())
-        gw._do_login = lambda: None  # 重连线程空调用，避免真实 login
+        # 事件门控：test 断言期间阻塞重连线程，消除 in_progress 竞态
+        gw._test_release = threading.Event()
+        def gated_do_login():
+            gw._test_release.wait(timeout=5)
+        gw._do_login = gated_do_login
         return gw
+
+    @staticmethod
+    def _wait_reconnect_done(gw, timeout=5.0):
+        """轮询等待 _reconnect_in_progress 变为 False（重连线程已退出）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not gw._reconnect_in_progress:
+                return
+            time.sleep(0.02)
 
     def test_backoff_sequence(self, monkeypatch):
         """连续失败退避 60→120→240→300 封顶。"""
@@ -81,7 +95,9 @@ class TestReconnectBackoff:
         gw._last_reconnect_attempt = now - 61
         gw._schedule_reconnect("test")
         assert gw._reconnect_in_progress is True
-        gw._reconnect_in_progress = False
+        # 放行重连线程，等待其退出（gated_do_login 立即返回 → finally 置 in_progress=False）
+        gw._test_release.set()
+        self._wait_reconnect_done(gw)
         # failures=3 → 间隔 min(60*8, 300)=300s：120s 前尝试 → 拦截
         gw._reconnect_failures = 3
         gw._last_reconnect_attempt = now - 120
@@ -89,14 +105,20 @@ class TestReconnectBackoff:
         assert gw._reconnect_in_progress is False
         # 301s 前 → 放行
         gw._last_reconnect_attempt = now - 301
+        gw._test_release.clear()
         gw._schedule_reconnect("test")
         assert gw._reconnect_in_progress is True
+        gw._test_release.set()
+        self._wait_reconnect_done(gw)
 
     def test_reconnect_attempts_counter(self, monkeypatch):
         gw = self._gw(monkeypatch)
         gw._last_reconnect_attempt = 0.0
         gw._schedule_reconnect("test")
         assert gw.reconnect_attempts == 1
+        # 放行重连线程，等待其退出，避免泄漏
+        gw._test_release.set()
+        self._wait_reconnect_done(gw)
 
 
 class TestNoiseDedup:

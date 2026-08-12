@@ -5,6 +5,7 @@
 """
 
 import threading
+from collections import deque
 
 from app.config import Config
 from app.gateway.base import (
@@ -78,5 +79,5 @@ class AmazingDataGateway(
         # 登录诊断（last_login_error / spi probe / 事件缓冲）
         self._last_login_error: dict | None = None
         self._last_login_spi = None     # set_cfg probe 捕获的 log_spi
-        self._login_events: list[dict] = []  # 登录窗口事件环形缓冲（≤20 条）
+        self._login_events: deque = deque(maxlen=20)  # 登录窗口事件环形缓冲（deque 线程安全 append/clear，自动丢弃超限）
         self._login_in_progress = False
