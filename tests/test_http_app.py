@@ -717,23 +717,58 @@ def test_shutdown_stops_watchdog():
     assert not rt_svc._watchdog_thread.is_alive()
 
 
-def test_daily_codes_exceeds_max_returns_422():
-    """codes 超过 MAX_CODES(500) 返回 422 并提示分批。"""
-    from app.http_app import MAX_CODES
+def test_daily_codes_over_500_accepted():
+    """codes 超过 500 正常处理（2026-08-13 移除 MAX_CODES=500 限制，主项目全市场批量查询需要）。"""
     gw = FakeGateway(ready=True)
     client = make_test_app(gateway=gw)
     resp = client.post("/daily", json={
-        "codes": [f"{i:06d}.SZ" for i in range(MAX_CODES + 1)],
-    })
-    assert resp.status_code == 422
-
-
-def test_daily_codes_at_max_accepted():
-    """恰好 MAX_CODES 个 codes 通过校验（SDK 查询本身用 FakeGateway 返回空）。"""
-    from app.http_app import MAX_CODES
-    gw = FakeGateway(ready=True)
-    client = make_test_app(gateway=gw)
-    resp = client.post("/daily", json={
-        "codes": [f"{i:06d}.SZ" for i in range(MAX_CODES)],
+        "codes": [f"{i:06d}.SZ" for i in range(600)],
     })
     assert resp.status_code == 200
+    assert resp.json() == {"data": []}
+
+
+# ---------------------------------------------------------------------------
+# 启动后市场代码表检测刷新（universe-refresh 后台线程）
+# ---------------------------------------------------------------------------
+
+def test_startup_refreshes_universe_once():
+    """启动登录成功后，后台线程检测刷新一次市场代码表。"""
+    import time as _time
+    gw = FakeGateway(ready=True, calendar=_today_cal())
+    calls = []
+    orig = gw.get_realtime_universe
+
+    def counting():
+        calls.append(1)
+        return orig()
+
+    gw.get_realtime_universe = counting
+    # 窗口设在 23:58-23:59（非窗口期），调度器 tick 不会拉代码表，
+    # 若调用发生必来自 universe-refresh 线程
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                    subscription_open="23:58", subscription_close="23:59")
+    app = create_app(config=config, gateway=gw)
+    with TestClient(app):
+        deadline = _time.time() + 5
+        while not calls and _time.time() < deadline:
+            _time.sleep(0.02)
+    assert calls
+
+
+def test_startup_universe_refresh_failure_does_not_crash():
+    """检测刷新失败只告警，应用正常启动（调度器后续重试）。"""
+    import time as _time
+    gw = FakeGateway(ready=True, calendar=_today_cal())
+
+    def _boom():
+        raise RuntimeError("simulated refresh failure")
+
+    gw.get_realtime_universe = _boom
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                    subscription_open="23:58", subscription_close="23:59")
+    app = create_app(config=config, gateway=gw)
+    with TestClient(app) as client:
+        _time.sleep(0.3)  # 给 universe-refresh 线程执行时间（异常应被吞）
+        resp = client.get("/health")
+        assert resp.status_code in (200, 503)

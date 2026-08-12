@@ -11,6 +11,7 @@
 import asyncio
 import logging
 import threading
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -89,11 +90,8 @@ def _align_uvicorn_log_format() -> None:
             ))
 
 
-MAX_CODES = 500  # 单请求 codes 上限，超出 422 提示分批（防大响应打爆内存）
-
-
 class _CodesRequest(BaseModel):
-    """含 codes 列表的请求基类：非空 + 上限校验。"""
+    """含 codes 列表的请求基类：非空校验。"""
 
     codes: list[str]
 
@@ -102,8 +100,6 @@ class _CodesRequest(BaseModel):
     def codes_valid(cls, v):
         if not v or len(v) == 0:
             raise ValueError("codes must be a non-empty array")
-        if len(v) > MAX_CODES:
-            raise ValueError(f"codes exceeds max allowed ({MAX_CODES}), please split into batches")
         return v
 
 
@@ -233,6 +229,26 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 scheduler = SubscriptionScheduler(gateway, realtime_service, config)
                 app.state.subscription_scheduler = scheduler
                 scheduler.start()
+                # 启动完成后后台检测刷新一次市场代码表：9 点后首次获取会刷新当日缓存
+                # （调度器盘中重启直接命中），同时验证 get_code_list 链路可用。
+                # 失败只告警不影响启动（调度器 tick 会重试）。
+                def _refresh_universe_once():
+                    try:
+                        t0 = time.monotonic()
+                        universe = gateway.get_realtime_universe()
+                        logger.info(
+                            "启动后市场代码表检测刷新完成: %d 只 (%.3fs)",
+                            len(universe), time.monotonic() - t0,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "启动后市场代码表检测刷新失败（调度器将重试）: %s: %s",
+                            type(e).__name__, e,
+                        )
+
+                threading.Thread(
+                    target=_refresh_universe_once, daemon=True, name="universe-refresh",
+                ).start()
             except Exception as e:
                 logger.error("启动登录失败: %s: %s", type(e).__name__, e)
         else:
