@@ -130,3 +130,17 @@ class TestNoneCalendarFallback:
         """跨日残留 calendar（不含今天）+ 工作日 → weekday 兜底 True。"""
         wed = datetime.datetime(2026, 8, 12, 14, 0)
         assert is_subscription_window(wed, [20260811]) is True
+
+
+def test_is_subscription_window_accepts_aware_datetime_and_set():
+    """tz-aware now + frozenset calendar 与 naive+list 行为一致。"""
+    from zoneinfo import ZoneInfo
+    from app.subscription_schedule import is_subscription_window
+    cal_list = [20260812]  # 2026-08-12 周三
+    cal_set = frozenset(cal_list)
+    naive = datetime.datetime(2026, 8, 12, 10, 0)
+    aware = datetime.datetime(2026, 8, 12, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert is_subscription_window(naive, cal_list) == is_subscription_window(aware, cal_set)
+    assert is_subscription_window(aware, cal_set) is True
+    outside = datetime.datetime(2026, 8, 12, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert is_subscription_window(outside, cal_set) is False

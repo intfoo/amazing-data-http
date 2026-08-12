@@ -18,10 +18,11 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.config import Config
 from app.errors import (
-    AppError, INTERNAL_ERROR, INVALID_REQUEST, REALTIME_SUBSCRIPTION_FAILED,
+    AppError, INTERNAL_ERROR, INVALID_REQUEST,
     RequestIdMiddleware, SDK_NOT_READY, SDK_QUERY_FAILED, SERIALIZATION_FAILED,
     SERVICE_BUSY, get_request_id,
 )
@@ -88,52 +89,47 @@ def _align_uvicorn_log_format() -> None:
             ))
 
 
-class DailyRequest(BaseModel):
-    """POST /daily 请求体。字段名与主项目自定义数据源协议一致。"""
+MAX_CODES = 500  # 单请求 codes 上限，超出 422 提示分批（防大响应打爆内存）
 
-    codes: list[str]                # 股票代码列表，如 ["000001.SZ", "600000.SH"]
-    start_time: str | None = None   # 开始日期，YYYY-MM-DD 或 ISO datetime（如 2024-01-01T00:00:00）；可选
-    end_time: str | None = None     # 结束日期，同上；可选
+
+class _CodesRequest(BaseModel):
+    """含 codes 列表的请求基类：非空 + 上限校验。"""
+
+    codes: list[str]
 
     @field_validator("codes")
     @classmethod
-    def codes_nonempty(cls, v):
-        """codes 必须是非空数组，Pydantic 校验失败自动返回 422。"""
+    def codes_valid(cls, v):
         if not v or len(v) == 0:
             raise ValueError("codes must be a non-empty array")
+        if len(v) > MAX_CODES:
+            raise ValueError(f"codes exceeds max allowed ({MAX_CODES}), please split into batches")
         return v
 
 
-class MinuteRequest(BaseModel):
+class DailyRequest(_CodesRequest):
+    """POST /daily 请求体。字段名与主项目自定义数据源协议一致。"""
+
+    # codes 必须是非空数组，Pydantic 校验失败自动返回 422。
+    start_time: str | None = None   # 开始日期，YYYY-MM-DD 或 ISO datetime（如 2024-01-01T00:00:00）；可选
+    end_time: str | None = None     # 结束日期，同上；可选
+
+
+class MinuteRequest(_CodesRequest):
     """POST /minute 请求体。period 可选，默认 min1。"""
 
-    codes: list[str]
+    # codes 必须是非空数组，Pydantic 校验失败自动返回 422。
     period: str | None = None
     start_time: str | None = None
     end_time: str | None = None
 
-    @field_validator("codes")
-    @classmethod
-    def codes_nonempty(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError("codes must be a non-empty array")
-        return v
 
-
-class AdjFactorRequest(BaseModel):
+class AdjFactorRequest(_CodesRequest):
     """POST /adj_factor 请求体。字段名与 /daily 一致，由外部项目 YAML field_map 适配。"""
 
-    codes: list[str]                # 股票代码列表，如 ["000001.SZ", "600000.SH"]
+    # codes 必须是非空数组，Pydantic 校验失败自动返回 422。
     start_time: str | None = None   # 开始日期，YYYY-MM-DD 或 ISO datetime；可选
     end_time: str | None = None     # 结束日期，同上；可选
-
-    @field_validator("codes")
-    @classmethod
-    def codes_nonempty(cls, v):
-        """codes 必须是非空数组，Pydantic 校验失败自动返回 422。"""
-        if not v or len(v) == 0:
-            raise ValueError("codes must be a non-empty array")
-        return v
 
 
 class EtfNetInflowRequest(BaseModel):
@@ -150,7 +146,7 @@ class SdkGate:
     线程安全：内部 threading.Lock，持锁时间极短（仅计数器增减）。
     """
 
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(self, max_concurrent: int = 2):
         self._max = max_concurrent
         self._active = 0
         self._lock = threading.Lock()
@@ -167,6 +163,37 @@ class SdkGate:
             self._active = max(0, self._active - 1)
 
 
+async def _run_sdk_endpoint(app: FastAPI, fn, *args, **kwargs) -> dict:
+    """SDK 查询端点公共执行路径：并发闸门 + 线程池卸载 + 统一异常映射。
+
+    只做 gate/to_thread/异常映射；各端点的请求日志与参数前置校验留在端点函数内。
+    异常映射：ValueError→422 / GatewayNotReadyError→503 / GatewayQueryError→502 /
+    TypeError·OverflowError(serialize/json)→502 / 其余→500。
+    """
+    if not app.state.sdk_gate.try_acquire():
+        raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
+    try:
+        data = await asyncio.to_thread(fn, *args, **kwargs)
+        return {"data": data}
+    except AppError:
+        raise
+    except ValueError as e:
+        raise AppError(INVALID_REQUEST, str(e), 422)
+    except GatewayNotReadyError as e:
+        raise AppError(SDK_NOT_READY, str(e), 503)
+    except GatewayQueryError as e:
+        raise AppError(SDK_QUERY_FAILED, str(e), 502)
+    except (TypeError, OverflowError) as e:
+        if "serialize" in str(e).lower() or "json" in str(e).lower():
+            raise AppError(SERIALIZATION_FAILED, str(e), 502)
+        raise AppError(INTERNAL_ERROR, str(e), 500)
+    except Exception as e:
+        logger.error("未处理异常: %s: %s", type(e).__name__, e)
+        raise AppError(INTERNAL_ERROR, str(e), 500)
+    finally:
+        app.state.sdk_gate.release()
+
+
 def create_app(config: Config | None = None, gateway: Gateway | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
@@ -181,7 +208,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     kline_service = KlineService(gateway)
     realtime_service = RealtimeService(gateway)
     adj_factor_service = AdjFactorService(gateway)
-    etf_flow_service = EtfFlowService(gateway)
+    etf_flow_service = EtfFlowService(gateway, cache_ttl_sec=config.etf_flow_cache_ttl_sec)
     health_service = HealthService(config, gateway, realtime_service)
 
     @asynccontextmanager
@@ -236,6 +263,8 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     # AuthMiddleware 才能在 401 响应中读到正确 request_id（顺序写反则 401 的 request_id 恒为 "unknown"）。
     app.add_middleware(AuthMiddleware, token=config.auth_token, enabled=config.auth_required)
     app.add_middleware(RequestIdMiddleware)
+    # GZip 最后 add = 最外层（insert(0) 语义），压缩位于传输最外层
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     app.state.config = config
     app.state.gateway = gateway
@@ -264,32 +293,9 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         logger.info("request_id=%s /daily codes=%d %s..%s",
                     get_request_id(request), len(req.codes),
                     req.start_time or "(default)", req.end_time or "(default)")
-        if not app.state.sdk_gate.try_acquire():
-            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
-        try:
-            # kline_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
-            data = await asyncio.to_thread(
-                kline_service.query, req.codes, req.start_time, req.end_time
-            )
-            return {"data": data}
-        except AppError:
-            raise
-        except ValueError as e:
-            # to_sdk_date 校验失败
-            raise AppError(INVALID_REQUEST, str(e), 422)
-        except GatewayNotReadyError as e:
-            raise AppError(SDK_NOT_READY, str(e), 503)
-        except GatewayQueryError as e:
-            raise AppError(SDK_QUERY_FAILED, str(e), 502)
-        except (TypeError, OverflowError) as e:
-            if "serialize" in str(e).lower() or "json" in str(e).lower():
-                raise AppError(SERIALIZATION_FAILED, str(e), 502)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        except Exception as e:
-            logger.error("未处理异常: %s: %s", type(e).__name__, e)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        finally:
-            app.state.sdk_gate.release()
+        return await _run_sdk_endpoint(
+            app, kline_service.query, req.codes, req.start_time, req.end_time
+        )
 
     @app.post("/minute")
     async def minute(req: MinuteRequest, request: Request):
@@ -300,31 +306,9 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         logger.info("request_id=%s /minute codes=%d period=%s %s..%s",
                     get_request_id(request), len(req.codes), period,
                     req.start_time or "(default)", req.end_time or "(default)")
-        if not app.state.sdk_gate.try_acquire():
-            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
-        try:
-            # kline_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
-            data = await asyncio.to_thread(
-                kline_service.query, req.codes, req.start_time, req.end_time, period=period
-            )
-            return {"data": data}
-        except AppError:
-            raise
-        except ValueError as e:
-            raise AppError(INVALID_REQUEST, str(e), 422)
-        except GatewayNotReadyError as e:
-            raise AppError(SDK_NOT_READY, str(e), 503)
-        except GatewayQueryError as e:
-            raise AppError(SDK_QUERY_FAILED, str(e), 502)
-        except (TypeError, OverflowError) as e:
-            if "serialize" in str(e).lower() or "json" in str(e).lower():
-                raise AppError(SERIALIZATION_FAILED, str(e), 502)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        except Exception as e:
-            logger.error("未处理异常: %s: %s", type(e).__name__, e)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        finally:
-            app.state.sdk_gate.release()
+        return await _run_sdk_endpoint(
+            app, kline_service.query, req.codes, req.start_time, req.end_time, period=period
+        )
 
     @app.post("/adj_factor")
     async def adj_factor(req: AdjFactorRequest, request: Request):
@@ -336,31 +320,9 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         logger.info("request_id=%s /adj_factor codes=%d %s..%s",
                     get_request_id(request), len(req.codes),
                     req.start_time or "(default)", req.end_time or "(default)")
-        if not app.state.sdk_gate.try_acquire():
-            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
-        try:
-            # adj_factor_service.query 是同步阻塞 SDK 调用，放线程池避免阻塞 event loop
-            data = await asyncio.to_thread(
-                app.state.adj_factor_service.query, req.codes, req.start_time, req.end_time
-            )
-            return {"data": data}
-        except AppError:
-            raise
-        except ValueError as e:
-            raise AppError(INVALID_REQUEST, str(e), 422)
-        except GatewayNotReadyError as e:
-            raise AppError(SDK_NOT_READY, str(e), 503)
-        except GatewayQueryError as e:
-            raise AppError(SDK_QUERY_FAILED, str(e), 502)
-        except (TypeError, OverflowError) as e:
-            if "serialize" in str(e).lower() or "json" in str(e).lower():
-                raise AppError(SERIALIZATION_FAILED, str(e), 502)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        except Exception as e:
-            logger.error("未处理异常: %s: %s", type(e).__name__, e)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        finally:
-            app.state.sdk_gate.release()
+        return await _run_sdk_endpoint(
+            app, app.state.adj_factor_service.query, req.codes, req.start_time, req.end_time
+        )
 
     @app.post("/etf/net_inflow")
     async def etf_net_inflow(req: EtfNetInflowRequest, request: Request):
@@ -372,30 +334,9 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
         logger.info("request_id=%s /etf/net_inflow %s..%s",
                     get_request_id(request),
                     req.start_time or "(default)", req.end_time or "(default)")
-        if not app.state.sdk_gate.try_acquire():
-            raise AppError(SERVICE_BUSY, "SDK concurrency limit reached, try again later", 503)
-        try:
-            data = await asyncio.to_thread(
-                app.state.etf_flow_service.query, req.start_time, req.end_time
-            )
-            return {"data": data}
-        except AppError:
-            raise
-        except ValueError as e:
-            raise AppError(INVALID_REQUEST, str(e), 422)
-        except GatewayNotReadyError as e:
-            raise AppError(SDK_NOT_READY, str(e), 503)
-        except GatewayQueryError as e:
-            raise AppError(SDK_QUERY_FAILED, str(e), 502)
-        except (TypeError, OverflowError) as e:
-            if "serialize" in str(e).lower() or "json" in str(e).lower():
-                raise AppError(SERIALIZATION_FAILED, str(e), 502)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        except Exception as e:
-            logger.error("未处理异常: %s: %s", type(e).__name__, e)
-            raise AppError(INTERNAL_ERROR, str(e), 500)
-        finally:
-            app.state.sdk_gate.release()
+        return await _run_sdk_endpoint(
+            app, app.state.etf_flow_service.query, req.start_time, req.end_time
+        )
 
     @app.get("/realtime")
     async def realtime(request: Request, codes: str | None = None, types: str | None = None):

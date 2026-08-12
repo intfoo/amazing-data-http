@@ -235,8 +235,11 @@ def test_call_sdk_with_timeout_raises_on_hang():
     import time as _t
     from app.gateway import AmazingDataGateway, GatewayQueryError
 
-    with pytest.raises(GatewayQueryError, match="timed out"):
-        AmazingDataGateway._call_sdk_with_timeout(lambda: _t.sleep(5), 0.1, "probe")
+    gw = AmazingDataGateway.__new__(AmazingDataGateway)  # 绕过 __init__（避免建目录/依赖 Config）
+    gw._ready = True
+    gw._schedule_reconnect = lambda reason: None  # 桩掉重连调度
+    with pytest.raises(GatewayQueryError, match="无响应"):
+        gw._call_sdk_with_timeout(lambda: _t.sleep(5), 0.1, "probe")
 
 
 def test_call_sdk_with_timeout_passthrough_error():
@@ -246,8 +249,28 @@ def test_call_sdk_with_timeout_passthrough_error():
     def _boom():
         raise ValueError("boom")
 
+    gw = AmazingDataGateway.__new__(AmazingDataGateway)  # 绕过 __init__（避免建目录/依赖 Config）
+    gw._ready = True
+    gw._schedule_reconnect = lambda reason: None  # 桩掉重连调度
     with pytest.raises(ValueError, match="boom"):
-        AmazingDataGateway._call_sdk_with_timeout(_boom, 1, "probe")
+        gw._call_sdk_with_timeout(_boom, 1, "probe")
+
+
+def test_call_sdk_with_timeout_marks_not_ready_and_schedules_reconnect():
+    """超时后：_ready 置 False、触发 _schedule_reconnect、消息不含连接关键词。"""
+    import time
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway.__new__(AmazingDataGateway)
+    gw._ready = True
+    calls = []
+    gw._schedule_reconnect = lambda reason: calls.append(reason)
+    with pytest.raises(GatewayQueryError) as exc_info:
+        gw._call_sdk_with_timeout(lambda: time.sleep(5), 0.1, "hang-test")
+    assert gw._ready is False
+    assert calls and "hang-test" in calls[0]
+    msg = str(exc_info.value).lower()
+    assert "timeout" not in msg and "timed out" not in msg  # 防 _is_connection_error 误匹配
 
 
 def test_get_adj_factor_none_fallback_to_remote():

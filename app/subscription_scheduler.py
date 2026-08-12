@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import datetime
 import logging
 import threading
 import time
@@ -22,7 +21,7 @@ import time
 from app.config import Config
 from app.gateway import Gateway
 from app.realtime_service import RealtimeService
-from app.subscription_schedule import is_subscription_window
+from app.subscription_schedule import is_subscription_window, now_cn
 
 logger = logging.getLogger("amazingdata.scheduler")
 
@@ -76,8 +75,8 @@ class SubscriptionScheduler:
 
     def _tick(self) -> None:
         """单次调度检查。"""
-        now = datetime.datetime.now()
-        cal = self._gw.calendar
+        now = now_cn()
+        cal = self._gw.calendar_set
         in_window = is_subscription_window(
             now, cal,
             open_time=self._config.subscription_open,

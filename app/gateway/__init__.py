@@ -63,6 +63,7 @@ class AmazingDataGateway(
         self._ready = False       # 是否已登录且 MarketData 就绪
         self._base_data = None      # ad.BaseData 实例（供 get_code_list）
         self._calendar = None       # 交易日历 list[int]（供 query_snapshot 默认日期）
+        self._calendar_set: frozenset = frozenset()  # calendar 的 set 形态（窗口判定 O(1) 成员检查）
         self._subscribe_data = None  # ad.SubscribeData 实例
         self._sub_thread = None      # 订阅 daemon 线程
         self._adj_factor_local_path = resolve_adj_factor_local_path(config.adj_factor_local_path)

@@ -14,6 +14,10 @@ class FakeGW:
     def calendar(self):
         return self._calendar
 
+    @property
+    def calendar_set(self) -> frozenset:
+        return frozenset(self._calendar) if self._calendar else frozenset()
+
     def refresh_calendar(self):
         self.refresh_called += 1
         self._calendar = [20240101, 20240102]

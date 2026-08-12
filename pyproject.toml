@@ -9,6 +9,7 @@ dependencies = [
     "pandas>=2.2",
     "numpy>=2.0",
     "tables>=3.11.1",
+    "tzdata>=2024.1",  # Windows 本地运行 zoneinfo 需要；pandas 已间接依赖，此处显式声明
 ]
 
 [project.optional-dependencies]

@@ -65,6 +65,10 @@ class FakeGateway:
         return self._calendar
 
     @property
+    def calendar_set(self) -> frozenset:
+        return frozenset(self._calendar) if self._calendar else frozenset()
+
+    @property
     def last_login_error(self):
         return self._last_login_error
 

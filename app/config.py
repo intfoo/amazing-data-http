@@ -4,8 +4,23 @@
 配置缺失时进程仍可启动（/health 返回 503），以便 Docker 日志暴露诊断信息。
 """
 
+import logging
 import os
 from dataclasses import dataclass
+
+logger = logging.getLogger("amazingdata.config")
+
+
+def _env_int(name: str, default: int) -> int:
+    """读取 int 型环境变量。缺失/空串用默认值；非法值 warning 后回退默认值（不崩溃）。"""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("环境变量 %s=%r 不是合法整数，使用默认值 %d", name, raw, default)
+        return default
 
 
 @dataclass(frozen=True)
@@ -18,7 +33,7 @@ class Config:
     port: int            # AmazingData/tgw 服务器端口
     http_host: str = "0.0.0.0"  # HTTP 监听地址，默认全网卡
     http_port: int = 3021       # HTTP 监听端口
-    sdk_max_concurrent: int = 5  # SDK 最大并发调用数，超出返回 503
+    sdk_max_concurrent: int = 2  # SDK 最大并发调用数（SDK 调用全局串行，此值只决定排队深度），超出返回 503
     adj_factor_local_path: str = ""  # SDK get_adj_factor 的 local_path 参数，必须为绝对路径
     adj_factor_is_local: bool = False  # SDK get_adj_factor 的 is_local：False=每次远程取最新，True=本地优先无则远程
     fund_local_path: str = ""    # SDK get_fund_share/get_fund_nav 的 local_path，必须为绝对路径
@@ -32,6 +47,7 @@ class Config:
     calendar_fallback_weekday: bool = True  # 日历不含今天时用 weekday 兜底（周一~周五视为交易日）
     reconnect_max_interval_sec: int = 300  # tgw 主动重连退避上限（秒）
     stale_max_age_sec: int = 300           # /realtime 订阅缓存 stale 上限（秒），超过走 fallback
+    etf_flow_cache_ttl_sec: int = 300  # /etf/net_inflow 结果缓存 TTL（秒），份额 T+1 更新无 freshness 风险
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -40,10 +56,10 @@ class Config:
             username=os.environ.get("AMAZINGDATA_USERNAME", ""),
             password=os.environ.get("AMAZINGDATA_PASSWORD", ""),
             ip=os.environ.get("AMAZINGDATA_HOST", ""),
-            port=int(os.environ.get("AMAZINGDATA_PORT", "0") or "0"),
+            port=_env_int("AMAZINGDATA_PORT", 0),
             http_host=os.environ.get("HTTP_HOST", "0.0.0.0") or "0.0.0.0",
-            http_port=int(os.environ.get("HTTP_PORT", "3021") or "3021"),
-            sdk_max_concurrent=int(os.environ.get("SDK_MAX_CONCURRENT", "5") or "5"),
+            http_port=_env_int("HTTP_PORT", 3021),
+            sdk_max_concurrent=_env_int("SDK_MAX_CONCURRENT", 2),
             adj_factor_local_path=os.environ.get("ADJ_FACTOR_LOCAL_PATH", "") or "",
             adj_factor_is_local=os.environ.get("ADJ_FACTOR_IS_LOCAL", "false").lower()
             in ("1", "true", "yes", "on"),
@@ -55,12 +71,13 @@ class Config:
             in ("1", "true", "yes", "on"),
             subscription_open=os.environ.get("SUBSCRIPTION_OPEN", "09:00") or "09:00",
             subscription_close=os.environ.get("SUBSCRIPTION_CLOSE", "15:20") or "15:20",
-            stale_threshold_sec=int(os.environ.get("STALE_THRESHOLD_SEC", "90") or "90"),
-            watchdog_interval_sec=int(os.environ.get("WATCHDOG_INTERVAL_SEC", "60") or "60"),
+            stale_threshold_sec=_env_int("STALE_THRESHOLD_SEC", 90),
+            watchdog_interval_sec=_env_int("WATCHDOG_INTERVAL_SEC", 60),
             calendar_fallback_weekday=os.environ.get("CALENDAR_FALLBACK_WEEKDAY", "true").lower()
             in ("1", "true", "yes", "on"),
-            reconnect_max_interval_sec=int(os.environ.get("RECONNECT_MAX_INTERVAL_SEC", "300") or "300"),
-            stale_max_age_sec=int(os.environ.get("STALE_MAX_AGE_SEC", "300") or "300"),
+            reconnect_max_interval_sec=_env_int("RECONNECT_MAX_INTERVAL_SEC", 300),
+            stale_max_age_sec=_env_int("STALE_MAX_AGE_SEC", 300),
+            etf_flow_cache_ttl_sec=_env_int("ETF_FLOW_CACHE_TTL_SEC", 300),
         )
 
     def is_configured(self) -> bool:

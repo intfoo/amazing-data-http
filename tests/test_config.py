@@ -39,7 +39,7 @@ def test_config_reads_sdk_max_concurrent(monkeypatch):
 def test_config_default_sdk_max_concurrent(monkeypatch):
     monkeypatch.delenv("SDK_MAX_CONCURRENT", raising=False)
     cfg = Config.from_env()
-    assert cfg.sdk_max_concurrent == 5
+    assert cfg.sdk_max_concurrent == 2
 
 
 def test_config_default_adj_factor_local_path(monkeypatch):
@@ -104,3 +104,19 @@ def test_config_reads_calendar_fallback_weekday(monkeypatch):
     monkeypatch.setenv("CALENDAR_FALLBACK_WEEKDAY", "false")
     cfg = Config.from_env()
     assert cfg.calendar_fallback_weekday is False
+
+
+def test_config_malformed_int_env_falls_back(monkeypatch):
+    """畸形 int 环境变量不崩溃，warning 后回退默认值。"""
+    monkeypatch.setenv("AMAZINGDATA_PORT", "not-a-number")
+    monkeypatch.setenv("SDK_MAX_CONCURRENT", "abc")
+    cfg = Config.from_env()
+    assert cfg.port == 0
+    assert cfg.sdk_max_concurrent == 2
+
+
+def test_config_etf_flow_cache_ttl(monkeypatch):
+    monkeypatch.delenv("ETF_FLOW_CACHE_TTL_SEC", raising=False)
+    assert Config.from_env().etf_flow_cache_ttl_sec == 300
+    monkeypatch.setenv("ETF_FLOW_CACHE_TTL_SEC", "600")
+    assert Config.from_env().etf_flow_cache_ttl_sec == 600

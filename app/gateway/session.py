@@ -51,6 +51,7 @@ class SessionMixin:
             self._base_data = base
             calendar = base.get_calendar()
             self._calendar = calendar
+            self._calendar_set = frozenset(calendar or [])
             self._market_data = ad.MarketData(calendar)
             self._info_data = ad.InfoData()
             self._ready = True
@@ -97,6 +98,7 @@ class SessionMixin:
         self._info_data = None
         if clear_calendar:
             self._calendar = None
+            self._calendar_set = frozenset()
 
     def _build_last_login_error(self, category: str, detail: str) -> None:
         """构建登录失败诊断：spi max_limitation 升级分类 + 登录窗口事件缓冲。"""
@@ -124,6 +126,11 @@ class SessionMixin:
         """交易日历 list[int]（login 后可用，logout 后为 None）。"""
         return self._calendar
 
+    @property
+    def calendar_set(self) -> frozenset:
+        """交易日历的 frozenset 形态（O(1) 成员检查）。空日历返回空 frozenset。"""
+        return self._calendar_set
+
     def refresh_calendar(self) -> list[int]:
         """重新拉取交易日历并热更新到 MarketData.calendar 属性。
 
@@ -137,6 +144,7 @@ class SessionMixin:
         with self._sdk_lock():
             calendar = self._base_data.get_calendar()
             self._calendar = calendar
+            self._calendar_set = frozenset(calendar or [])
             if self._market_data is not None:
                 self._market_data.calendar = calendar
             logger.info(

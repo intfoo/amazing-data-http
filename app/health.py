@@ -4,10 +4,8 @@
 响应体不含密码或连接凭据，可安全暴露给 Docker healthcheck。
 """
 
-import datetime
-
 from app.gateway import Gateway
-from app.subscription_schedule import is_subscription_window
+from app.subscription_schedule import is_subscription_window, now_cn
 
 
 class HealthService:
@@ -24,8 +22,8 @@ class HealthService:
         if rt_svc.is_active():
             return "active"
         # inactive 分情况
-        now = datetime.datetime.now()
-        cal = self._gw.calendar
+        now = now_cn()
+        cal = self._gw.calendar_set
         if not cal or not is_subscription_window(
             now, cal,
             open_time=self._config.subscription_open,
@@ -73,8 +71,8 @@ class HealthService:
         """快捷判断：配置完整 + SDK 就绪 + 窗口期内订阅活跃。/health 据此返回 200 或 503。"""
         if not (self._config.is_configured() and self._gw.is_ready()):
             return False
-        now = datetime.datetime.now()
-        cal = self._gw.calendar
+        now = now_cn()
+        cal = self._gw.calendar_set
         if cal and is_subscription_window(
             now, cal,
             open_time=self._config.subscription_open,

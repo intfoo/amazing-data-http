@@ -5,7 +5,6 @@ request_id 贯穿日志和响应，便于从 HTTP 响应反查服务端日志。
 """
 
 import uuid
-from typing import Optional
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware

@@ -715,3 +715,25 @@ def test_shutdown_stops_watchdog():
     assert rt_svc._stop_flag.is_set()
     rt_svc._watchdog_thread.join(timeout=2)
     assert not rt_svc._watchdog_thread.is_alive()
+
+
+def test_daily_codes_exceeds_max_returns_422():
+    """codes 超过 MAX_CODES(500) 返回 422 并提示分批。"""
+    from app.http_app import MAX_CODES
+    gw = FakeGateway(ready=True)
+    client = make_test_app(gateway=gw)
+    resp = client.post("/daily", json={
+        "codes": [f"{i:06d}.SZ" for i in range(MAX_CODES + 1)],
+    })
+    assert resp.status_code == 422
+
+
+def test_daily_codes_at_max_accepted():
+    """恰好 MAX_CODES 个 codes 通过校验（SDK 查询本身用 FakeGateway 返回空）。"""
+    from app.http_app import MAX_CODES
+    gw = FakeGateway(ready=True)
+    client = make_test_app(gateway=gw)
+    resp = client.post("/daily", json={
+        "codes": [f"{i:06d}.SZ" for i in range(MAX_CODES)],
+    })
+    assert resp.status_code == 200

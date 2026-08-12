@@ -9,6 +9,14 @@ calendar_fallback_weekday=True 时用 weekday 兜底（周一~周五视为交易
 """
 
 import datetime
+from zoneinfo import ZoneInfo
+
+_CN_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def now_cn() -> datetime.datetime:
+    """当前时间（Asia/Shanghai，tz-aware）。窗口判定统一用显式时区，不依赖系统 TZ。"""
+    return datetime.datetime.now(_CN_TZ)
 
 
 def parse_hhmm(s: str) -> datetime.time:

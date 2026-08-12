@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import pandas as pd
 
-from app.subscription_schedule import is_subscription_window
+from app.subscription_schedule import is_subscription_window, now_cn
 
 from app.gateway import GatewayNotReadyError
 from app.serializer import serialize_dataframe, serialize_value
@@ -47,6 +47,7 @@ class RealtimeService:
         self._active = False
         self._fallback_cache: list[dict] | None = None  # query_snapshot fallback 缓存
         self._fallback_time: float = 0
+        self._fallback_codes: set[str] = set()  # fallback 缓存覆盖的 codes（TTL 命中判定用）
         # singleflight 锁：保证同一时刻只有一个 fallback query_snapshot 在跑。
         # 全市场 query_snapshot 可能数分钟，并发请求若各自发起查询会堆积抢 gateway._lock，
         # 导致整个服务雪崩。改为：第一个请求查，期间其他请求返回旧缓存/空，不阻塞。
@@ -152,7 +153,7 @@ class RealtimeService:
             return True
         calendar, open_time, close_time, fallback = self._window_params
         return is_subscription_window(
-            datetime.datetime.now(), calendar, open_time, close_time, fallback,
+            now_cn(), calendar, open_time, close_time, fallback,
         )
 
     def set_type_map(self, mapping: dict[str, str]) -> None:
@@ -209,8 +210,11 @@ class RealtimeService:
         self._watchdog_thread.start()
 
     def stop_watchdog(self) -> None:
-        """优雅停止 watchdog。lifespan shutdown 时调用。"""
+        """优雅停止 watchdog。set flag 后 join 旧线程，确保 start_watchdog 时旧线程必死（防双线程/旧参数复跑）。"""
         self._stop_flag.set()
+        t = self._watchdog_thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2)
 
     def _watchdog_loop(
         self,
@@ -227,7 +231,7 @@ class RealtimeService:
                 break
             if not self._active:
                 break
-            now = datetime.datetime.now()
+            now = now_cn()
             if not is_subscription_window(
                 now, calendar, open_time, close_time, calendar_fallback_weekday,
             ):
@@ -283,7 +287,9 @@ class RealtimeService:
             return []
         now = time.time()
         # 1. 缓存有效 → 直接返回过滤结果
-        if self._fallback_cache is not None and now - self._fallback_time <= FALLBACK_TTL:
+        if (self._fallback_cache is not None
+                and now - self._fallback_time <= FALLBACK_TTL
+                and set(codes) <= self._fallback_codes):
             return self._filter_fallback(codes, types)
         # 2. 缓存过期/空 → 非阻塞抢 singleflight 锁
         if not self._fallback_lock.acquire(blocking=False):
@@ -297,7 +303,9 @@ class RealtimeService:
         try:
             # 双检：抢锁期间可能已被其他请求填充缓存
             now = time.time()
-            if self._fallback_cache is not None and now - self._fallback_time <= FALLBACK_TTL:
+            if (self._fallback_cache is not None
+                    and now - self._fallback_time <= FALLBACK_TTL
+                    and set(codes) <= self._fallback_codes):
                 return self._filter_fallback(codes, types)
             # codes 此处必非空（无 codes 已在方法开头短路返回），直接用作查询列表
             try:
@@ -319,7 +327,14 @@ class RealtimeService:
                 records = serialize_dataframe(merged)
             else:
                 records = []
-            self._fallback_cache = records
+            # 按 code 合并进缓存（新记录覆盖同 code 旧记录），避免异 codes 请求互相挤掉缓存。
+            # 写序：先 _fallback_cache 后 _fallback_codes（引用赋值原子；读侧误判 miss 仅多查一次）。
+            # 合并后 TTL 对旧条目一并续期，属可接受简化。
+            merged_records = {r.get("code"): r for r in (self._fallback_cache or [])}
+            for r in records:
+                merged_records[r.get("code")] = r
+            self._fallback_cache = list(merged_records.values())
+            self._fallback_codes |= set(codes)
             self._fallback_time = time.time()
             logger.info("fallback query_snapshot 已缓存: %d 条", len(records))
         finally:
@@ -372,7 +387,10 @@ class RealtimeService:
     def _build_extract_fn(data):
         """根据 data 类型构建字段提取函数（首次调用，结果可缓存）。"""
         if dataclasses.is_dataclass(data):
-            return dataclasses.asdict
+            # 浅拷贝字段提取：asdict 是递归深拷贝，全市场高频推送热路径开销大。
+            # 前提：SDK Snapshot 字段全为标量/datetime（probe 样本为扁平结构），
+            # 嵌套对象由 serialize_value 原样透传（若出现会在 JSON 层暴露，届时再处理）。
+            return lambda d: {f.name: getattr(d, f.name) for f in dataclasses.fields(d)}
         if hasattr(data, "__dict__"):
             return lambda d: dict(vars(d))
         slots = []

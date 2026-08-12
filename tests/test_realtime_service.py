@@ -731,3 +731,83 @@ def test_clear_cache_clears_type_map():
     # clear_cache 后类型映射被清空
     svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
     assert svc.snapshot()[0]["security_type"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# fallback 缓存 codes 维度 + watchdog join（#3 #6）
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_cache_misses_uncovered_codes():
+    """TTL 内请求缓存未覆盖的 codes 必须穿透查询，不得返回错误的空结果。"""
+    import pandas as pd
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    calls = []
+
+    def fake_query(codes, **kw):
+        calls.append(list(codes))
+        return {
+            code: pd.DataFrame({
+                "code": [code],
+                "last": [10.0 if code == "000001.SZ" else 20.0],
+                "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+            })
+            for code in codes
+        }
+
+    gw.query_snapshot = fake_query
+    # 第一次查 000001.SZ → 查询 1 次，返回 1 条
+    r1 = svc.fallback_snapshot(["000001.SZ"])
+    assert len(r1) == 1
+    assert r1[0]["code"] == "000001.SZ"
+    assert len(calls) == 1
+    # 第二次查 600000.SH（TTL 内，但 codes 未覆盖）→ 必须再查询 1 次
+    r2 = svc.fallback_snapshot(["600000.SH"])
+    assert len(r2) == 1
+    assert r2[0]["code"] == "600000.SH"
+    assert len(calls) == 2
+
+
+def test_fallback_cache_merges_codes():
+    """异 codes 先后查询后，缓存为并集；请求并集 codes 在 TTL 内不再查询。"""
+    import pandas as pd
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    calls = []
+
+    def fake_query(codes, **kw):
+        calls.append(list(codes))
+        return {
+            code: pd.DataFrame({
+                "code": [code],
+                "last": [10.0 if code == "000001.SZ" else 20.0],
+                "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+            })
+            for code in codes
+        }
+
+    gw.query_snapshot = fake_query
+    # 依次查两个不同的 code
+    svc.fallback_snapshot(["000001.SZ"])
+    svc.fallback_snapshot(["600000.SH"])
+    assert len(calls) == 2
+    # 第三次查并集 codes → TTL 内且 codes 已被合并覆盖 → 不再查询
+    r3 = svc.fallback_snapshot(["000001.SZ", "600000.SH"])
+    assert len(calls) == 2  # 无新调用
+    assert len(r3) == 2
+    codes = {row["code"] for row in r3}
+    assert codes == {"000001.SZ", "600000.SH"}
+
+
+def test_stop_watchdog_joins_thread():
+    """stop_watchdog 后旧线程必须已退出（join 生效）。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_active(True)
+    svc.start_watchdog([20240102], stale_threshold_sec=999, watchdog_interval_sec=999,
+                       open_time="00:00", close_time="23:59")
+    assert svc._watchdog_thread is not None
+    assert svc._watchdog_thread.is_alive()
+    svc.stop_watchdog()
+    # stop_watchdog 内部已 join(timeout=2)，线程应已退出
+    assert not svc._watchdog_thread.is_alive()

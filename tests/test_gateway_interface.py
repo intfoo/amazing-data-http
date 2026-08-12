@@ -74,3 +74,34 @@ def test_fake_gateway_calendar_injectable():
 def test_fake_gateway_satisfies_protocol_with_calendar():
     gw = FakeGateway(ready=True)
     assert isinstance(gw, Gateway)
+
+
+def test_fake_gateway_has_calendar_set_property():
+    """FakeGateway 暴露 calendar_set（Protocol @runtime_checkable 需要）。"""
+    gw = FakeGateway(ready=True)
+    assert gw.calendar_set == frozenset()
+    gw2 = FakeGateway(ready=True, calendar=[20240102, 20240103])
+    assert gw2.calendar_set == frozenset({20240102, 20240103})
+    assert isinstance(gw2, Gateway)
+
+
+def test_stop_subscription_acquires_sdk_lock():
+    """预持 gateway._lock 时 stop_subscription 必须阻塞等锁（证明经过 _sdk_lock）。"""
+    import threading
+    from app.config import Config
+    from app.gateway import AmazingDataGateway
+
+    gw = AmazingDataGateway(Config(username="u", password="p", ip="1.2.3.4", port=1))
+    entered = threading.Event()   # stop_subscription 已返回
+    gw._lock.acquire()
+    try:
+        t = threading.Thread(
+            target=lambda: (gw.stop_subscription(), entered.set()), daemon=True
+        )
+        t.start()
+        t.join(timeout=1.0)
+        assert not entered.is_set()  # 仍在等 _sdk_lock（未持有锁时会立即返回）
+    finally:
+        gw._lock.release()
+    t.join(timeout=5)
+    assert entered.is_set()  # 释放锁后正常返回

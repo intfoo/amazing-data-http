@@ -153,7 +153,7 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 | `AMAZINGDATA_PORT` | 是 | — | SDK 登录目标服务器端口 |
 | `HTTP_HOST` | 否 | `0.0.0.0` | 本服务 HTTP 监听地址。容器内必须 `0.0.0.0`；仅本机访问可改 `127.0.0.1` |
 | `HTTP_PORT` | 否 | `3021` | 本服务 HTTP 监听端口。Docker 模式下 `docker-compose.yml` 端口映射同步读取此变量，`Dockerfile` CMD 也读取它 |
-| `SDK_MAX_CONCURRENT` | 否 | `5` | SDK 最大并发调用数，超出返回 503 `SERVICE_BUSY` |
+| `SDK_MAX_CONCURRENT` | 否 | `2` | SDK 最大并发调用数（SDK 调用全局串行，此值只决定排队深度），超出返回 503 `SERVICE_BUSY` |
 | `AUTH_TOKEN` | 视情况 | `""` | Bearer token。`AUTH_REQUIRED=true` 时必填，客户端需带 `Authorization: Bearer <token>`。强度要求：长度 > 12 且同时含字母和数字，弱 token 阻止启动 |
 | `AUTH_REQUIRED` | 否 | `true` | 认证开关。`false` 时认证彻底关闭，所有请求直接放行，`AUTH_TOKEN` 被忽略。仅本地调试用，生产必须保持 `true` |
 | `ADJ_FACTOR_LOCAL_PATH` | 否 | `""` | SDK `get_adj_factor` 的 `local_path` 参数，必须为绝对路径。留空由 SDK 自行管理 HDF5 缓存 |
@@ -162,6 +162,7 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 | `SUBSCRIPTION_CLOSE` | 否 | `15:20` | 订阅窗口结束（HH:MM） |
 | `STALE_THRESHOLD_SEC` | 否 | `90` | watchdog 失活阈值（秒）。窗口期内连续 N 秒未收到快照即判定订阅失活，`/health` 返回 503 触发容器重启 |
 | `WATCHDOG_INTERVAL_SEC` | 否 | `60` | watchdog 检查间隔（秒） |
+| `ETF_FLOW_CACHE_TTL_SEC` | 否 | `300` | /etf/net_inflow 结果缓存 TTL（秒） |
 
 > 四项凭据缺失时进程仍可启动，`/health` 返回 503 `config: incomplete`，便于 Docker 日志暴露诊断信息。认证配置无效（`AUTH_REQUIRED=true` 但 token 为空/过弱）时进程启动即退出。非交易时段或窗口期外不启动订阅，`/health` 报 `realtime_detail: inactive_offhours` 且仍返回 200；窗口期内订阅失活则报 503（`inactive_stale`/`inactive_error`/`inactive_not_started`）。
 

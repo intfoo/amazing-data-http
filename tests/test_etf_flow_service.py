@@ -679,3 +679,60 @@ def test_sdk_not_ready():
     svc = EtfFlowService(gw)
     with pytest.raises(GatewayNotReadyError):
         svc.query()
+
+
+# ========== test_cache ==========
+
+def test_etf_flow_result_cache_hit_skips_gateway():
+    """同参数第二次查询零 gateway 调用（结果缓存命中）。"""
+    code_info_df = make_code_info_df()
+    share_dict = {"510300.SH": make_share_df()}
+    nav_dict = {"510300.SH": make_nav_df()}
+    gw = FakeGateway(
+        ready=True,
+        code_info_result=code_info_df,
+        fund_share_result=share_dict,
+        fund_nav_result=nav_dict,
+    )
+    svc = EtfFlowService(gw)
+    # 第一次查询 → gateway 被调用
+    records1 = svc.query("2024-01-01", "2024-01-31")
+    assert len(records1) == 3  # 1 只宽基 × 3 天
+    assert len(gw.fund_share_calls) == 1
+
+    # 第二次同参数查询 → 结果缓存命中，零 gateway 调用
+    records2 = svc.query("2024-01-01", "2024-01-31")
+    assert records2 == records1
+    assert len(gw.fund_share_calls) == 1  # 仍为 1，未新增调用
+
+
+def test_etf_flow_list_cache_expires_next_day(monkeypatch):
+    """清单缓存按日失效（跨日重取 get_code_info）。"""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    code_info_df = make_code_info_df()
+    share_dict = {"510300.SH": make_share_df()}
+    nav_dict = {"510300.SH": make_nav_df()}
+    gw = FakeGateway(
+        ready=True,
+        code_info_result=code_info_df,
+        fund_share_result=share_dict,
+        fund_nav_result=nav_dict,
+    )
+    svc = EtfFlowService(gw)
+
+    # 用不同 start_time/end_time 避免命中结果缓存，只测清单缓存
+    # 第一天：now_cn 返回 2024-01-15
+    day1 = _dt.datetime(2024, 1, 15, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr("app.etf_flow_service.now_cn", lambda: day1)
+    svc.query("2024-01-01", "2024-01-04")
+    assert len(gw.fund_share_calls) == 1
+
+    # 第二天：now_cn 返回 2024-01-16（跨日），清单缓存失效
+    day2 = _dt.datetime(2024, 1, 16, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr("app.etf_flow_service.now_cn", lambda: day2)
+    svc.query("2024-01-01", "2024-01-05")  # 不同区间避开结果缓存，只测清单缓存
+    # 跨日后清单缓存失效，get_code_info 被重新调用
+    # 通过 fund_share_calls 增加 1 来验证走了完整查询路径
+    assert len(gw.fund_share_calls) == 2

@@ -26,6 +26,7 @@ ETF 份额变动是 T 日交易收盘后的申赎结果。
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -37,6 +38,7 @@ from app.adj_factor_service import _parse_iso
 from app.gateway import Gateway
 from app.kline_service import to_sdk_date
 from app.serializer import serialize_dataframe
+from app.subscription_schedule import now_cn
 
 logger = logging.getLogger("amazingdata.etf_flow")
 
@@ -138,10 +140,22 @@ EXCLUDE_SUFFIXES = [
 
 
 class EtfFlowService:
-    """宽基 ETF 净流入统计 Service。"""
+    """宽基 ETF 净流入统计 Service。
 
-    def __init__(self, gateway: Gateway):
+    缓存语义：
+    - 查询结果按 (start_time, end_time) 缓存，TTL 由 cache_ttl_sec 控制（默认 300s）。
+      份额数据 T+1 才更新，300s 内无 freshness 风险。缓存上限 64 条，超限整体清空。
+    - 宽基 ETF 清单按日缓存（key=当日日期字符串），跨日自动失效重取。
+    """
+
+    def __init__(self, gateway: Gateway, cache_ttl_sec: int = 300):
         self._gw = gateway
+        self._cache_ttl_sec = cache_ttl_sec
+        self._cache_lock = threading.Lock()
+        # 宽基 ETF 清单按日缓存：(date_str, codes, name_map)
+        self._list_cache: tuple[str, list[str], dict[str, str]] | None = None
+        # 查询结果缓存：key=(start_time, end_time) → (cached_at, records)
+        self._result_cache: dict[tuple, tuple[float, list[dict]]] = {}
 
     def query(
         self,
@@ -156,11 +170,11 @@ class EtfFlowService:
         # 1. 解析日期（SDK 8 位整型） + 校验 start <= end
         # start_time/end_time 均缺省时默认近 30 天，避免返回全量历史数据（2012年至今）
         # 导致响应过大且 SDK 查询耗时过长（对标 /minute 的近一年默认策略）
+        now_cn_ts = now_cn()  # 一次取用：默认区间与清单缓存日期同源（防跨午夜不一致）
         if start_time is None and end_time is None:
-            from datetime import datetime as _dt, timedelta as _td
-            _now = _dt.now()
-            start_time = (_now - _td(days=30)).strftime("%Y-%m-%d")
-            end_time = _now.strftime("%Y-%m-%d")
+            from datetime import timedelta as _td
+            start_time = (now_cn_ts - _td(days=30)).strftime("%Y-%m-%d")
+            end_time = now_cn_ts.strftime("%Y-%m-%d")
             logger.debug("etf_flow 默认范围: %s..%s (近 30 天)", start_time, end_time)
         begin_date = to_sdk_date(start_time) if start_time else None
         end_date = to_sdk_date(end_time) if end_time else None
@@ -170,19 +184,37 @@ class EtfFlowService:
         start_dt = _parse_iso(start_time) if start_time else None
         end_dt = _parse_iso(end_time) if end_time else None
 
+        # 结果缓存命中检查：key=(start_time, end_time)
+        cache_key = (start_time, end_time)
+        now_ts = time.monotonic()
+        with self._cache_lock:
+            hit = self._result_cache.get(cache_key)
+            if hit is not None and now_ts - hit[0] <= self._cache_ttl_sec:
+                logger.info("etf_flow 结果缓存命中: key=%s records=%d", cache_key, len(hit[1]))
+                return list(hit[1])
+
         # 2. 获取宽基 ETF 清单 + 交易日历
         t0 = time.monotonic()
-        etf_df = self._gw.get_code_info(security_type="EXTRA_ETF")
-        t1 = time.monotonic()
-        broad_based = self._filter_broad_based(etf_df)  # → list[(code, name)]
-        codes = [c for c, _ in broad_based]
-        name_map = {c: n for c, n in broad_based}
+        # 宽基 ETF 清单按日缓存（key=当日日期字符串），跨日自动失效重取
+        today = now_cn_ts.strftime("%Y-%m-%d")
+        with self._cache_lock:
+            list_hit = self._list_cache if self._list_cache and self._list_cache[0] == today else None
+        if list_hit is not None:
+            _, codes, name_map = list_hit
+        else:
+            etf_df = self._gw.get_code_info(security_type="EXTRA_ETF")
+            t1 = time.monotonic()
+            broad_based = self._filter_broad_based(etf_df)  # → list[(code, name)]
+            codes = [c for c, _ in broad_based]
+            name_map = {c: n for c, n in broad_based}
+            with self._cache_lock:
+                self._list_cache = (today, codes, name_map)
+            t2 = time.monotonic()
+            logger.info(
+                "etf_flow get_code_info: gateway=%.3fs filter=%.3fs broad_based=%d/%d",
+                t1 - t0, t2 - t1, len(codes), len(etf_df) if etf_df is not None else 0,
+            )
         calendar = self._gw.calendar
-        t2 = time.monotonic()
-        logger.info(
-            "etf_flow get_code_info: gateway=%.3fs filter=%.3fs broad_based=%d/%d",
-            t1 - t0, t2 - t1, len(codes), len(etf_df) if etf_df is not None else 0,
-        )
 
         if not codes:
             return []
@@ -240,6 +272,11 @@ class EtfFlowService:
             "etf_flow compute: %.3fs records=%d",
             t6 - t5, len(records),
         )
+        # 写结果缓存：key=(start_time, end_time)，64 条上限整体清空
+        with self._cache_lock:
+            if len(self._result_cache) >= 64:
+                self._result_cache.clear()
+            self._result_cache[cache_key] = (time.monotonic(), records)
         return records
 
     @staticmethod
