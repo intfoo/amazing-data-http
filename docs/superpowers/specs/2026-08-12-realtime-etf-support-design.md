@@ -47,7 +47,12 @@ ETF 特有字段（如 `iopv`）自然带出。
   - 股票列表失败：异常正常传播（与现状一致）
   - 指数/ETF 列表失败：各自独立降级（warn 日志 + 跳过该类），不影响其余类别
 - `Gateway` Protocol（`app/gateway/base.py`）同步替换方法签名。
-- 不留 `get_realtime_code_list` 兼容层（全仓仅 `subscription_scheduler` + 1 个测试调用，直接替换）。
+- 不留 `get_realtime_code_list` 兼容层，直接替换。全仓引用清单（review 核实）：
+  - 代码 3 处：`base.py` Protocol 定义、`query_market.py` 实现、`subscription_scheduler.py` 调用 + 日志字符串
+  - 测试 3 个文件：`tests/conftest.py`（FakeGateway 定义）、`tests/test_scheduler_calendar_refresh.py:25`（独立 FakeGW 定义）、
+    `tests/test_http_app.py:419-431`（`test_realtime_not_active_after_startup_failure` 中
+    `gw.get_realtime_code_list = _boom` monkey-patch，须改为 `gw.get_realtime_universe = _boom`，
+    否则补丁打在不存在的方法上，订阅正常启动导致断言失败）
 
 ### 4.2 RealtimeService 层（`app/realtime_service.py`）
 
@@ -58,10 +63,26 @@ ETF 特有字段（如 `iopv`）自然带出。
   - `types is None` → 不过滤（向后兼容）
   - 记录 `security_type` 在 `types` 中 → 保留
   - 记录类型为 `"unknown"`（不在映射中）→ **放行**（宽容模式）
+  - 过滤读取一律 `record.get("security_type", "unknown")` 兜底：`set_type_map` 前的启动竞态
+    或 `clear_cache` 后的残留记录可能无该字段，缺失视为 unknown 放行，与注入语义一致
 - 锁内只取引用快照，过滤在锁外完成（延续现有性能模式）。
-- **fallback 路径的记录不经过 `on_snapshot`**，本身无 `security_type` 字段：在 `_filter_fallback`
-  阶段按 `code` 查 `_type_map` 统一注入 `security_type` 并应用 `types` 过滤（fallback 缓存为全量共享，
-  注入与过滤都是纯内存操作，无额外 SDK 调用；注入在过滤后/返回前的浅拷贝上进行，不污染共享缓存）。
+- **fallback 路径的记录不经过 `on_snapshot`**，本身无 `security_type` 字段：`_filter_fallback`
+  改签名 `(self, codes, types=None)`，按 `code` 查 `_type_map` 统一注入并过滤，伪代码：
+
+  ```python
+  def _filter_fallback(self, codes, types=None) -> list[dict]:
+      # ... 现有 codes 过滤逻辑 ...
+      result = []
+      for r in filtered:
+          r_copy = dict(r)  # 浅拷贝，不污染共享 _fallback_cache 中的原始 dict
+          st = self._type_map.get(r_copy.get("code"), "unknown")
+          r_copy["security_type"] = st
+          if types is None or st in types or st == "unknown":
+              result.append(r_copy)
+      return result
+  ```
+
+  fallback 缓存为全量共享，注入与过滤都是纯内存操作，无额外 SDK 调用。
 
 ### 4.3 HTTP 层（`app/http_app.py`）
 
@@ -75,6 +96,8 @@ ETF 特有字段（如 `iopv`）自然带出。
 - `_start_subscription`：`code_list = self._gw.get_realtime_code_list()` 改为
   `universe = self._gw.get_realtime_universe()`；`list(universe)` 传给订阅，`universe` 传给
   `realtime_service.set_type_map()`。
+- 日志字符串 `"get_realtime_code_list=%.3fs"`（`subscription_scheduler.py:133`）同步改为
+  `get_realtime_universe`。
 
 ## 5. 错误处理与边界
 
@@ -84,6 +107,8 @@ ETF 特有字段（如 `iopv`）自然带出。
 | 盘后启动、映射表为空 | 所有代码视为 unknown → `types` 过滤全放行，`security_type="unknown"` |
 | 同一 code 出现在多个列表 | dict 后写覆盖（股票/指数/ETF 代码段实际不重叠，理论防护） |
 | 客户端传映射外代码 + types | 放行（宽容模式），如 `?codes=510300.SH&types=etf` 盘后也能拿到数据 |
+| `set_type_map` 线程安全 | 整体替换 `self._type_map` 引用（GIL 保证指针赋值原子性），读侧 `get()` 无需加锁 |
+| 订阅代码总量 | ETF 加入后约 6000+（股票 5000+ / 指数 / ETF 1000+），先例已验证 5000+ 可行；若 SDK 注册超时再考虑分批（YAGNI 暂不做） |
 | watchdog / 订阅窗口 / 健康检查 | 不变 |
 
 ## 6. 测试策略
@@ -101,6 +126,10 @@ ETF 特有字段（如 `iopv`）自然带出。
   - `codes` + `types` 叠加
   - 不传 types 行为不变（回归）
 - `tests/test_subscription_scheduler.py`：适配 `get_realtime_universe` 新签名。
+- `tests/test_scheduler_calendar_refresh.py`：独立 `FakeGW.get_realtime_code_list` →
+  `get_realtime_universe` 返回 `dict[code, type]`。
+- `tests/test_http_app.py::test_realtime_not_active_after_startup_failure`：
+  monkey-patch 目标改为 `gw.get_realtime_universe = _boom`。
 
 ## 7. 不做的事（YAGNI）
 
@@ -123,4 +152,5 @@ ETF 特有字段（如 `iopv`）自然带出。
 | `tests/test_realtime_service.py` | 修改 | 类型注入/过滤/清空测试 |
 | `tests/test_http_app.py` | 修改 | types 参数 HTTP 测试 + 适配 |
 | `tests/test_subscription_scheduler.py` | 修改 | 适配新签名 |
+| `tests/test_scheduler_calendar_refresh.py` | 修改 | FakeGW 适配 `get_realtime_universe` |
 | `docs/API.md` | 修改 | `/realtime` 章节补充 `types` 参数与 `security_type` 字段 |
