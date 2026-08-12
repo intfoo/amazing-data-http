@@ -398,3 +398,167 @@ def test_sdk_lock_normal_acquire_release():
         pass
     assert gw._lock.acquire(blocking=False)
     gw._lock.release()
+
+
+# ---------------------------------------------------------------------------
+# get_realtime_universe 按日缓存：9:00 后首次获取刷新，复用 adj_factor 目录持久化
+# ---------------------------------------------------------------------------
+
+class _FakeBaseCodeList:
+    """get_code_list 结果可注入、调用可记录的 fake。"""
+
+    def __init__(self):
+        self.calls = []
+        self.map = {}
+        self.fail = False
+
+    def get_code_list(self, security_type="EXTRA_STOCK_A"):
+        self.calls.append(security_type)
+        if self.fail:
+            raise RuntimeError("boom")
+        return self.map.get(security_type, [])
+
+
+def _make_universe_gw(tmp_path, monkeypatch, hour, minute=0, day=12):
+    """构造 ready gateway：adj_factor 路径指向 tmp_path，now_cn 冻结到 2026-08-{day} {hour}:{minute}。"""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from app.config import Config
+    from app.gateway import AmazingDataGateway
+
+    cfg = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                 adj_factor_local_path=str(tmp_path))
+    gw = AmazingDataGateway(cfg)
+    gw._ready = True
+    base = _FakeBaseCodeList()
+    base.map = {
+        "EXTRA_STOCK_A": ["000001.SZ"],
+        "EXTRA_INDEX_A": ["000001.SH"],
+        "EXTRA_ETF": ["510300.SH"],
+    }
+    gw._base_data = base
+    frozen = _dt.datetime(2026, 8, day, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr("app.gateway.query_market.now_cn", lambda: frozen)
+    return gw, base
+
+
+def _write_stale_universe_cache(tmp_path, refresh_date="2026-08-11",
+                                stock=("600000.SH",), index=(), etf=()):
+    """写磁盘缓存：meta.json + 按类型纯代码数组文件（stock/index/etf.json）。"""
+    import json
+    d = tmp_path / "realtime_universe"
+    d.mkdir(exist_ok=True)
+    for t, codes in (("stock", stock), ("index", index), ("etf", etf)):
+        (d / f"{t}.json").write_text(
+            json.dumps(sorted(codes), ensure_ascii=False), encoding="utf-8")
+    (d / "meta.json").write_text(json.dumps({
+        "refresh_date": refresh_date,
+        "fetched_at": f"{refresh_date}T10:00:00+08:00",
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+def test_universe_cache_refresh_once_after_9am(tmp_path, monkeypatch):
+    """9 点后第一次获取刷新并写磁盘缓存（meta + 按类型三文件）；当日后续获取零 SDK 调用。"""
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=10)
+    u1 = gw.get_realtime_universe()
+    assert u1 == {"000001.SZ": "stock", "000001.SH": "index", "510300.SH": "etf"}
+    assert base.calls == ["EXTRA_STOCK_A", "EXTRA_INDEX_A", "EXTRA_ETF"]
+    # 磁盘缓存已写（adj_factor 目录下 realtime_universe/ 子目录）
+    cache_dir = tmp_path / "realtime_universe"
+    assert (cache_dir / "meta.json").exists()
+    assert (cache_dir / "stock.json").exists()
+    assert (cache_dir / "index.json").exists()
+    assert (cache_dir / "etf.json").exists()
+    # 当日第二次：命中缓存，零新增调用
+    u2 = gw.get_realtime_universe()
+    assert u2 == u1
+    assert len(base.calls) == 3
+
+
+def test_universe_cache_before_9am_uses_stale(tmp_path, monkeypatch):
+    """9 点前：沿用缓存（哪怕隔日），不拉取。"""
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=8, minute=30)
+    _write_stale_universe_cache(tmp_path)
+    u = gw.get_realtime_universe()
+    assert u == {"600000.SH": "stock"}
+    assert base.calls == []  # 未拉取
+
+
+def test_universe_cache_after_9am_stale_refreshes(tmp_path, monkeypatch):
+    """9 点后缓存 refresh_date 为昨日 → 刷新一次。"""
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=9, minute=0)
+    _write_stale_universe_cache(tmp_path)
+    u = gw.get_realtime_universe()
+    assert "000001.SZ" in u  # 已刷新为新数据
+    assert base.calls == ["EXTRA_STOCK_A", "EXTRA_INDEX_A", "EXTRA_ETF"]
+
+
+def test_universe_fetch_before_9am_does_not_count_as_daily_refresh(tmp_path, monkeypatch):
+    """9 点前被迫拉取（无缓存）时 refresh_date 记空，9 点后首次获取仍会刷新。"""
+    import json
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=8, minute=30)
+    gw.get_realtime_universe()
+    assert len(base.calls) == 3
+    meta_path = tmp_path / "realtime_universe" / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["refresh_date"] == ""
+    # 切到 9 点后：再获取 → 重新刷新
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    later = _dt.datetime(2026, 8, 12, 9, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr("app.gateway.query_market.now_cn", lambda: later)
+    gw.get_realtime_universe()
+    assert len(base.calls) == 6  # 重新拉了一轮
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["refresh_date"] == "2026-08-12"
+
+
+def test_universe_refresh_failure_falls_back_to_stale_cache(tmp_path, monkeypatch):
+    """刷新失败且有旧缓存 → warn 沿用旧缓存，不抛。"""
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=10)
+    _write_stale_universe_cache(tmp_path)
+    base.fail = True
+    u = gw.get_realtime_universe()
+    assert u == {"600000.SH": "stock"}
+
+
+def test_universe_cache_index_file_missing_degrades(tmp_path, monkeypatch):
+    """index.json 缺失/损坏只影响指数类：stock 缓存仍命中，index 按空降级。"""
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=10)
+    _write_stale_universe_cache(tmp_path, refresh_date="2026-08-12",
+                                stock=("600000.SH",), etf=("510300.SH",))
+    # 删掉 index.json（refresh_date 已是今天 → 命中分支）
+    (tmp_path / "realtime_universe" / "index.json").unlink()
+    u = gw.get_realtime_universe()
+    assert u == {"600000.SH": "stock", "510300.SH": "etf"}
+    assert base.calls == []  # stock 命中，未拉取
+
+
+def test_universe_cache_stock_file_missing_no_cache(tmp_path, monkeypatch):
+    """stock.json 缺失 → 视为无缓存，正常拉取（index/etf 残留文件不被误用）。"""
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=10)
+    _write_stale_universe_cache(tmp_path, refresh_date="2026-08-12")
+    (tmp_path / "realtime_universe" / "stock.json").unlink()
+    u = gw.get_realtime_universe()
+    assert "000001.SZ" in u  # 走了拉取
+    assert base.calls == ["EXTRA_STOCK_A", "EXTRA_INDEX_A", "EXTRA_ETF"]
+
+
+def test_universe_refresh_failure_no_cache_raises(tmp_path, monkeypatch):
+    """刷新失败且无任何缓存 → 异常正常传播。"""
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=10)
+    base.fail = True
+    with pytest.raises(GatewayQueryError):
+        gw.get_realtime_universe()
+
+
+def test_universe_cache_survives_process_restart(tmp_path, monkeypatch):
+    """磁盘缓存跨进程复用：新 gateway 实例（内存缓存为空）命中磁盘缓存。"""
+    gw1, base1 = _make_universe_gw(tmp_path, monkeypatch, hour=10)
+    gw1.get_realtime_universe()
+    assert len(base1.calls) == 3
+    # 新实例（模拟进程重启），内存缓存为空
+    gw2, base2 = _make_universe_gw(tmp_path, monkeypatch, hour=11)
+    u = gw2.get_realtime_universe()
+    assert u == {"000001.SZ": "stock", "000001.SH": "index", "510300.SH": "etf"}
+    assert base2.calls == []  # 磁盘命中，零 SDK 调用

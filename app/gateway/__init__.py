@@ -69,6 +69,10 @@ class AmazingDataGateway(
         self._adj_factor_local_path = resolve_adj_factor_local_path(config.adj_factor_local_path)
         self._info_data = None  # ad.InfoData 实例（供 get_fund_share/get_fund_nav）
         self._fund_local_path = resolve_fund_local_path(config.fund_local_path)
+        # 实时代码表按日缓存目录（磁盘缓存在 adj_factor 目录下的 realtime_universe/
+        # 子目录：meta.json + stock/index/etf.json）：每日 9:00 后首次获取刷新一次，
+        # 详见 query_market.get_realtime_universe。
+        self._universe_cache_dir = self._adj_factor_local_path + "realtime_universe/"
         # 主动重连状态（tgw 断线回调触发，后台线程执行）
         self._reconnect_lock = threading.Lock()
         self._reconnect_in_progress = False

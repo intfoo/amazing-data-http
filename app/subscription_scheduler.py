@@ -27,6 +27,12 @@ logger = logging.getLogger("amazingdata.scheduler")
 
 SCHEDULE_INTERVAL_SEC = 60  # 调度器检查间隔（秒）
 
+# 连续重启退避（秒）：第 1 次重启失败后等 1 分钟，之后 2、3 分钟，5 分钟封顶。
+# 防"失活→重启"死循环中 SDK stop() 无效导致订阅线程/服务端会话无限累积
+# （服务端会话堆积会加剧账号在线数超限被踢，与失活互为因果）。
+# 重启后收到数据（last_snapshot_ts 晚于重启时刻）或窗口关闭时复位。
+_RESTART_BACKOFF_SEC = (60, 120, 180, 300)
+
 
 class SubscriptionScheduler:
     """后台调度线程：按交易窗口自动启动/停止快照订阅。"""
@@ -45,6 +51,10 @@ class SubscriptionScheduler:
         self._first_tick_done = threading.Event()
         # 防止 start_subscription 与 stop_subscription 并发
         self._action_lock = threading.Lock()
+        # 重启退避状态（仅 _tick 单线程访问，无需锁）
+        self._restart_failures = 0        # 连续"重启后未收到数据"次数
+        self._last_restart_attempt = 0.0  # time.monotonic()，退避计时用
+        self._last_restart_wall = 0.0     # time.time()，与 last_snapshot_ts 比较用
 
     def start(self) -> None:
         """启动调度线程。幂等（已启动则跳过）。"""
@@ -88,8 +98,31 @@ class SubscriptionScheduler:
                 if not self._gw.is_ready():
                     self._self_heal_login()
                     return
-                logger.info("调度器：在订阅窗口内但订阅未活跃，尝试启动")
+                # 重启退避：第 n 次失败后等待 _RESTART_BACKOFF_SEC[n-1]（5 分钟封顶）
+                idx = max(0, min(self._restart_failures - 1, len(_RESTART_BACKOFF_SEC) - 1))
+                interval = _RESTART_BACKOFF_SEC[idx]
+                elapsed = time.monotonic() - self._last_restart_attempt
+                if elapsed < interval:
+                    logger.debug(
+                        "调度器：重启退避中（%.0fs/%ds，连续第 %d 次），本 tick 跳过",
+                        elapsed, interval, self._restart_failures,
+                    )
+                    return
+                self._restart_failures += 1
+                self._last_restart_attempt = time.monotonic()
+                self._last_restart_wall = time.time()
+                logger.info(
+                    "调度器：在订阅窗口内但订阅未活跃，尝试启动（连续第 %d 次）",
+                    self._restart_failures,
+                )
                 self._start_subscription(cal)
+            else:
+                # 重启后收到了数据（时间戳晚于重启时刻）→ 订阅真正恢复，退避状态复位
+                # （含计时戳：确认健康后的下次失活立即重启，不等退避）
+                if self._restart_failures and self._rt.last_snapshot_ts() > self._last_restart_wall:
+                    self._restart_failures = 0
+                    self._last_restart_attempt = 0.0
+                    self._last_restart_wall = 0.0
         else:
             if self._rt.is_active():
                 logger.info("调度器：不在订阅窗口，停止订阅")
@@ -168,4 +201,8 @@ class SubscriptionScheduler:
             self._rt.stop_watchdog()
             self._rt.set_active(False)
             self._rt.clear_cache()
+            # 窗口关闭：退避状态复位，下一窗口从第 1 次重启重新开始
+            self._restart_failures = 0
+            self._last_restart_attempt = 0.0
+            self._last_restart_wall = 0.0
             logger.info("调度器已停止订阅并清空缓存")

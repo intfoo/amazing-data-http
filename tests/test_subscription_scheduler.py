@@ -112,10 +112,105 @@ def test_tick_recovers_after_subscription_crash():
     # 模拟订阅崩溃
     rt.on_subscription_error(RuntimeError("crash"))
     assert rt.is_active() is False
-    # 第二次 tick：自动恢复
+    # 第二次 tick：自动恢复（回拨重启时间越过 60s 退避窗口）
+    scheduler._last_restart_attempt = time.monotonic() - 61
     scheduler._tick()
     assert gw.sub_start_called == 2  # 再次启动
     assert rt.is_active() is True
+
+
+# ---------------------------------------------------------------------------
+# 重启退避：连续重启失败按 1/2/3/5 分钟退避，收到数据或窗口关闭复位
+# ---------------------------------------------------------------------------
+
+class TestRestartBackoff:
+    """失活→重启死循环防护：连续重启未收到数据时按 60/120/180/300s 退避。"""
+
+    def test_first_restart_immediate(self):
+        """当天首次启动不受退避影响，立即执行。"""
+        scheduler, gw, rt = _make_scheduler()
+        rt.set_active(False)
+        scheduler._tick()
+        assert gw.sub_start_called == 1
+        assert scheduler._restart_failures == 1
+
+    def test_second_restart_waits_60s(self):
+        """第 1 次重启后未收到数据 → 第 2 次需等 60s。"""
+        scheduler, gw, rt = _make_scheduler()
+        rt.set_active(False)
+        scheduler._tick()
+        assert gw.sub_start_called == 1
+        # 重启后未收到数据，watchdog 判失活
+        rt.set_active(False)
+        # 距上次重启 30s（<60s）→ 跳过
+        scheduler._last_restart_attempt = time.monotonic() - 30
+        scheduler._tick()
+        assert gw.sub_start_called == 1
+        # 距上次重启 61s → 放行
+        scheduler._last_restart_attempt = time.monotonic() - 61
+        scheduler._tick()
+        assert gw.sub_start_called == 2
+        assert scheduler._restart_failures == 2
+
+    def test_backoff_sequence_1_2_3_5(self):
+        """退避间隔序列：1 → 2 → 3 → 5 分钟封顶。"""
+        scheduler, gw, rt = _make_scheduler()
+        rt.set_active(False)
+        scheduler._tick()  # 第 1 次
+        expected_gaps = [60, 120, 180, 300, 300]
+        for i, gap in enumerate(expected_gaps, start=2):
+            rt.set_active(False)
+            # gap - 1 秒 → 仍跳过
+            scheduler._last_restart_attempt = time.monotonic() - (gap - 1)
+            scheduler._tick()
+            assert gw.sub_start_called == i - 1
+            # gap 秒 → 放行
+            scheduler._last_restart_attempt = time.monotonic() - gap
+            scheduler._tick()
+            assert gw.sub_start_called == i
+            assert scheduler._restart_failures == i
+
+    def test_backoff_reset_when_data_received(self):
+        """重启后收到数据（last_snapshot_ts 晚于重启时刻）→ 退避计数复位。"""
+        scheduler, gw, rt = _make_scheduler()
+        rt.set_active(False)
+        scheduler._tick()
+        assert scheduler._restart_failures == 1
+        # 模拟订阅恢复并收到数据
+        rt.set_active(True)
+        rt._last_snapshot_ts = time.time()
+        scheduler._tick()
+        assert scheduler._restart_failures == 0
+        # 复位后再次失活 → 立即重启（不等退避）
+        rt.set_active(False)
+        scheduler._tick()
+        assert gw.sub_start_called == 2
+        assert scheduler._restart_failures == 1
+
+    def test_backoff_not_reset_by_stale_snapshot(self):
+        """重启前的旧数据时间戳不复位退避（防止假恢复）。"""
+        scheduler, gw, rt = _make_scheduler()
+        rt.set_active(False)
+        scheduler._tick()
+        assert scheduler._restart_failures == 1
+        # 旧数据时间戳（早于重启时刻）→ 不复位
+        rt.set_active(True)
+        rt._last_snapshot_ts = scheduler._last_restart_wall - 10
+        scheduler._tick()
+        assert scheduler._restart_failures == 1
+
+    def test_backoff_reset_on_window_close(self):
+        """窗口关闭停止订阅时退避状态复位，下一窗口重新计数。"""
+        config = _make_config(subscription_open="23:58", subscription_close="23:59")
+        scheduler, gw, rt = _make_scheduler(config=config)
+        scheduler._restart_failures = 3
+        scheduler._last_restart_attempt = time.monotonic()
+        scheduler._last_restart_wall = time.time()
+        rt.set_active(True)
+        scheduler._tick()  # 非窗口 + active → stop
+        assert gw.sub_stop_called == 1
+        assert scheduler._restart_failures == 0
+        assert scheduler._last_restart_attempt == 0.0
 
 
 # ---------------------------------------------------------------------------

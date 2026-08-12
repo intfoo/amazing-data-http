@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +18,15 @@ from app.gateway.base import (
     _is_sdk_corruption,
     logger,
 )
+from app.subscription_schedule import now_cn
+
+# 实时代码表每日刷新时点：代码表交易日 9 点前更新（手册 §3.5.2.2），
+# 9 点后第一次获取时刷新一次，其余时间命中缓存。
+_UNIVERSE_REFRESH_HOUR = 9
+
+# 磁盘缓存按类型分独立文件（realtime_universe/{stock,index,etf}.json）：
+# 单类型文件损坏/缺失只影响该类（index/etf 缺失 = 降级为空，与拉取降级语义一致）。
+_UNIVERSE_CACHE_TYPES = ("stock", "index", "etf")
 
 
 class QueryMarketMixin:
@@ -86,7 +97,128 @@ class QueryMarketMixin:
     def get_realtime_universe(self) -> dict[str, str]:
         """获取实时订阅用的全市场代码表（股票 + 指数 + ETF），返回 {code: type}。
 
-        依次取 EXTRA_STOCK_A → EXTRA_INDEX_A → EXTRA_ETF，合并为 dict[code, "stock"|"index"|"etf"]。
+        按日缓存（2026-08-12）：全量拉取 ~60s（get_code_list ×3 串行），但代码表每个交易日
+        9 点前才更新（手册 §3.5.2.2），盘中不变。缓存规则：
+        - 当日 09:00 前：直接沿用缓存（新一天的表还没更新，拉也是旧数据）；
+        - 当日 09:00 及之后：第一次获取刷新一次（refresh_date == 今天则命中）；
+        - 09:00 前无缓存被迫拉取时 refresh_date 记空，保证 9 点后首次获取仍刷新。
+        缓存持久化到 adj_factor 目录下的 realtime_universe/ 子目录：meta.json（refresh_date
+        等元数据）+ stock/index/etf.json（纯代码数组）。meta.json 最后写，作为提交点——
+        中途崩溃残留的部分新文件配旧 meta，refresh_date 仍是昨天，下次获取自动重刷。
+        刷新失败且有缓存（哪怕隔日）→ warn 沿用旧缓存；无缓存才抛。
+        """
+        now = now_cn()
+        today_key = now.strftime("%Y-%m-%d")
+        cached = self._read_universe_cache()
+        if cached is not None:
+            if now.hour < _UNIVERSE_REFRESH_HOUR or cached.get("refresh_date") == today_key:
+                logger.debug(
+                    "实时代码表命中缓存: refresh_date=%s codes=%d",
+                    cached.get("refresh_date"), len(cached.get("universe", {})),
+                )
+                return dict(cached["universe"])
+
+        try:
+            universe = self._fetch_realtime_universe()
+        except Exception as e:
+            if cached is not None:
+                logger.warning(
+                    "实时代码表刷新失败，沿用旧缓存(refresh_date=%s): %s: %s",
+                    cached.get("refresh_date"), type(e).__name__, e,
+                )
+                return dict(cached["universe"])
+            raise
+
+        self._write_universe_cache(
+            # 9 点前拉取的缓存不计入"当日已刷新"（表还没更新），9 点后首次获取会再刷一次
+            refresh_date=today_key if now.hour >= _UNIVERSE_REFRESH_HOUR else "",
+            fetched_at=now.isoformat(),
+            universe=universe,
+        )
+        return universe
+
+    def _read_universe_cache(self) -> dict | None:
+        """读磁盘缓存（realtime_universe/ 子目录）合并为缓存 entry。
+
+        meta.json 或 stock.json 缺失/损坏 → 返回 None（无缓存）；
+        index/etf.json 缺失/损坏 → 该类按空降级（与拉取时 warn 降级语义一致）。
+        """
+        try:
+            with open(self._universe_cache_dir + "meta.json", encoding="utf-8") as f:
+                meta = json.load(f)
+            if not isinstance(meta, dict):
+                raise ValueError("bad meta schema")
+            with open(self._universe_cache_dir + "stock.json", encoding="utf-8") as f:
+                stock_codes = json.load(f)
+            if not isinstance(stock_codes, list):
+                raise ValueError("bad stock schema")
+        except (OSError, ValueError) as e:
+            logger.warning("实时代码表磁盘缓存读取失败（忽略）: %s: %s", type(e).__name__, e)
+            return None
+        entries: dict[str, list] = {"stock": stock_codes}
+        for t in ("index", "etf"):
+            try:
+                with open(self._universe_cache_dir + f"{t}.json", encoding="utf-8") as f:
+                    codes = json.load(f)
+                if not isinstance(codes, list):
+                    raise ValueError("bad schema")
+                entries[t] = codes
+            except (OSError, ValueError) as e:
+                logger.warning(
+                    "实时代码表磁盘缓存 %s.json 读取失败，该类按空降级: %s: %s",
+                    t, type(e).__name__, e,
+                )
+        universe: dict[str, str] = {}
+        for t, codes in entries.items():
+            universe.update({c: t for c in codes})
+        return {
+            "refresh_date": meta.get("refresh_date", ""),
+            "fetched_at": meta.get("fetched_at"),
+            "universe": universe,
+        }
+
+    def _write_universe_cache(self, *, refresh_date: str, fetched_at: str,
+                              universe: dict[str, str]) -> None:
+        """写磁盘缓存：先写类型文件（纯代码数组），最后写 meta.json（提交点）。
+
+        每文件原子写（tmp + replace），异常只告警不影响主流程。
+        stock.json 写失败时不写 meta（避免"新 meta + 旧/无 stock"的半新状态被当有效缓存）。
+        """
+        by_type: dict[str, list] = {t: [] for t in _UNIVERSE_CACHE_TYPES}
+        for code, t in universe.items():
+            if t in by_type:
+                by_type[t].append(code)
+        try:
+            os.makedirs(self._universe_cache_dir, exist_ok=True)
+        except OSError as e:
+            logger.warning("实时代码表磁盘缓存目录创建失败（忽略）: %s: %s", type(e).__name__, e)
+            return
+
+        def _put(name: str, payload) -> None:
+            path = self._universe_cache_dir + name
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(path + ".tmp", path)
+
+        for t in _UNIVERSE_CACHE_TYPES:
+            try:
+                _put(f"{t}.json", sorted(by_type[t]))
+            except OSError as e:
+                logger.warning(
+                    "实时代码表磁盘缓存 %s.json 写入失败（忽略）: %s: %s",
+                    t, type(e).__name__, e,
+                )
+                if t == "stock":
+                    return
+        try:
+            _put("meta.json", {"refresh_date": refresh_date, "fetched_at": fetched_at})
+        except OSError as e:
+            logger.warning("实时代码表磁盘缓存 meta.json 写入失败（忽略）: %s: %s",
+                           type(e).__name__, e)
+
+    def _fetch_realtime_universe(self) -> dict[str, str]:
+        """实际拉取：依次取 EXTRA_STOCK_A → EXTRA_INDEX_A → EXTRA_ETF，合并 {code: type}。
+
         股票列表获取失败时异常正常传播（GatewayNotReadyError / GatewayQueryError）。
         指数 / ETF 列表获取失败时各自独立降级：记录 warning，跳过该类，不影响其余类别。
         """
