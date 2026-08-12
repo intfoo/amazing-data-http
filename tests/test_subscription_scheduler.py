@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.config import Config
+from app.gateway import GatewayNotReadyError
 from app.realtime_service import RealtimeService
 from app.subscription_scheduler import SubscriptionScheduler
 from tests.conftest import FakeGateway, make_daily_df
@@ -241,3 +242,50 @@ def test_tick_does_not_start_with_fallback_disabled():
     rt.set_active(False)
     scheduler._tick()
     assert gw.sub_start_called == 0
+
+
+# ---------------------------------------------------------------------------
+# 自愈 login：窗口内 + not ready → 调 gateway.login()（2026-08-12 事故修复）
+# ---------------------------------------------------------------------------
+
+class TestSchedulerSelfHeal:
+    """调度器 not-ready 自愈：窗口内 SDK 未登录时每 tick 重试 login。"""
+
+    def test_not_ready_triggers_login(self):
+        """窗口内 + not ready + 无重连进行中 → 调 gateway.login()，不启动订阅。"""
+        gw = FakeGateway(ready=False, calendar=_today_cal())
+        config = _make_config()
+        rt = RealtimeService(gateway=gw)
+        scheduler = SubscriptionScheduler(gw, rt, config)
+        rt.set_active(False)
+        scheduler._tick()
+        assert gw.login_called == 1
+        assert gw.sub_start_called == 0  # login 后 return，本轮不启动订阅
+
+    def test_not_ready_skips_when_reconnect_in_progress(self):
+        """_reconnect_in_progress=True → 跳过 login（避免 _sdk_lock 竞争）。"""
+        gw = FakeGateway(ready=False, calendar=_today_cal())
+        gw._reconnect_in_progress = True
+        config = _make_config()
+        rt = RealtimeService(gateway=gw)
+        scheduler = SubscriptionScheduler(gw, rt, config)
+        rt.set_active(False)
+        scheduler._tick()
+        assert gw.login_called == 0
+        assert gw.sub_start_called == 0
+
+    def test_login_failure_swallowed(self):
+        """login 抛异常被吞（debug 日志），_tick 不炸、进程不死。"""
+        gw = FakeGateway(ready=False, calendar=_today_cal())
+        config = _make_config()
+        rt = RealtimeService(gateway=gw)
+        scheduler = SubscriptionScheduler(gw, rt, config)
+        rt.set_active(False)
+
+        def failing_login():
+            raise GatewayNotReadyError("fake login fail")
+
+        gw.login = failing_login
+        # _tick 不应抛异常
+        scheduler._tick()
+        assert gw.sub_start_called == 0

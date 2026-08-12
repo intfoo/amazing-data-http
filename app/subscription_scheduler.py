@@ -86,12 +86,32 @@ class SubscriptionScheduler:
         )
         if in_window:
             if not self._rt.is_active():
+                if not self._gw.is_ready():
+                    self._self_heal_login()
+                    return
                 logger.info("调度器：在订阅窗口内但订阅未活跃，尝试启动")
                 self._start_subscription(cal)
         else:
             if self._rt.is_active():
                 logger.info("调度器：不在订阅窗口，停止订阅")
                 self._stop_subscription()
+
+    def _self_heal_login(self) -> None:
+        """启动失败自愈：not ready 时每 tick（60s 天然限频）重试 login。
+
+        tgw 重连进行中跳过（避免 _sdk_lock 30s 竞争超时产生误导日志）。
+        异常吞掉（含 GatewayQueryError 锁竞争超时）：下次 tick 再试，进程不死。
+        """
+        if getattr(self._gw, "_reconnect_in_progress", False):
+            logger.debug("tgw 重连进行中，跳过调度器自愈 login")
+            return
+        if not self._config.is_configured():
+            return
+        try:
+            self._gw.login()
+            logger.info("调度器自愈 login 成功")
+        except Exception as e:
+            logger.debug("调度器自愈 login 失败: %s: %s", type(e).__name__, e)
 
     def _start_subscription(self, cal: list[int]) -> None:
         """启动快照订阅（先 stop 清理旧资源，再 start）。"""

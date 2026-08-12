@@ -68,14 +68,22 @@ def test_is_window_calendar_fallback_default_true():
     assert is_subscription_window(now, cal) is True
 
 
-def test_is_window_calendar_none():
-    now = datetime.datetime(2024, 1, 2, 10, 30)
-    assert is_subscription_window(now, None) is False
+def test_is_window_calendar_none_weekday_fallback():
+    """calendar=None + 工作日窗口内 → True（weekday 兜底，默认）。"""
+    now = datetime.datetime(2024, 1, 2, 10, 30)  # 周二
+    assert is_subscription_window(now, None) is True
 
 
-def test_is_window_calendar_empty():
+def test_is_window_calendar_none_strict_mode():
+    """calendar=None + calendar_fallback_weekday=False → False（严格模式）。"""
     now = datetime.datetime(2024, 1, 2, 10, 30)
-    assert is_subscription_window(now, []) is False
+    assert is_subscription_window(now, None, calendar_fallback_weekday=False) is False
+
+
+def test_is_window_calendar_empty_weekday_fallback():
+    """calendar=[] + 工作日窗口内 → True（空列表同样走 weekday 兜底）。"""
+    now = datetime.datetime(2024, 1, 2, 10, 30)  # 周二
+    assert is_subscription_window(now, []) is True
 
 
 def test_is_window_custom_times():
@@ -91,3 +99,34 @@ def test_is_window_wide_window_always_true_on_trading_day():
     assert is_subscription_window(now, cal, open_time="00:00", close_time="23:59") is True
     now = datetime.datetime(2024, 1, 2, 23, 58)
     assert is_subscription_window(now, cal, open_time="00:00", close_time="23:59") is True
+
+
+# ---------------------------------------------------------------------------
+# calendar=None / 空 → weekday 兜底（2026-08-12 事故修复）
+# ---------------------------------------------------------------------------
+
+class TestNoneCalendarFallback:
+    """calendar=None（登录前/重连失败）时 weekday 兜底，避免盘中误判"不在窗口"。"""
+
+    def test_none_calendar_weekday_in_window(self):
+        """calendar=None + 周三 14:00 → True（weekday 兜底）。"""
+        wed = datetime.datetime(2026, 8, 12, 14, 0)  # 周三
+        assert is_subscription_window(wed, None) is True
+
+    def test_none_calendar_weekend(self):
+        sat = datetime.datetime(2026, 8, 15, 14, 0)  # 周六
+        assert is_subscription_window(sat, None) is False
+
+    def test_none_calendar_out_of_hours(self):
+        wed_evening = datetime.datetime(2026, 8, 12, 16, 0)  # 周三出窗
+        assert is_subscription_window(wed_evening, None) is False
+
+    def test_none_calendar_strict_mode(self):
+        """calendar_fallback_weekday=False + calendar=None → False（严格模式）。"""
+        wed = datetime.datetime(2026, 8, 12, 14, 0)
+        assert is_subscription_window(wed, None, calendar_fallback_weekday=False) is False
+
+    def test_cross_day_stale_calendar(self):
+        """跨日残留 calendar（不含今天）+ 工作日 → weekday 兜底 True。"""
+        wed = datetime.datetime(2026, 8, 12, 14, 0)
+        assert is_subscription_window(wed, [20260811]) is True

@@ -39,6 +39,7 @@ class FakeGateway:
         self.sub_stop_called = 0
         self._sub_code_list = None
         self._calendar = calendar
+        self._reconnect_in_progress = False
 
     def login(self) -> None:
         self.login_called += 1

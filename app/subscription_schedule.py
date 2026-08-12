@@ -26,14 +26,21 @@ def is_subscription_window(
 ) -> bool:
     """是否应启动订阅：交易日 且 在 [open_time, close_time] 窗口内。
 
-    calendar 为 None 或空时返回 False（login 前 / 无日历数据）。
+    calendar 为 None/空时走 weekday 兜底（calendar_fallback_weekday=False 时返回 False）。
     日历不含今天时：
     - calendar_fallback_weekday=True（默认）：用 weekday 兜底，周一~周五视为交易日
       （无法识别节假日，但避免 SDK 日历数据延迟导致交易时段订阅永不启动）
     - calendar_fallback_weekday=False：返回 False（严格按日历）
     """
     if not calendar:
-        return False
+        # calendar 为 None（登录前/重连失败保留期）：weekday 兜底，
+        # 避免日历缺失导致盘中误判"不在窗口"杀订阅清缓存（2026-08-12 事故）。
+        if not calendar_fallback_weekday:
+            return False
+        if now.weekday() >= 5:
+            return False
+        t = now.time()
+        return parse_hhmm(open_time) <= t <= parse_hhmm(close_time)
     today_int = int(now.strftime("%Y%m%d"))
     if today_int not in calendar:
         if not calendar_fallback_weekday:
