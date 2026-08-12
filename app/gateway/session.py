@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from app.gateway.base import GatewayNotReadyError, logger
 
 
@@ -14,14 +16,11 @@ class SessionMixin:
             self._do_login()
 
     def _do_login(self) -> None:
-        """实际登录流程：import SDK → login → BaseData → get_calendar → MarketData。
+        """实际登录流程：import SDK → 装事件钩子/probe → login → BaseData → calendar → MarketData。
 
-        SDK import 延迟到此处（而非模块顶部），使服务在无 SDK 环境下也能启动，
-        /health 能正常返回 503 诊断信息。
-
-        连接泄漏防护：ad.login() 成功后若后续步骤（BaseData/MarketData）失败，
-        必须调 _safe_logout 释放已建立的 SDK 连接，否则 _ready 仍为 False，
-        下次重 login 时不会先 logout（因 if self._ready 为 False），旧连接泄漏。
+        SystemExit 兜底：SDK tgw_login.login 失败路径是 print('login fail') + exit(0)，
+        SystemExit 是 BaseException，except Exception 接不住，必须显式捕获，
+        否则穿透 lifespan 杀进程（uvicorn startup failed → 容器重启死循环）。
         """
         try:
             import AmazingData as ad
@@ -31,7 +30,13 @@ class SessionMixin:
             raise GatewayNotReadyError(f"SDK import failed: {e}") from e
 
         self._ad = ad
-        sdk_logged_in = False  # 标记 ad.login 是否已成功，用于失败时回滚
+        # 钩子/probe 前置：import tgw 后 g_spi 即存在（interface.py 模块级创建），
+        # login 前安装可捕获失败全程的 OnLog/OnLogon 事件（真实失败原因）。
+        self._install_tgw_event_logger()
+        self._install_login_spi_probe()
+        sdk_logged_in = False
+        self._login_events.clear()
+        self._login_in_progress = True
         try:
             if self._ready:
                 self._safe_logout()
@@ -49,23 +54,37 @@ class SessionMixin:
             self._market_data = ad.MarketData(calendar)
             self._info_data = ad.InfoData()
             self._ready = True
+            self._last_login_error = None
             logger.info("SDK 登录成功")
-            self._install_tgw_event_logger()
-        except Exception as e:
-            # ad.login 已成功但后续步骤失败：必须 logout 释放连接，否则连接泄漏
+        except SystemExit as e:
+            # SDK login 内部 exit(0) → 进程存活兜底
+            self._build_last_login_error("sdk_exit", f"SDK login 内部 exit({e.code})")
             if sdk_logged_in:
                 self._safe_logout()
             self._ready = False
-            logger.error("SDK 登录失败: %s: %s", type(e).__name__, e)
+            logger.error("SDK 登录失败: %s", self._last_login_error)
+            raise GatewayNotReadyError(f"login failed: SDK exit({e.code})") from e
+        except Exception as e:
+            self._build_last_login_error("exception", f"{type(e).__name__}: {e}")
+            if sdk_logged_in:
+                self._safe_logout()
+            self._ready = False
+            logger.error("SDK 登录失败: %s", self._last_login_error)
             raise GatewayNotReadyError(f"login failed: {e}") from e
+        finally:
+            self._login_in_progress = False
 
     def logout(self) -> None:
-        """线程安全的登出入口。"""
+        """线程安全的登出入口。shutdown 路径：清空 calendar。"""
         with self._sdk_lock():
-            self._safe_logout()
+            self._safe_logout(clear_calendar=True)
 
-    def _safe_logout(self) -> None:
-        """登出并清理状态。登出异常被忽略（不影响后续重登录）。"""
+    def _safe_logout(self, clear_calendar: bool = False) -> None:
+        """登出并清理状态。登出异常被忽略（不影响后续重登录）。
+
+        clear_calendar=False（重连路径默认）：保留 calendar（纯日期数据，当天有效），
+        供调度器在重连失败期间正确判定订阅窗口，避免误判"不在窗口"杀订阅清缓存。
+        """
         if self._ad is None:
             return
         try:
@@ -76,7 +95,25 @@ class SessionMixin:
         self._market_data = None
         self._base_data = None
         self._info_data = None
-        self._calendar = None
+        if clear_calendar:
+            self._calendar = None
+
+    def _build_last_login_error(self, category: str, detail: str) -> None:
+        """构建登录失败诊断：spi max_limitation 升级分类 + 登录窗口事件缓冲。"""
+        spi = self._last_login_spi
+        if spi is not None and getattr(spi, "max_limitation", False):
+            category = "max_limitation"
+        self._last_login_error = {
+            "ts": time.time(),
+            "category": category,
+            "detail": detail,
+            "events": list(self._login_events)[-20:],
+        }
+
+    @property
+    def last_login_error(self) -> dict | None:
+        """最近一次登录失败诊断 {ts, category, detail, events}。成功登录后为 None。"""
+        return self._last_login_error
 
     def is_ready(self) -> bool:
         """SDK 是否已登录且 MarketData 已初始化。"""

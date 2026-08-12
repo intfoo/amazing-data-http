@@ -30,6 +30,8 @@ class Config:
     stale_threshold_sec: int = 90          # watchdog 失活阈值（秒）
     watchdog_interval_sec: int = 60        # watchdog 检查间隔（秒）
     calendar_fallback_weekday: bool = True  # 日历不含今天时用 weekday 兜底（周一~周五视为交易日）
+    reconnect_max_interval_sec: int = 300  # tgw 主动重连退避上限（秒）
+    stale_max_age_sec: int = 300           # /realtime 订阅缓存 stale 上限（秒），超过走 fallback
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -57,6 +59,8 @@ class Config:
             watchdog_interval_sec=int(os.environ.get("WATCHDOG_INTERVAL_SEC", "60") or "60"),
             calendar_fallback_weekday=os.environ.get("CALENDAR_FALLBACK_WEEKDAY", "true").lower()
             in ("1", "true", "yes", "on"),
+            reconnect_max_interval_sec=int(os.environ.get("RECONNECT_MAX_INTERVAL_SEC", "300") or "300"),
+            stale_max_age_sec=int(os.environ.get("STALE_MAX_AGE_SEC", "300") or "300"),
         )
 
     def is_configured(self) -> bool:

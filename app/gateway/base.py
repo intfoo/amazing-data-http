@@ -41,6 +41,10 @@ _CONNECTION_KEYWORDS: tuple[str, ...] = (
 _RECONNECT_COOLDOWN_SEC = 60    # 主动重连冷却（heartbeat 每 30s 报一次，避免频繁 relogin）
 _DISCONNECT_DEDUP_SEC = 300     # 相同断线 WARNING 去重窗口
 
+_RECONNECT_MAX_INTERVAL_SEC = 300   # 主动重连退避上限（Config 默认值同源）
+_TGW_NOISE_PATTERNS: tuple[str, ...] = ("HandleFile", "Now use ip", "mdga.json")
+_TGW_NOISE_DEDUP_SEC = 60           # tgw 噪音日志 dedup 窗口
+
 ADJ_FACTOR_TIMEOUT_SEC = 120  # get_adj_factor SDK 调用超时（正常本地 <1s / 远程 ~21s）
 
 SDK_LOCK_TIMEOUT_SEC = 30  # gateway._lock 竞争超时；超时说明有 SDK 调用挂起未释放
@@ -105,6 +109,11 @@ class Gateway(Protocol):
 
     @property
     def calendar(self) -> list[int] | None: ...
+
+    @property
+    def last_login_error(self) -> dict | None: ...
+    @property
+    def reconnect_attempts(self) -> int: ...
 
 
 class GatewayError(Exception):

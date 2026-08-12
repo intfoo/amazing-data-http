@@ -72,3 +72,11 @@ class AmazingDataGateway(
         self._reconnect_in_progress = False
         self._last_reconnect_attempt = 0.0
         self._last_disconnect_log: dict = {"msg": None, "ts": 0.0}
+        self._last_noise_log: dict = {"msg": None, "ts": 0.0}  # tgw 噪音 dedup（独立槽位）
+        self._reconnect_failures = 0    # 连续重连失败计数（指数退避用）
+        self._reconnect_attempts = 0    # 累计重连尝试（/health 诊断）
+        # 登录诊断（last_login_error / spi probe / 事件缓冲）
+        self._last_login_error: dict | None = None
+        self._last_login_spi = None     # set_cfg probe 捕获的 log_spi
+        self._login_events: list[dict] = []  # 登录窗口事件环形缓冲（≤20 条）
+        self._login_in_progress = False
