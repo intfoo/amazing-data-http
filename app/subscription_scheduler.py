@@ -111,13 +111,15 @@ class SubscriptionScheduler:
                 logger.warning("调度器 stop 旧订阅异常（已忽略）: %s: %s", type(e).__name__, e)
             t0 = time.monotonic()
             try:
-                code_list = self._gw.get_realtime_code_list()
+                universe = self._gw.get_realtime_universe()
+                code_list = list(universe)
                 t1 = time.monotonic()
                 self._gw.start_snapshot_subscription(
                     code_list,
                     on_data=self._rt.on_snapshot,
                     on_error=self._rt.on_subscription_error,
                 )
+                self._rt.set_type_map(universe)
                 self._rt.set_active(True)
                 self._rt.start_watchdog(
                     cal,
@@ -130,7 +132,7 @@ class SubscriptionScheduler:
                 t2 = time.monotonic()
                 logger.info(
                     "调度器启动订阅成功: %d 只 "
-                    "(get_realtime_code_list=%.3fs subscribe=%.3fs)",
+                    "(get_realtime_universe=%.3fs subscribe=%.3fs)",
                     len(code_list), t1 - t0, t2 - t1,
                 )
             except Exception as e:

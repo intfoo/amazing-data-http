@@ -185,24 +185,30 @@
 
 返回实时行情快照。**优先读订阅缓存**（盘中 SDK 实时推送，每个 code 保留最新一笔），**缓存空时 fallback 查当日历史快照**（`query_snapshot` 取收盘快照，覆盖非交易时段）。
 
-> 订阅推送只在交易时段生效；非交易时段缓存为空，自动 fallback 到 `query_snapshot` 查当日快照（取每只股票最后一行）。fallback 结果带 60 秒 TTL 缓存。
+> 订阅推送只在交易时段生效；非交易时段缓存为空，自动 fallback 到 `query_snapshot` 查当日快照（取每只股票最后一行）。fallback 结果带 120 秒 TTL 缓存。
 
 **查询参数**：
 
 | 参数 | 类型 | 约束 |
 |------|------|------|
 | `codes` | string | 可选。逗号分隔的代码列表，如 `?codes=000001.SZ,600000.SH`。不传返回全市场快照；传入则过滤返回指定代码。不触发额外订阅 |
+| `types` | string | 可选。逗号分隔的证券类型，合法值 `stock`/`index`/`etf`，如 `?types=stock,etf`。不传不做类型过滤；传入则按 `security_type` 字段过滤。含非法值返回 422。`codes` 与 `types` 叠加：先按 `codes` 过滤，再按 `types` 过滤 |
 
 **示例**：
 ```
 GET /realtime                           # 全市场快照
 GET /realtime?codes=000001.SZ         # 单个代码
 GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
+GET /realtime?types=etf               # 仅 ETF
+GET /realtime?types=stock,etf          # 股票 + ETF
+GET /realtime?codes=510300.SH&types=etf  # 代码 + 类型叠加
 ```
+
+> **types 过滤语义（宽容模式）**：记录的 `security_type` 在 `types` 集合中 → 保留；不在映射中的代码（`security_type` 为 `"unknown"`）→ 放行（盘后/新品种前向兼容）。不传 `types` 时不过滤，行为与升级前完全一致。非法值（如 `?types=bond`）→ HTTP 422 `INVALID_REQUEST`。
 
 **成功响应**（HTTP 200）：
 ```json
-{"data": [{"code": "000001.SZ", "trade_time": "2024-01-02T09:30:00", "last": 10.3, "pre_close": 10.2, "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 123456, "amount": 1270000.0, "num_trades": 1234, "high_limited": 11.22, "low_limited": 9.18, "ask_price1": 10.31, "ask_volume1": 500, "bid_price1": 10.29, "bid_volume1": 480, "trading_phase_code": "T0 "}]}
+{"data": [{"code": "000001.SZ", "security_type": "stock", "trade_time": "2024-01-02T09:30:00", "last": 10.3, "pre_close": 10.2, "open": 10.2, "high": 10.45, "low": 10.1, "close": 10.3, "volume": 123456, "amount": 1270000.0, "num_trades": 1234, "high_limited": 11.22, "low_limited": 9.18, "ask_price1": 10.31, "ask_volume1": 500, "bid_price1": 10.29, "bid_volume1": 480, "trading_phase_code": "T0 "}]}
 ```
 
 响应 `data` 数组元素字段（透传 SDK `Snapshot` 全部字段，字段名保持 SDK 原始名）：
@@ -210,6 +216,7 @@ GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `code` | string | 证券代码+市场 |
+| `security_type` | string | 证券类型：`stock`/`index`/`etf`/`unknown`（订阅启动前或类型映射中不存在的代码为 `unknown`） |
 | `trade_time` | string | ISO datetime，交易所行情数据时间 |
 | `pre_close` | float | 昨收价 |
 | `last` | float | 最新价 |
@@ -233,7 +240,7 @@ GET /realtime?codes=000001.SZ,600000.SH   # 多个代码
 
 **数据来源**：
 - 交易时段：订阅缓存（SDK 实时推送的最新快照）
-- 非交易时段/订阅未推送：fallback `query_snapshot` 查当日历史快照（取每只股票最后一行 = 收盘快照），结果带 60 秒 TTL 缓存
+- 非交易时段/订阅未推送：fallback `query_snapshot` 查当日历史快照（取每只股票最后一行 = 收盘快照），结果带 120 秒 TTL 缓存
 - SDK 未就绪（未登录）：HTTP 503 `SDK_NOT_READY`
 
 ## GET /health

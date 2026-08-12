@@ -83,38 +83,67 @@ class QueryMarketMixin:
             )
             return result
 
-    def get_realtime_code_list(self) -> list[str]:
-        """获取实时订阅用的合并代码列表（股票 + 指数）。
+    def get_realtime_universe(self) -> dict[str, str]:
+        """获取实时订阅用的全市场代码表（股票 + 指数 + ETF），返回 {code: type}。
 
-        先取股票列表（EXTRA_STOCK_A），再取指数列表（EXTRA_INDEX_A）。
+        依次取 EXTRA_STOCK_A → EXTRA_INDEX_A → EXTRA_ETF，合并为 dict[code, "stock"|"index"|"etf"]。
         股票列表获取失败时异常正常传播（GatewayNotReadyError / GatewayQueryError）。
-        指数列表获取失败时降级：记录 warning，只返回股票列表，不抛异常。
+        指数 / ETF 列表获取失败时各自独立降级：记录 warning，跳过该类，不影响其余类别。
         """
         t_total = time.perf_counter()
+        universe: dict[str, str] = {}
+
+        # 股票（EXTRA_STOCK_A）：失败异常传播
         stock_codes = self.get_code_list(security_type="EXTRA_STOCK_A")
         t_stock = time.perf_counter() - t_total
+        universe.update({c: "stock" for c in stock_codes})
+
+        # 指数（EXTRA_INDEX_A）：失败 warn 降级
         try:
             t0 = time.perf_counter()
             index_codes = self.get_code_list(security_type="EXTRA_INDEX_A")
             t_index = time.perf_counter() - t0
         except Exception as e:
             logger.warning(
-                "get_code_list(EXTRA_INDEX_A) 失败，降级为仅股票: %s: %s",
+                "get_code_list(EXTRA_INDEX_A) 失败，降级为仅股票+ETF: %s: %s",
                 type(e).__name__, e,
             )
             logger.info(
-                "实时代码列表就绪: %d 只股票 (%.3fs，指数失败，总计 %.3fs)",
-                len(stock_codes), t_stock, time.perf_counter() - t_total,
+                "实时代码列表就绪: %d 股票 + 0 指数 + 0 ETF = %d "
+                "(stock=%.3fs，指数失败，总计 %.3fs)",
+                len(stock_codes), len(universe),
+                t_stock, time.perf_counter() - t_total,
             )
-            return stock_codes
+            return universe
+        universe.update({c: "index" for c in index_codes})
+
+        # ETF（EXTRA_ETF）：失败 warn 降级
+        try:
+            t0 = time.perf_counter()
+            etf_codes = self.get_code_list(security_type="EXTRA_ETF")
+            t_etf = time.perf_counter() - t0
+        except Exception as e:
+            logger.warning(
+                "get_code_list(EXTRA_ETF) 失败，降级为仅股票+指数: %s: %s",
+                type(e).__name__, e,
+            )
+            logger.info(
+                "实时代码列表就绪: %d 股票 + %d 指数 + 0 ETF = %d "
+                "(stock=%.3fs index=%.3fs，ETF失败，总计 %.3fs)",
+                len(stock_codes), len(index_codes), len(universe),
+                t_stock, t_index, time.perf_counter() - t_total,
+            )
+            return universe
+        universe.update({c: "etf" for c in etf_codes})
+
         total = time.perf_counter() - t_total
         logger.info(
-            "实时代码列表: %d 股票 + %d 指数 = %d "
-            "(stock=%.3fs index=%.3fs total=%.3fs)",
-            len(stock_codes), len(index_codes), len(stock_codes) + len(index_codes),
-            t_stock, t_index, total,
+            "实时代码列表: %d 股票 + %d 指数 + %d ETF = %d "
+            "(stock=%.3fs index=%.3fs etf=%.3fs total=%.3fs)",
+            len(stock_codes), len(index_codes), len(etf_codes), len(universe),
+            t_stock, t_index, t_etf, total,
         )
-        return stock_codes + index_codes
+        return universe
 
     def query_snapshot(
         self,

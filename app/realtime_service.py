@@ -55,6 +55,9 @@ class RealtimeService:
         # 缓存条目数有界，无需淘汰策略。若未来 SDK 引入更多类型可考虑加上限。
         self._extract_fns: dict = {}
 
+        # 代码 → 证券类型映射（"stock"|"index"|"etf"），由调度器 set_type_map 设置。
+        # 整体替换引用（GIL 保证指针赋值原子性），读侧 get() 无需加锁。
+        self._type_map: dict[str, str] = {}
         # Watchdog 相关字段
         self._last_snapshot_ts: float = 0.0
         self._deactivation_reason: str | None = None  # "stale" / "error" / None
@@ -71,6 +74,7 @@ class RealtimeService:
             record = self._snapshot_to_dict(data)
             code = record.get("code") if record else None
             if code:
+                record["security_type"] = self._type_map.get(code, "unknown")
                 with self._lock:
                     self._cache[code] = record
             self._last_snapshot_ts = time.time()
@@ -93,10 +97,16 @@ class RealtimeService:
         self._deactivation_reason = "error"
         logger.error("实时订阅因错误停用: %s", err)
 
-    def snapshot(self, codes: list[str] | None = None) -> list[dict]:
+    def snapshot(
+        self,
+        codes: list[str] | None = None,
+        types: set[str] | None = None,
+    ) -> list[dict]:
         """GET /realtime 读缓存，返回快照列表。
 
         codes 为 None 时返回全市场快照；非空时只返回指定 code 的快照。
+        types 非 None 时按 security_type 过滤：类型在 types 中或类型为 "unknown"
+        （不在映射中）的记录保留（宽容模式）。types 为 None 时不过滤（向后兼容）。
         锁内只取 values 引用快照（list 浅复制引用），浅拷贝 dict 在锁外完成，
         避免长时间持锁阻塞 on_snapshot 写入。
         """
@@ -106,7 +116,15 @@ class RealtimeService:
             else:
                 wanted = set(codes)
                 items = [v for code, v in self._cache.items() if code in wanted]
-        return [dict(v) for v in items]
+        result = []
+        for v in items:
+            r = dict(v)
+            if types is not None:
+                st = r.get("security_type", "unknown")
+                if st not in types and st != "unknown":
+                    continue
+            result.append(r)
+        return result
 
     def is_active(self) -> bool:
         return self._active
@@ -137,10 +155,19 @@ class RealtimeService:
             datetime.datetime.now(), calendar, open_time, close_time, fallback,
         )
 
+    def set_type_map(self, mapping: dict[str, str]) -> None:
+        """设置代码 → 证券类型映射（调度器启动订阅时调用）。
+
+        整体替换 self._type_map 引用（GIL 保证指针赋值原子性），读侧
+        .get() 无需加锁。mapping 是 {code: "stock"|"index"|"etf"}。
+        """
+        self._type_map = mapping
+
     def clear_cache(self) -> None:
-        """清空订阅缓存（调度器停止订阅时调用）。"""
+        """清空订阅缓存与类型映射（调度器停止订阅时调用）。"""
         with self._lock:
             self._cache.clear()
+        self._type_map = {}
 
     def deactivation_reason(self) -> str | None:
         """供 HealthService 区分 inactive_stale / inactive_not_started / inactive_error。"""
@@ -219,7 +246,11 @@ class RealtimeService:
                 self._deactivation_reason = "stale"
                 break
 
-    def fallback_snapshot(self, codes: list[str] | None = None) -> list[dict]:
+    def fallback_snapshot(
+        self,
+        codes: list[str] | None = None,
+        types: set[str] | None = None,
+    ) -> list[dict]:
         """订阅缓存为空时的 fallback：用 query_snapshot 查当日历史快照。
 
         取每只股票的最后一行（最新/收盘快照）序列化返回。
@@ -238,28 +269,28 @@ class RealtimeService:
             # 无 codes：不查全市场。有旧缓存返回缓存；缓存空时检查 SDK 就绪
             # （未就绪抛 GatewayNotReadyError 让路由转 503，保持错误语义不变）
             if self._fallback_cache:
-                return list(self._fallback_cache)
+                return self._filter_fallback(None, types)
             if not self._gw.is_ready():
                 raise GatewayNotReadyError("gateway not ready")
             return []
         now = time.time()
         # 1. 缓存有效 → 直接返回过滤结果
         if self._fallback_cache is not None and now - self._fallback_time <= FALLBACK_TTL:
-            return self._filter_fallback(codes)
+            return self._filter_fallback(codes, types)
         # 2. 缓存过期/空 → 非阻塞抢 singleflight 锁
         if not self._fallback_lock.acquire(blocking=False):
             # 已有查询在跑：返回旧缓存（哪怕过期）或空，不阻塞、不重复查询
             if self._fallback_cache:
                 logger.info("fallback 查询进行中，返回旧缓存: %d 条",
                             len(self._fallback_cache))
-                return self._filter_fallback(codes)
+                return self._filter_fallback(codes, types)
             logger.info("fallback 查询进行中，缓存为空，返回 []")
             return []
         try:
             # 双检：抢锁期间可能已被其他请求填充缓存
             now = time.time()
             if self._fallback_cache is not None and now - self._fallback_time <= FALLBACK_TTL:
-                return self._filter_fallback(codes)
+                return self._filter_fallback(codes, types)
             # codes 此处必非空（无 codes 已在方法开头短路返回），直接用作查询列表
             try:
                 result = self._gw.query_snapshot(
@@ -270,7 +301,7 @@ class RealtimeService:
                 raise
             except Exception as e:
                 logger.warning("fallback query_snapshot 失败: %s: %s", type(e).__name__, e)
-                return self._filter_fallback(codes) if self._fallback_cache else []
+                return self._filter_fallback(codes, types) if self._fallback_cache else []
             # 合并每只股票的最后一行（最新快照），一次 serialize_dataframe 序列化，
             # 避免几千只股票逐只调 serialize_dataframe 的开销。
             import pandas as pd
@@ -285,16 +316,34 @@ class RealtimeService:
             logger.info("fallback query_snapshot 已缓存: %d 条", len(records))
         finally:
             self._fallback_lock.release()
-        return self._filter_fallback(codes)
+        return self._filter_fallback(codes, types)
 
-    def _filter_fallback(self, codes: list[str] | None) -> list[dict]:
-        """在 fallback 缓存上按 codes 过滤，返回浅拷贝列表。缓存为空时返回 []。"""
+    def _filter_fallback(
+        self,
+        codes: list[str] | None,
+        types: set[str] | None = None,
+    ) -> list[dict]:
+        """在 fallback 缓存上按 codes + types 过滤，返回浅拷贝列表。
+
+        fallback 缓存记录本身无 security_type 字段（不经 on_snapshot 注入），
+        此处按 code 查 _type_map 统一注入并过滤。浅拷贝 dict 不污染共享
+        _fallback_cache 中的原始 dict。缓存为空时返回 []。
+        """
         if not self._fallback_cache:
             return []
         if codes:
             wanted = set(codes)
-            return [r for r in self._fallback_cache if r.get("code") in wanted]
-        return list(self._fallback_cache)
+            filtered = [r for r in self._fallback_cache if r.get("code") in wanted]
+        else:
+            filtered = self._fallback_cache
+        result = []
+        for r in filtered:
+            r_copy = dict(r)  # 浅拷贝，不污染共享 _fallback_cache 中的原始 dict
+            st = self._type_map.get(r_copy.get("code"), "unknown")
+            r_copy["security_type"] = st
+            if types is None or st in types or st == "unknown":
+                result.append(r_copy)
+        return result
 
     def _snapshot_to_dict(self, data) -> dict:
         """Snapshot 对象 → JSON 安全 dict（按类型缓存提取函数）。

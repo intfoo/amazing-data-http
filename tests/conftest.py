@@ -15,7 +15,8 @@ class FakeGateway:
                  calendar: list[int] | None = None,
                  code_info_result: pd.DataFrame | None = None,
                  fund_share_result: dict[str, pd.DataFrame] | None = None,
-                 fund_nav_result: dict[str, pd.DataFrame] | None = None):
+                 fund_nav_result: dict[str, pd.DataFrame] | None = None,
+                 etf_code_list: list[str] | None = None):
         self._ready = ready
         self._result = result if result is not _UNSET else {}
         self._adj_factor_result = adj_factor_result
@@ -31,6 +32,9 @@ class FakeGateway:
         self.fund_nav_calls: list[dict] = []
         self._code_list = ["000001.SZ", "600000.SH"]
         self._index_code_list = ["000001.SH", "399001.SZ"]
+        self._etf_code_list = etf_code_list if etf_code_list is not None else [
+            "510300.SH", "159915.SZ",
+        ]
         self.sub_start_called = 0
         self.sub_stop_called = 0
         self._sub_code_list = None
@@ -75,10 +79,20 @@ class FakeGateway:
             raise GatewayNotReadyError("fake not ready")
         if security_type == "EXTRA_INDEX_A":
             return list(self._index_code_list)
+        if security_type == "EXTRA_ETF":
+            return list(self._etf_code_list)
         return list(self._code_list)
 
-    def get_realtime_code_list(self) -> list[str]:
-        return self.get_code_list("EXTRA_STOCK_A") + self.get_code_list("EXTRA_INDEX_A")
+    def get_realtime_universe(self) -> dict[str, str]:
+        """返回 {code: "stock"|"index"|"etf"} 合并字典，供订阅 + 类型映射使用。"""
+        universe: dict[str, str] = {}
+        for code in self.get_code_list("EXTRA_STOCK_A"):
+            universe[code] = "stock"
+        for code in self.get_code_list("EXTRA_INDEX_A"):
+            universe[code] = "index"
+        for code in self.get_code_list("EXTRA_ETF"):
+            universe[code] = "etf"
+        return universe
 
     def query_snapshot(self, codes, trade_date=None, begin_time=None, end_time=None):
         """FakeGateway 快照查询：未就绪抛 GatewayNotReadyError，否则返回空 dict。"""

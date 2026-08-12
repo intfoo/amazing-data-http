@@ -22,8 +22,8 @@ class FakeGW:
     def stop_subscription(self):
         pass
 
-    def get_realtime_code_list(self):
-        return ["000001.SZ"]
+    def get_realtime_universe(self):
+        return {"000001.SZ": "stock"}
 
     def start_snapshot_subscription(self, code_list, on_data, on_error=None):
         pass

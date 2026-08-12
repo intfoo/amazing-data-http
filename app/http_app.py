@@ -398,22 +398,38 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             app.state.sdk_gate.release()
 
     @app.get("/realtime")
-    async def realtime(request: Request, codes: str | None = None):
+    async def realtime(request: Request, codes: str | None = None, types: str | None = None):
         """实时行情快照。优先读订阅缓存（盘中实时），缓存空时 fallback 查当日历史快照。
 
         codes 为逗号分隔的代码字符串（如 ?codes=000001.SZ,600000.SH），
         从全市场缓存中过滤返回；不传则返回全市场。
+        types 为逗号分隔的证券类型（如 ?types=stock,etf），合法值 stock/index/etf，
+        非法值返回 422。codes 与 types 叠加过滤：先按 codes，再按 types。
         """
-        logger.info("request_id=%s /realtime codes=%s", get_request_id(request), codes or "(all)")
+        logger.info("request_id=%s /realtime codes=%s types=%s",
+                    get_request_id(request), codes or "(all)", types or "(all)")
         code_list = [s.strip() for s in codes.split(",") if s.strip()] if codes else None
+        # 解析 types 参数
+        type_set = {t.strip() for t in types.split(",") if t.strip()} if types else None
+        if type_set is not None:
+            valid_types = {"stock", "index", "etf"}
+            invalid = type_set - valid_types
+            if invalid:
+                raise AppError(
+                    INVALID_REQUEST,
+                    f"invalid types: {','.join(sorted(invalid))}, allowed: stock,index,etf",
+                    422,
+                )
         # 优先读订阅缓存（盘中实时推送的数据）；snapshot 只读内存，不阻塞 event loop
-        data = realtime_service.snapshot(code_list)
+        data = realtime_service.snapshot(code_list, type_set)
         if not data:
             # 缓存空（非交易时段/订阅未推送），fallback 查当日历史快照。
             # query_snapshot 是同步阻塞 SDK 调用（全市场可能数分钟），必须放线程池，
             # 否则卡死 event loop 导致 /health 等其他请求全部阻塞。
             try:
-                data = await asyncio.to_thread(realtime_service.fallback_snapshot, code_list)
+                data = await asyncio.to_thread(
+                    realtime_service.fallback_snapshot, code_list, type_set,
+                )
             except GatewayNotReadyError as e:
                 logger.info("request_id=%s realtime fallback: SDK 未就绪",
                             get_request_id(request))

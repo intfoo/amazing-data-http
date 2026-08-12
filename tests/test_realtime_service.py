@@ -528,3 +528,201 @@ def test_on_snapshot_reactivates_when_no_window_params():
     svc.set_active(False)
     svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
     assert svc.is_active() is True
+
+
+# ---------------------------------------------------------------------------
+# ETF 类型注入与过滤测试（设计文档 §4.2）
+# ---------------------------------------------------------------------------
+
+
+def test_on_snapshot_injects_security_type_known():
+    """set_type_map 后 on_snapshot 注入的 record 含 security_type 且值正确。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_type_map({
+        "000001.SZ": "stock",
+        "510300.SH": "etf",
+    })
+    svc.on_snapshot(_snap(last=10.3, code="000001.SZ"))
+    svc.on_snapshot(_snap(last=4.1, code="510300.SH"))
+    data = svc.snapshot()
+    by_code = {r["code"]: r for r in data}
+    assert by_code["000001.SZ"]["security_type"] == "stock"
+    assert by_code["510300.SH"]["security_type"] == "etf"
+
+
+def test_on_snapshot_injects_security_type_unknown():
+    """映射查不到的 code → security_type 为 "unknown"。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_type_map({"000001.SZ": "stock"})
+    # 510300.SH 不在映射中
+    svc.on_snapshot(_snap(last=4.1, code="510300.SH"))
+    data = svc.snapshot()
+    assert len(data) == 1
+    assert data[0]["security_type"] == "unknown"
+
+
+def test_snapshot_types_filter_etf():
+    """snapshot(types={"etf"})：etf 保留、stock 排除、unknown 放行。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_type_map({
+        "000001.SZ": "stock",
+        "510300.SH": "etf",
+    })
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))   # stock
+    svc.on_snapshot(_snap(last=4.1, code="510300.SH"))    # etf
+    svc.on_snapshot(_snap(last=20.0, code="159915.SZ"))   # unknown（不在映射中）
+    # types={"etf"} → 只保留 etf + unknown
+    data = svc.snapshot(types={"etf"})
+    codes = {r["code"] for r in data}
+    assert "510300.SH" in codes       # etf 保留
+    assert "159915.SZ" in codes       # unknown 放行
+    assert "000001.SZ" not in codes   # stock 排除
+
+
+def test_snapshot_types_none_returns_all():
+    """types=None 不过滤，全量返回。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_type_map({
+        "000001.SZ": "stock",
+        "510300.SH": "etf",
+    })
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
+    svc.on_snapshot(_snap(last=4.1, code="510300.SH"))
+    svc.on_snapshot(_snap(last=20.0, code="159915.SZ"))  # unknown
+    data = svc.snapshot(types=None)
+    assert len(data) == 3
+
+
+def test_snapshot_types_filter_stock():
+    """types={"stock"} 只保留 stock + unknown（宽容模式：未知类型放行）。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_type_map({
+        "000001.SZ": "stock",
+        "510300.SH": "etf",
+    })
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))   # stock
+    svc.on_snapshot(_snap(last=4.1, code="510300.SH"))    # etf
+    svc.on_snapshot(_snap(last=20.0, code="159915.SZ"))   # unknown
+    data = svc.snapshot(types={"stock"})
+    codes = {r["code"] for r in data}
+    assert "000001.SZ" in codes       # stock 保留
+    assert "510300.SH" not in codes   # etf 排除
+    assert "159915.SZ" in codes       # unknown 放行（宽容模式）
+
+
+def test_fallback_snapshot_types_filter_consistent():
+    """fallback_snapshot(types=...) 过滤语义与 snapshot 一致。"""
+    import pandas as pd
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    svc.set_type_map({
+        "000001.SZ": "stock",
+        "510300.SH": "etf",
+    })
+    gw.query_snapshot = lambda codes, **kw: {
+        "000001.SZ": pd.DataFrame({
+            "code": ["000001.SZ"],
+            "last": [10.3],
+            "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+        }),
+        "510300.SH": pd.DataFrame({
+            "code": ["510300.SH"],
+            "last": [4.1],
+            "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+        }),
+    }
+    result = svc.fallback_snapshot(
+        ["000001.SZ", "510300.SH"], types={"etf"},
+    )
+    assert len(result) == 1
+    assert result[0]["code"] == "510300.SH"
+    assert result[0]["security_type"] == "etf"
+
+
+def test_fallback_snapshot_no_type_map_injects_unknown():
+    """fallback 未设置 type_map 时所有记录 security_type 为 unknown（宽容放行）。"""
+    import pandas as pd
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    # 不调 set_type_map → _type_map 为空
+    gw.query_snapshot = lambda codes, **kw: {
+        "000001.SZ": pd.DataFrame({
+            "code": ["000001.SZ"],
+            "last": [10.3],
+            "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+        }),
+    }
+    result = svc.fallback_snapshot(["000001.SZ"])
+    assert len(result) == 1
+    assert result[0]["security_type"] == "unknown"
+
+
+def test_fallback_snapshot_types_unknown_passes_through():
+    """fallback 中未知类型的记录在 types 非空时放行（宽容模式）。"""
+    import pandas as pd
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    # 只映射了 000001.SZ，510300.SH 未知
+    svc.set_type_map({"000001.SZ": "stock"})
+    gw.query_snapshot = lambda codes, **kw: {
+        "000001.SZ": pd.DataFrame({
+            "code": ["000001.SZ"],
+            "last": [10.3],
+            "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+        }),
+        "510300.SH": pd.DataFrame({
+            "code": ["510300.SH"],
+            "last": [4.1],
+            "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+        }),
+    }
+    result = svc.fallback_snapshot(
+        ["000001.SZ", "510300.SH"], types={"etf"},
+    )
+    # 000001.SZ 是 stock（不在 types 中）→ 排除
+    # 510300.SH 是 unknown → 放行
+    assert len(result) == 1
+    assert result[0]["code"] == "510300.SH"
+    assert result[0]["security_type"] == "unknown"
+
+
+def test_fallback_snapshot_cache_not_polluted_by_injection():
+    """连续两次 fallback_snapshot，第二次记录仍只有一份 security_type。
+
+    fallback 缓存为全量共享，注入在浅拷贝上进行，不污染原始缓存。
+    第一次调用注入 security_type 后，第二次调用不应出现重复注入或残留。
+    """
+    import pandas as pd
+    gw = FakeGateway(ready=True)
+    svc = RealtimeService(gateway=gw)
+    svc.set_type_map({"000001.SZ": "stock"})
+    gw.query_snapshot = lambda codes, **kw: {
+        "000001.SZ": pd.DataFrame({
+            "code": ["000001.SZ"],
+            "last": [10.3],
+            "trade_time": [pd.Timestamp("2024-01-02T15:00")],
+        }),
+    }
+    # 第一次调用（缓存填充 + 注入）
+    r1 = svc.fallback_snapshot(["000001.SZ"])
+    assert len(r1) == 1
+    assert r1[0]["security_type"] == "stock"
+    # 第二次调用（走缓存，注入在浅拷贝上）
+    r2 = svc.fallback_snapshot(["000001.SZ"])
+    assert len(r2) == 1
+    assert r2[0]["security_type"] == "stock"
+    # 确保缓存原始记录没有被注入污染（不含 security_type）
+    raw = svc._fallback_cache[0]
+    assert "security_type" not in raw
+
+
+def test_clear_cache_clears_type_map():
+    """clear_cache 清空类型映射：clear 后 on_snapshot 注入 "unknown"。"""
+    svc = RealtimeService(gateway=None)
+    svc.set_type_map({"000001.SZ": "stock"})
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
+    assert svc.snapshot()[0]["security_type"] == "stock"
+    svc.clear_cache()
+    # clear_cache 后类型映射被清空
+    svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
+    assert svc.snapshot()[0]["security_type"] == "unknown"
