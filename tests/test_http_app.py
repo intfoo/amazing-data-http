@@ -654,11 +654,16 @@ def test_lifespan_starts_watchdog_in_window():
 
 
 def test_lifespan_skips_subscription_no_calendar():
-    """calendar=None（gateway 未 login）时不启动订阅。"""
+    """calendar=None 且严格模式（fallback 关）时不启动订阅。
+
+    2026-08-12 起 calendar=None 默认走 weekday 兜底（工作日窗口内会启动订阅），
+    本用例固定 calendar_fallback_weekday=False 验证严格模式下的旧语义。
+    """
     gw = FakeGateway(ready=True, result={"000001.SZ": make_daily_df()},
                      calendar=None)
     config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
-                    subscription_open="00:00", subscription_close="23:59")
+                    subscription_open="00:00", subscription_close="23:59",
+                    calendar_fallback_weekday=False)
     app = create_app(config=config, gateway=gw)
     with TestClient(app) as client:
         _wait_scheduler(app)

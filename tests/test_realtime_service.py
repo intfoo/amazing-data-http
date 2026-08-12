@@ -461,12 +461,17 @@ def test_watchdog_non_window_does_not_trigger():
 
 
 def test_watchdog_calendar_none_does_not_trigger():
-    """calendar 为 None 时不触发（线程方式，避免同步调用死循环）。"""
+    """calendar 为 None 且严格模式（fallback 关）时不触发（线程方式，避免同步调用死循环）。
+
+    2026-08-12 起 calendar=None 默认走 weekday 兜底（工作日窗口内会正常判 stale），
+    本用例固定 calendar_fallback_weekday=False 验证严格模式下的旧语义。
+    """
     svc = RealtimeService(gateway=None)
     svc.set_active(True)
     svc._last_snapshot_ts = time.time() - 200
     svc.start_watchdog(None, stale_threshold_sec=90, watchdog_interval_sec=0,
-                       open_time="00:00", close_time="23:59")
+                       open_time="00:00", close_time="23:59",
+                       calendar_fallback_weekday=False)
     time.sleep(0.05)
     assert svc.is_active() is True
     svc.stop_watchdog()
