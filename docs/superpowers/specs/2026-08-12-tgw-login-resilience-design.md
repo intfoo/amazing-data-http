@@ -44,33 +44,22 @@
 
 ## 3. 详细设计
 
-### 3.1 SystemExit 兜底（新 `app/gateway/login_guard.py` + `session.py`）
+### 3.1 SystemExit 兜底（`session.py`）
 
-新增 `app/gateway/login_guard.py`：
+评审结论：SDK 的 `exit(0)` 在调用线程同步抛 `SystemExit`，**显式 `except SystemExit` 即可完整拦截**，无需 patch `builtins.exit`（全局副作用、线程安全风险，放弃 `login_guard.py` 方案）。
 
-```python
-class SdkLoginExitError(Exception):
-    """SDK login 内部调用 exit()/quit() 被拦截。携带 exit code。"""
-    def __init__(self, code: int | None): ...
+`session.py::_do_login` 异常链改造：
 
-@contextmanager
-def guard_sdk_exit():
-    """临时替换 builtins.exit / builtins.quit 为抛 SdkLoginExitError，退出时还原。
-    仅包住 ad.login() 调用窗口。线程安全性：login 全程持 _sdk_lock 串行，
-    且 SDK exit 在调用线程同步抛出，patch 窗口与 login 调用同线程。"""
-```
+- `except SystemExit as e`（置于 `except Exception` **之前**）：SDK login 内部 exit → 构建 `last_login_error`（category 标注 `sdk_exit`，code=e.code）→ 走统一失败处理。
+- `except Exception`（现有逻辑不变）。
+- 统一失败处理：`_ready=False`、已登录则 `_safe_logout()` 回滚、抛 `GatewayNotReadyError`。
 
-`session.py::_do_login` 改造：
-
-- `ad.login(...)` 调用包在 `with guard_sdk_exit():` 内。
-- 异常链：`except SdkLoginExitError`（拼上 `last_login_error` 诊断信息）→ `except Exception`（现有）→ 显式 `except SystemExit` 兜底转 `GatewayNotReadyError`（防其他退出路径）。
-- 三种失败路径统一：`_ready=False`、已登录则 `_safe_logout()` 回滚、抛 `GatewayNotReadyError`。
-
-效果：lifespan 的 `except Exception` 重新生效 → 启动失败进程存活；重连线程 `_do()` 的 `except Exception` 生效 → 失败有日志。
+效果：lifespan 的 `except Exception` 重新生效 → 启动失败进程存活；重连线程 `_do()` 的 `except Exception` 生效（SystemExit 已在 `_do_login` 内转换）→ 失败有日志。
 
 ### 3.2 失败原因提取（`tgw_events.py` + `session.py`）
 
 - `_install_tgw_event_logger()` 调用点从 `_do_login` 末尾挪到 `ad.login` 之前（幂等标记 `_event_logger_installed` 已有，重复调用安全）。
+  - **已验证可行**：`tgw/__init__.py` 末尾 `from .interface import *`，`interface.py:5` 模块级 `g_spi = TmpPushSpi()` → `import tgw` 后 `g_spi` 即存在，不依赖登录态；`tgw.Login` 内部 `IGMDApi_Init(g_spi, ...)` 后 native 日志经 `g_spi.OnLog` 分发 → login 前装钩子可捕获失败全程事件。
 - 新增 `_install_login_spi_probe()`（同在 login 前安装，幂等）：
   - `from AmazingData.login import tgw_login`，wrap `tgw_login.set_cfg`：调原函数，把返回三元组中的 `log_spi` 存 `self._last_login_spi` 后原样返回。
   - import/patch 失败仅 warning，不影响主流程。
@@ -97,25 +86,32 @@ def guard_sdk_exit():
 
 ### 3.5 /realtime stale 降级（`subscription_schedule.py` + `subscription_scheduler.py` + `realtime_service.py` + `http_app.py`）
 
-- `is_subscription_window`：calendar 为 None/空时从"直接 False"改为 weekday 兜底（周一~周五 + 时间窗），docstring 同步更新。calendar 非空但不含今天的既有 weekday 兜底逻辑不变。
-- 调度器 `_tick` 加守卫：`not self._gw.is_ready()` 时跳过启动订阅分支（避免未登录期每 60s 刷"启动订阅失败"日志）；出窗口停订阅分支不受影响。
-- **启动失败自愈**：`_tick` 在 `not is_ready()` 且 `config.is_configured()` 时尝试 `gateway.login()`（try/except 吞异常，失败只 debug 日志）。tick 间隔 60s 天然限频；与 tgw 触发的重连在 `_sdk_lock` 下串行，互不冲突。覆盖"启动时厂商故障、事后恢复"场景——此前该场景只能重启进程才能恢复。
-- `RealtimeService`：
-  - 新增 `_last_snapshot_ts: float | None`，`on_snapshot` 写入；`clear_cache` 重置。
-  - 新增只读属性/方法暴露 `cache_age_sec`（`now - _last_snapshot_ts`，无数据为 None）。
+- `is_subscription_window`：calendar 为 None/空时从"直接 False"改为走 weekday 兜底，**且尊重 `calendar_fallback_weekday` 参数**（False → 仍返回 False 严格模式），docstring 同步更新。calendar 非空但不含今天的既有兜底逻辑不变。
+  - 已知行为变化（接受）：gateway 未登录时 HealthService 的 `deactivation_reason` 可能从 `inactive_offhours` 变为 `inactive_not_started`/`inactive_stale`；不影响 200/503 判定。
+- 调度器 `_tick` 重排（顺序固定）：
+  1. 判定 `in_window`；
+  2. `in_window and not is_active()` 且 `not is_ready()` → **自愈分支**：若 `_reconnect_in_progress`（getattr 防御）为真则跳过（避免与 tgw 重连线程在 `_sdk_lock` 上 30s 竞争产生误导日志）；否则 `try: gateway.login() except Exception: debug 日志`。tick 间隔 60s 天然限频。覆盖"启动时厂商故障、事后恢复"场景——此前只能重启进程恢复；
+  3. `in_window and not is_active() and is_ready()` → 启动订阅（现状）；
+  4. `not in_window and is_active()` → 停订阅清缓存（现状）。
+- `RealtimeService`（`_last_snapshot_ts` 已存在于 `on_snapshot` 写入，无需新增）：
+  - `clear_cache` 增加重置 `_last_snapshot_ts = 0.0`。
+  - 新增只读 `cache_age_sec` 属性：`_last_snapshot_ts == 0` 时返回 **None**（而非 epoch 巨值），否则 `now - _last_snapshot_ts`。
 - 缓存清理策略不变：仅"真出窗口"时 `clear_cache`。断线期间窗口判定正常（3.4 保证），调度器不动订阅，缓存自然留存并随时间变 stale。
 - `/realtime` 路由：
-  - 缓存命中（`data` 非空）：若 `cache_age_sec > stale_threshold_sec`（config 既有，默认 90s），响应附加 `"stale": true, "cache_age_sec": N`；新鲜时字段省略（向后兼容，响应仍为 `{"data": [...]}`）。
-  - 缓存空：走既有 fallback 逻辑不变（SDK 挂时 `GatewayNotReadyError` → 503）。
+  - 缓存命中且 `cache_age_sec <= stale_threshold_sec`（90s）：原样返回 `{"data": [...]}`。
+  - 缓存命中且 `stale_threshold_sec < cache_age_sec <= stale_max_age_sec`：附加 `"stale": true, "cache_age_sec": N`（纯增量，向后兼容）。
+  - `cache_age_sec > stale_max_age_sec`（**stale 上限**，新增 config `STALE_MAX_AGE_SEC` 默认 300s）：视为无缓存，走 fallback；fallback 失败 → 503。防止无限期返回陈旧数据。
+  - 缓存空：走既有 fallback 逻辑不变。
 
 ### 3.6 日志降噪（`tgw_events.py`）
 
-- `logged_on_log` 的 `level == 3`（kError）分支前置噪音模式表：`"HandleFile"`、`"Now use ip"`、`mdga.json` 命中 → INFO 级 + 60s dedup（复用 `_should_log_disconnect` 同款机制或独立 dedup 槽位）。
+- `logged_on_log` 的 `level == 3`（kError）分支前置噪音模式表：`"HandleFile"`、`"Now use ip"`、`mdga.json` 命中 → INFO 级 + 60s dedup。**使用独立 dedup 槽位**（新 `_last_noise_log` dict），不与 `_last_disconnect_log` 共用，避免噪音压制真实断线 WARNING。
 - 模式表为模块级常量 `_TGW_NOISE_PATTERNS`，便于后续补充。
 
 ### 3.7 /health 诊断（`health.py` + `session.py`/`tgw_events.py` 暴露口）
 
-- Gateway 新增只读属性：`last_login_error: dict | None`、`reconnect_attempts: int`、（realtime 侧）`stale` 状态由 HealthService 经 RealtimeService 读取。
+- Gateway 新增只读属性：`last_login_error: dict | None`、`reconnect_attempts: int`，**同步声明进 `base.py` 的 `Gateway` Protocol**（否则 HealthService 经 Protocol 访问时类型检查报错）；`tests/conftest.py` 的 FakeGateway 与 `test_scheduler_calendar_refresh.py` 的独立 FakeGW 同步补齐（含 `is_ready()`）。
+- （realtime 侧）`stale` 状态由 HealthService 经 RealtimeService 的 `cache_age_sec` 读取。
 - `HealthService.status()` 的 sdk 段增加：`last_login_error`（category/ts/detail 截断）、`reconnect_attempts`；realtime 段增加 `stale_since`/`cache_age_sec`。
 - 200/503 判定逻辑不变。
 
@@ -126,40 +122,45 @@ def guard_sdk_exit():
 | 启动 login 失败（含 exit(0)） | 进程存活，/health 503 + last_login_error，调度器每 tick（60s）重试 login 自愈 |
 | 盘中断线重连失败 | 进程存活，退避重试，/realtime 返回 stale 缓存，/daily 等 503 |
 | 重连成功 | 退避复位，订阅由调度器下个 tick 自动恢复（is_active False → 启动） |
+| stale 缓存超过上限（默认 300s） | /realtime 放弃缓存走 fallback，SDK 仍挂 → 503（不无限期返回陈旧数据） |
 | 真出交易窗口 | 停订阅 + 清缓存（现状不变），/realtime fallback 历史快照 |
 | SDK 登录成功但 BaseData 等后续失败 | `_safe_logout()` 回滚（保留 calendar）+ GatewayNotReadyError（现状保留） |
 | patch set_cfg/builtins 失败 | warning 降级，核心兜底（except SystemExit）仍生效 |
 
 ## 5. 测试设计（tests/，沿用 FakeGateway 模式）
 
-1. `guard_sdk_exit`：fake `ad.login` 调 `exit(0)` → 断言抛 `GatewayNotReadyError`、进程存活、`_ready=False`、`_calendar` 保留；`exit` 在 with 外还原。
-2. `_do_login` 各失败路径（SdkLoginExitError / Exception / SystemExit）统一映射 GatewayNotReadyError。
+1. SystemExit 兜底：fake `ad.login` 调 `exit(0)` → 断言抛 `GatewayNotReadyError`、进程存活、`_ready=False`、`_calendar` 保留。
+2. `_do_login` 各失败路径（SystemExit / Exception）统一映射 GatewayNotReadyError；失败时 `last_login_error` 已构建。
 3. 退避序列：连续失败 60→120→240→300→300；成功后复位。
-4. `is_subscription_window`：calendar=None + 周三 14:00 → True；calendar=None + 周六 → False；calendar=None + 工作日 16:00（出窗）→ False。
-5. 调度器 not-ready 守卫：gateway 未 ready 时不调 `start_subscription`，改为尝试 `gateway.login()`（异常被吞，进程不退出）。
-6. stale 降级：缓存有数据且 age > threshold → /realtime 响应带 `stale: true`；新鲜 → 无该字段；缓存空 → fallback 行为不变。
-7. 噪音过滤：构造 kError "HandleFile | Now use ip ..." → 断言 INFO 且 60s 内 dedup。
+4. `is_subscription_window`：calendar=None + 周三 14:00 → True；calendar=None + 周六 → False；calendar=None + 工作日 16:00（出窗）→ False；calendar=None + `calendar_fallback_weekday=False` → False。
+5. 调度器 not-ready 守卫：gateway 未 ready 且 `_reconnect_in_progress=False` → 尝试 `gateway.login()`（异常被吞）；`_reconnect_in_progress=True` → 跳过 login；不调 `start_subscription`。
+6. stale 降级：age ≤ 90s → 无 stale 字段；90s < age ≤ 300s → `stale: true` + `cache_age_sec`；age > 300s → 走 fallback；缓存空 → fallback 行为不变。
+7. 噪音过滤：构造 kError "HandleFile | Now use ip ..." → 断言 INFO 且 60s 内 dedup；噪音 dedup 不压制断线 WARNING（独立槽位）。
 8. /health 新字段存在性与取值。
+9. calendar 跨日残留：旧 calendar 保留 → 次日判定走 weekday 兜底正确返回（工作日 True）。
+10. FakeGateway/FakeGW 同步：Protocol 新属性 + `is_ready()` 补齐后既有测试套件全绿。
 
 ## 6. 涉及文件
 
 | 文件 | 改动 |
 |------|------|
-| `app/gateway/login_guard.py` | 新增：SdkLoginExitError + guard_sdk_exit |
-| `app/gateway/session.py` | exit guard 包裹 login、异常链、calendar 保留、login 前装钩子/probe、last_login_error 构建 |
-| `app/gateway/tgw_events.py` | 退避、噪音过滤、事件缓冲、spi probe、钩子前置 |
-| `app/gateway/base.py` | 退避常量、噪音模式表 |
-| `app/config.py` | `RECONNECT_MAX_INTERVAL_SEC` |
-| `app/subscription_schedule.py` | calendar None → weekday 兜底 |
-| `app/subscription_scheduler.py` | not-ready 守卫 |
-| `app/realtime_service.py` | `_last_snapshot_ts` / cache_age_sec |
+| `app/gateway/session.py` | `except SystemExit` 兜底、calendar 保留（`_safe_logout(clear_calendar)`）、login 前装钩子/probe、last_login_error 构建 |
+| `app/gateway/tgw_events.py` | 退避、噪音过滤（独立 dedup 槽位）、事件缓冲、spi probe、钩子前置 |
+| `app/gateway/base.py` | 退避常量、噪音模式表、Protocol 新增 `last_login_error`/`reconnect_attempts` 属性声明 |
+| `app/gateway/__init__.py` | `_last_noise_log` / `_last_login_events` / `_last_login_spi` / 连续失败计数器等实例字段 |
+| `app/config.py` | `RECONNECT_MAX_INTERVAL_SEC`（默认 300）、`STALE_MAX_AGE_SEC`（默认 300） |
+| `app/subscription_schedule.py` | calendar None → weekday 兜底（尊重 fallback 开关） |
+| `app/subscription_scheduler.py` | not-ready 自愈 login（含 `_reconnect_in_progress` 守卫）+ 启动订阅 ready 守卫 |
+| `app/realtime_service.py` | `clear_cache` 重置 `_last_snapshot_ts`、新增 `cache_age_sec` |
 | `app/health.py` | 诊断字段 |
-| `app/http_app.py` | /realtime stale 响应字段 |
-| `tests/` | 上述 8 组测试 |
+| `app/http_app.py` | /realtime stale 响应字段 + stale 上限走 fallback |
+| `docs/API.md` | /realtime stale/cache_age_sec 字段说明 |
+| `tests/`（含 conftest FakeGateway、test_scheduler_calendar_refresh FakeGW 同步） | 上述 10 组测试 |
 
 ## 7. 风险与缓解
 
-- **builtins patch 线程安全**：patch 窗口仅 login 调用期间，login 全程持 `_sdk_lock` 串行；其他线程若在窗口内调 `exit()` 会抛 SdkLoginExitError——正常代码路径无此调用，可接受。
-- **SDK 升级改 login 内部结构**：`except SystemExit` 显式兜底保证即使 patch 失效进程也不死；probe 失败仅 warning。
-- **stale 缓存误导下游**：stale 标记 + cache_age_sec 显式暴露，由调用方决策；默认阈值 90s 与 watchdog 口径一致。
-- **calendar 跨日残留**：重连成功路径 `_do_login` 会刷新 calendar；真出窗口清缓存逻辑不受 calendar 残留影响（日历当天有效，跨日后 weekday 兜底仍正确）。
+- **SDK 升级改 login 内部结构**：`except SystemExit` 兜底与 patch 无关，始终生效；`set_cfg` probe 失败仅 warning 降级。
+- **tgw.g_spi 生命周期**：已验证 `import tgw` 即存在（`interface.py` 模块级创建，`__init__` re-export），钩子前置安全。
+- **stale 缓存误导下游**：stale 标记 + cache_age_sec 显式暴露，超 300s 上限转 503；由调用方决策。
+- **calendar 跨日残留**：重连成功路径 `_do_login` 会刷新 calendar；跨日后旧日历不含今天 → weekday 兜底仍正确（测试 9 覆盖）。
+- **调度器自愈 login 与 tgw 重连竞争**：`_reconnect_in_progress` 守卫 + `_sdk_lock` 串行；锁竞争超时异常被吞仅 debug。
