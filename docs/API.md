@@ -243,6 +243,16 @@ GET /realtime?codes=510300.SH&types=etf  # 代码 + 类型叠加
 - 非交易时段/订阅未推送：fallback `query_snapshot` 查当日历史快照（取每只股票最后一行 = 收盘快照），结果带 120 秒 TTL 缓存
 - SDK 未就绪（未登录）：HTTP 503 `SDK_NOT_READY`
 
+断线降级字段（仅订阅缓存超过 `STALE_THRESHOLD_SEC`（默认 90s）未更新时附加）：
+
+```json
+{"data": [...], "stale": true, "cache_age_sec": 130}
+```
+
+- `stale`: true 表示数据为断线期间的最后一次推送缓存，调用方自行决定是否可用。
+- `cache_age_sec`: 距最后一次快照推送的秒数。
+- 缓存年龄超过 `STALE_MAX_AGE_SEC`（默认 300s）后不再返回 stale 缓存，回退当日历史快照查询，SDK 不可用时报 503。
+
 ## GET /health
 
 健康检查。

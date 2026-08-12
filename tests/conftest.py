@@ -40,6 +40,8 @@ class FakeGateway:
         self._sub_code_list = None
         self._calendar = calendar
         self._reconnect_in_progress = False
+        self._last_login_error = None
+        self._reconnect_attempts = 0
 
     def login(self) -> None:
         self.login_called += 1
@@ -61,6 +63,14 @@ class FakeGateway:
     @property
     def calendar(self) -> list[int] | None:
         return self._calendar
+
+    @property
+    def last_login_error(self):
+        return self._last_login_error
+
+    @property
+    def reconnect_attempts(self) -> int:
+        return self._reconnect_attempts
 
     def query_kline(self, codes, begin_date, end_date, period):
         self.query_calls.append({

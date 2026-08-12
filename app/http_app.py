@@ -422,6 +422,17 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 )
         # 优先读订阅缓存（盘中实时推送的数据）；snapshot 只读内存，不阻塞 event loop
         data = realtime_service.snapshot(code_list, type_set)
+        stale_fields: dict = {}
+        if data:
+            age = realtime_service.cache_age_sec
+            if age is not None and age > config.stale_max_age_sec:
+                # 缓存过旧（超上限）：视为无缓存走 fallback，不无限期返回陈旧数据
+                logger.info("request_id=%s 订阅缓存过旧 (%.0fs > %ds)，走 fallback",
+                            get_request_id(request), age, config.stale_max_age_sec)
+                data = []
+            elif age is not None and age > config.stale_threshold_sec:
+                # 盘中断线降级：返回 stale 缓存，调用方自行决策
+                stale_fields = {"stale": True, "cache_age_sec": int(age)}
         if not data:
             # 缓存空（非交易时段/订阅未推送），fallback 查当日历史快照。
             # query_snapshot 是同步阻塞 SDK 调用（全市场可能数分钟），必须放线程池，
@@ -442,7 +453,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 logger.info("request_id=%s realtime fallback: %d 代码 -> %d 条",
                             get_request_id(request),
                             len(code_list) if code_list else 0, len(data))
-        return {"data": data}
+        return {"data": data, **stale_fields}
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):

@@ -164,10 +164,11 @@ class RealtimeService:
         self._type_map = mapping
 
     def clear_cache(self) -> None:
-        """清空订阅缓存与类型映射（调度器停止订阅时调用）。"""
+        """清空订阅缓存与类型映射（调度器停止订阅时调用）。重置快照时间戳。"""
         with self._lock:
             self._cache.clear()
         self._type_map = {}
+        self._last_snapshot_ts = 0.0
 
     def deactivation_reason(self) -> str | None:
         """供 HealthService 区分 inactive_stale / inactive_not_started / inactive_error。"""
@@ -176,6 +177,13 @@ class RealtimeService:
     def last_snapshot_ts(self) -> float:
         """最后一次收到快照数据的时间戳（0=从未收到）。"""
         return self._last_snapshot_ts
+
+    @property
+    def cache_age_sec(self) -> float | None:
+        """缓存距最近一次快照的秒数。从未收到数据（ts==0）返回 None。"""
+        if self._last_snapshot_ts == 0:
+            return None
+        return time.time() - self._last_snapshot_ts
 
     def start_watchdog(
         self,

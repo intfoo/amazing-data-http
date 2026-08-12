@@ -61,6 +61,12 @@ class HealthService:
             "realtime": "active" if rt else "inactive",
             "realtime_detail": rt_detail,
             "auth": auth_state,
+            # 登录/重连诊断（SDK 故障排障：一次 /health 看清失败类别与重连次数）
+            "last_login_error": getattr(self._gw, "last_login_error", None),
+            "reconnect_attempts": getattr(self._gw, "reconnect_attempts", 0),
+            "cache_age_sec": (
+                self._realtime_svc.cache_age_sec if self._realtime_svc else None
+            ),
         }
 
     def is_ok(self) -> bool:
