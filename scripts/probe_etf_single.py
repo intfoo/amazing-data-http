@@ -34,7 +34,7 @@ def main():
 
     import AmazingData as ad
     sys.path.insert(0, str(PROJECT_ROOT))
-    from app.etf_flow_service import EtfFlowService
+    from app.fund_data_service import FundDataService
     _log("import OK")
     ad.login(username=os.environ["AMAZINGDATA_USERNAME"], password=os.environ["AMAZINGDATA_PASSWORD"],
              host=os.environ["AMAZINGDATA_HOST"], port=int(os.environ["AMAZINGDATA_PORT"]))
@@ -67,9 +67,26 @@ def main():
 
     start_dt = datetime.strptime(str(begin_date), "%Y%m%d")
     end_dt = datetime.strptime(str(end_date), "%Y%m%d")
-    records = EtfFlowService._compute_net_inflow(
-        codes, name_map, share_dict, nav_dict, start_dt, end_dt, calendar
-    )
+    records = []
+    for code in codes:
+        raw_share = share_dict.get(code)
+        if raw_share is None or raw_share.empty:
+            continue
+        share_df = FundDataService._normalize_share_df(raw_share, code, calendar)
+        raw_nav = nav_dict.get(code)
+        nav_df = FundDataService._normalize_nav_df(raw_nav) if raw_nav is not None and not raw_nav.empty else None
+        if nav_df is not None:
+            merged = share_df.merge(nav_df, on="trade_date", how="left")
+            merged["nav"] = merged["nav"].ffill()
+        else:
+            merged = share_df.copy()
+            merged["nav"] = None
+        merged["net_inflow_share"] = merged["share"].diff()
+        merged["net_inflow_amount"] = merged["net_inflow_share"] * merged["nav"]
+        merged = merged[(merged["trade_date"] >= start_dt.strftime("%Y-%m-%d"))
+                        & (merged["trade_date"] <= end_dt.strftime("%Y-%m-%d"))]
+        for _, row in merged.iterrows():
+            records.append({"code": code, "name": name_map.get(code, ""), **row.to_dict()})
     _log(f"计算 OK: {len(records)} 条")
 
     # 按代码分组
@@ -78,7 +95,7 @@ def main():
         by_code.setdefault(r["code"], []).append(r)
 
     for code, label in TARGET_CODES:
-        recs = sorted(by_code.get(code, []), key=lambda x: x["date"])
+        recs = sorted(by_code.get(code, []), key=lambda x: x["trade_date"])
         print(f"\n{'='*90}", flush=True)
         print(f"{label}  {code}  近 30 天每日净流入（{len(recs)} 个交易日）", flush=True)
         print(f"{'='*90}", flush=True)
@@ -87,7 +104,7 @@ def main():
 
         total_amount = 0.0
         for r in recs:
-            date = r["date"]
+            date = r["trade_date"]
             share = r.get("share")
             nav = r.get("nav")
             delta = r.get("net_inflow_share")
