@@ -187,6 +187,17 @@ def test_nan_change_date_row_dropped():
     assert recs[0]["trade_date"] == "2024-01-04"
 
 
+def test_share_sz_snap_with_nan_change_date_row():
+    """深市混入 NaN CHANGE_DATE 行：有效行仍逐行 snap（不作全列 .all() 门槛），NaN 行丢弃。"""
+    df = _share_df([(20240108, 200.0, 20240108)])  # 周一公告 → snap 回周五 01-05
+    df.loc[1] = [None, 50.0, 20240109]  # NaN 行使 CHANGE_DATE 列升级为 float64
+    gw = FakeGateway(ready=True, calendar=CAL, fund_share_result={"159915.SZ": df})
+    svc = FundDataService(gw)
+    recs = svc.query_share(["159915.SZ"], "2024-01-01", "2024-01-31")
+    assert [r["trade_date"] for r in recs] == ["2024-01-05"]
+    assert [r["ann_date"] for r in recs] == ["2024-01-08"]
+
+
 def test_result_cache_hit():
     """相同 (codes, start, end) 300s 内命中缓存，不重复调 SDK；codes 顺序不同也命中（frozenset）。"""
     gw = FakeGateway(ready=True, calendar=CAL, fund_share_result={

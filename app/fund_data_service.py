@@ -246,8 +246,11 @@ class FundDataService:
 
         is_sz = code.endswith(".SZ")
         if is_sz and "CHANGE_DATE" in df.columns and "ANN_DATE" in df.columns:
-            same_as_ann = (df["CHANGE_DATE"] == df["ANN_DATE"]).all()
-            if same_as_ann:
+            # 逐行判断 CHANGE_DATE==ANN_DATE（该行 CHANGE_DATE 填的是公告日 T+1，需 snap）。
+            # 不能用 .all() 全列门槛：混入 NaN 行时 NaN==x 为 False，会导致有效行的
+            # 修正被整体跳过（静默错误）。NaN 行 same_mask 为 False 保持原值，随后被 dropna。
+            same_mask = df["CHANGE_DATE"] == df["ANN_DATE"]
+            if same_mask.any():
                 dt = pd.to_datetime(dates, format="%Y-%m-%d", errors="coerce")
                 if calendar:
                     cal_sorted = sorted(set(calendar))
@@ -261,11 +264,12 @@ class FundDataService:
                             return pd.to_datetime(str(cal_sorted[idx - 1]), format="%Y%m%d")
                         return d  # 日历里找不到，保持原值
 
-                    dt = dt.apply(snap_to_prev_trade)
+                    snapped = dt.apply(snap_to_prev_trade)
                 else:
                     logger.warning(
                         "fund_data 深市份额修正无交易日历，退化为减 1 天: code=%s", code)
-                    dt = dt - pd.Timedelta(days=1)
+                    snapped = dt - pd.Timedelta(days=1)
+                dt = dt.where(~same_mask, snapped)
                 dates = dt.dt.strftime("%Y-%m-%d")
 
         if "ANN_DATE" in df.columns:

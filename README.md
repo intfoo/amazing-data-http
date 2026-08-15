@@ -38,10 +38,11 @@ app/
 ├── config.py             # 环境变量配置（Config dataclass）
 ├── errors.py             # 错误码 + AppError + request_id 中间件
 ├── auth.py               # Bearer Token 认证依赖
-├── http_app.py           # FastAPI 应用（/daily /minute /adj_factor /realtime /health 路由）
+├── http_app.py           # FastAPI 应用（/daily /minute /adj_factor /etf/share /etf/nav /realtime /health 路由）
 ├── gateway.py            # Gateway 接口 + AmazingDataGateway SDK 封装
 ├── kline_service.py      # 日期转换 + dict[code, DataFrame] 展平
 ├── adj_factor_service.py # 除权因子查询（宽表 melt 长表 + dropna）
+├── fund_data_service.py  # ETF 份额/净值原始数据（深市份额日期修正 + 后扩拉取）
 ├── realtime_service.py   # 实时行情订阅缓存 + snapshot fallback
 ├── serializer.py         # DataFrame/NumPy/datetime → JSON 序列化
 └── health.py             # 健康检查服务
