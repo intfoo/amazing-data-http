@@ -31,7 +31,7 @@ from app.auth import AuthMiddleware
 from app.gateway import Gateway, GatewayNotReadyError, GatewayQueryError, AmazingDataGateway
 from app.health import HealthService
 from app.adj_factor_service import AdjFactorService
-from app.etf_flow_service import EtfFlowService
+from app.fund_data_service import FundDataService
 from app.kline_service import KlineService, MINUTE_PERIODS
 from app.realtime_service import RealtimeService
 from app.subscription_scheduler import SubscriptionScheduler
@@ -128,8 +128,12 @@ class AdjFactorRequest(_CodesRequest):
     end_time: str | None = None     # 结束日期，同上；可选
 
 
-class EtfNetInflowRequest(BaseModel):
-    """POST /etf/net_inflow 请求体。start_time/end_time 可选。"""
+class EtfFundDataRequest(BaseModel):
+    """POST /etf/share、/etf/nav 请求体。codes 可缺省（=全量 ETF），日期可选。
+
+    不继承 _CodesRequest（其 validator 强制 codes 非空）。
+    """
+    codes: list[str] | None = None
     start_time: str | None = None
     end_time: str | None = None
 
@@ -204,7 +208,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     kline_service = KlineService(gateway)
     realtime_service = RealtimeService(gateway)
     adj_factor_service = AdjFactorService(gateway)
-    etf_flow_service = EtfFlowService(gateway, cache_ttl_sec=config.etf_flow_cache_ttl_sec)
+    fund_data_service = FundDataService(gateway, cache_ttl_sec=config.fund_data_cache_ttl_sec)
     health_service = HealthService(config, gateway, realtime_service)
 
     @asynccontextmanager
@@ -288,7 +292,7 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
     app.state.realtime_service = realtime_service
     app.state.health_service = health_service
     app.state.adj_factor_service = adj_factor_service
-    app.state.etf_flow_service = etf_flow_service
+    app.state.fund_data_service = fund_data_service
     app.state.sdk_gate = SdkGate(max_concurrent=config.sdk_max_concurrent)
 
     @app.get("/health")
@@ -340,18 +344,35 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             app, app.state.adj_factor_service.query, req.codes, req.start_time, req.end_time
         )
 
-    @app.post("/etf/net_inflow")
-    async def etf_net_inflow(req: EtfNetInflowRequest, request: Request):
-        """宽基 ETF 净流入统计。返回 {"data": [...]}。
+    @app.post("/etf/share")
+    async def etf_share(req: EtfFundDataRequest, request: Request):
+        """ETF 份额原始时序。返回 {"data": [{code, trade_date, share, ann_date}]}。
 
-        start_time / end_time 可选；未传时返回全量数据。
-        日期格式校验与 start<=end 校验在 EtfFlowService 内完成，ValueError 转 422。
+        trade_date=份额实际变动交易日（深市 CHANGE_DATE 为公告日 T+1，服务端已 snap 还原，
+        详见 docs/API.md）。宽基识别与净流入计算由下游负责。
         """
-        logger.info("request_id=%s /etf/net_inflow %s..%s",
+        logger.info("request_id=%s /etf/share codes=%s %s..%s",
                     get_request_id(request),
+                    len(req.codes) if req.codes else "(all)",
                     req.start_time or "(default)", req.end_time or "(default)")
         return await _run_sdk_endpoint(
-            app, app.state.etf_flow_service.query, req.start_time, req.end_time
+            app, app.state.fund_data_service.query_share,
+            req.codes, req.start_time, req.end_time
+        )
+
+    @app.post("/etf/nav")
+    async def etf_nav(req: EtfFundDataRequest, request: Request):
+        """ETF 净值原始时序。返回 {"data": [{code, trade_date, nav}]}。
+
+        trade_date=PRICE_DATE（净值计算日，沪深均准确）。
+        """
+        logger.info("request_id=%s /etf/nav codes=%s %s..%s",
+                    get_request_id(request),
+                    len(req.codes) if req.codes else "(all)",
+                    req.start_time or "(default)", req.end_time or "(default)")
+        return await _run_sdk_endpoint(
+            app, app.state.fund_data_service.query_nav,
+            req.codes, req.start_time, req.end_time
         )
 
     @app.get("/realtime")
