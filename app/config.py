@@ -47,7 +47,8 @@ class Config:
     calendar_fallback_weekday: bool = True  # 日历不含今天时用 weekday 兜底（周一~周五视为交易日）
     reconnect_max_interval_sec: int = 300  # tgw 主动重连退避上限（秒）
     stale_max_age_sec: int = 300           # /realtime 订阅缓存 stale 上限（秒），超过走 fallback
-    etf_flow_cache_ttl_sec: int = 300  # /etf/net_inflow 结果缓存 TTL（秒），份额 T+1 更新无 freshness 风险
+    fund_data_cache_ttl_sec: int = 300  # /etf/share、/etf/nav 结果缓存 TTL（秒），份额/净值 T+1 更新无 freshness 风险
+    sdk_call_timeout_sec: int = 120  # 单次 SDK 调用超时（秒）：超时隔离为 daemon 线程 + 置 not-ready + 退避重建（_do_login 含换锁）
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -77,7 +78,8 @@ class Config:
             in ("1", "true", "yes", "on"),
             reconnect_max_interval_sec=_env_int("RECONNECT_MAX_INTERVAL_SEC", 300),
             stale_max_age_sec=_env_int("STALE_MAX_AGE_SEC", 300),
-            etf_flow_cache_ttl_sec=_env_int("ETF_FLOW_CACHE_TTL_SEC", 300),
+            fund_data_cache_ttl_sec=_env_int("FUND_DATA_CACHE_TTL_SEC", 300),
+            sdk_call_timeout_sec=_env_int("SDK_CALL_TIMEOUT_SEC", 120),
         )
 
     def is_configured(self) -> bool:

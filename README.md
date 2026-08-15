@@ -162,7 +162,8 @@ curl -X POST http://localhost:3021/daily -H "Content-Type: application/json" -d 
 | `SUBSCRIPTION_CLOSE` | 否 | `15:20` | 订阅窗口结束（HH:MM） |
 | `STALE_THRESHOLD_SEC` | 否 | `90` | watchdog 失活阈值（秒）。窗口期内连续 N 秒未收到快照即判定订阅失活，`/health` 返回 503 触发容器重启 |
 | `WATCHDOG_INTERVAL_SEC` | 否 | `60` | watchdog 检查间隔（秒） |
-| `ETF_FLOW_CACHE_TTL_SEC` | 否 | `300` | /etf/net_inflow 结果缓存 TTL（秒） |
+| `FUND_DATA_CACHE_TTL_SEC` | 否 | `300` | /etf/share、/etf/nav 结果缓存 TTL（秒） |
+| `SDK_CALL_TIMEOUT_SEC` | 否 | `120` | 单次 SDK 调用超时（秒），超时隔离 + 自动重建会话 |
 
 > 四项凭据缺失时进程仍可启动，`/health` 返回 503 `config: incomplete`，便于 Docker 日志暴露诊断信息。认证配置无效（`AUTH_REQUIRED=true` 但 token 为空/过弱）时进程启动即退出。非交易时段或窗口期外不启动订阅，`/health` 报 `realtime_detail: inactive_offhours` 且仍返回 200；窗口期内订阅失活则报 503（`inactive_stale`/`inactive_error`/`inactive_not_started`）。
 

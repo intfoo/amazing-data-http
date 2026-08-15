@@ -115,8 +115,23 @@ def test_config_malformed_int_env_falls_back(monkeypatch):
     assert cfg.sdk_max_concurrent == 2
 
 
-def test_config_etf_flow_cache_ttl(monkeypatch):
-    monkeypatch.delenv("ETF_FLOW_CACHE_TTL_SEC", raising=False)
-    assert Config.from_env().etf_flow_cache_ttl_sec == 300
-    monkeypatch.setenv("ETF_FLOW_CACHE_TTL_SEC", "600")
-    assert Config.from_env().etf_flow_cache_ttl_sec == 600
+def test_config_fund_data_cache_ttl(monkeypatch):
+    """FUND_DATA_CACHE_TTL_SEC 环境变量 → Config.fund_data_cache_ttl_sec。"""
+    monkeypatch.delenv("FUND_DATA_CACHE_TTL_SEC", raising=False)
+    assert Config.from_env().fund_data_cache_ttl_sec == 300
+    monkeypatch.setenv("FUND_DATA_CACHE_TTL_SEC", "600")
+    assert Config.from_env().fund_data_cache_ttl_sec == 600
+
+
+def test_config_default_sdk_call_timeout(monkeypatch):
+    """SDK_CALL_TIMEOUT_SEC 缺省时默认 120。"""
+    monkeypatch.delenv("SDK_CALL_TIMEOUT_SEC", raising=False)
+    config = Config.from_env()
+    assert config.sdk_call_timeout_sec == 120
+
+
+def test_config_reads_sdk_call_timeout(monkeypatch):
+    """SDK_CALL_TIMEOUT_SEC 环境变量覆盖默认值。"""
+    monkeypatch.setenv("SDK_CALL_TIMEOUT_SEC", "180")
+    config = Config.from_env()
+    assert config.sdk_call_timeout_sec == 180
