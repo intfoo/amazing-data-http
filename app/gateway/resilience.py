@@ -27,7 +27,7 @@ class ResilienceMixin:
         def _run() -> None:
             try:
                 holder["result"] = fn()
-            except Exception as e:  # noqa: BLE001 - SDK 异常需原样传递
+            except BaseException as e:  # SDK 异常需原样传递；含 SystemExit（ad.login 失败路径 exit(0)）
                 holder["error"] = e
 
         t = threading.Thread(target=_run, daemon=True, name=f"sdk-{label}")
@@ -45,6 +45,24 @@ class ResilienceMixin:
         if "error" in holder:
             raise holder["error"]
         return holder.get("result")
+
+    def _reset_sdk_query_lock(self) -> None:
+        """更换 SDK 全局查询锁（QueryLock.query_lock 是类属性，所有实例共享）。
+
+        SDK 的 MarketData/DownloadInfoData 异常路径不释放内部锁（pyc 反汇编实证），
+        泄漏后全局楔死；锁是类属性，重建实例仍绑旧锁。此处直接替换类属性：
+        _do_login 重建的新实例（含 SDK 内部每次调用新建的 DownloadInfoData/MarketData）
+        绑定新锁，幽灵线程持有的旧锁对象随其终结后释放，互不干扰。
+        在 _do_login 开头调用（幂等）。任何导入/属性异常都静默跳过——
+        换锁正是要在 SDK 部分损坏的场景生效，不能因换锁失败阻断会话重建。
+        """
+        try:
+            from AmazingData.environment import QueryLock
+        except Exception as e:  # ImportError/AttributeError/pyc 损坏等
+            logger.debug("换锁跳过（SDK 不可用）: %s: %s", type(e).__name__, e)
+            return
+        QueryLock.query_lock = threading.RLock()
+        logger.warning("SDK 全局查询锁已更换（旧锁疑似泄漏楔死）")
 
     @contextmanager
     def _sdk_lock(self, timeout_sec: float = SDK_LOCK_TIMEOUT_SEC):

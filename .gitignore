@@ -15,6 +15,9 @@ docs/probe-code-info.json
 # codegraph MCP 索引（工具生成，勿入库）
 .codegraph/
 
+# 线上排障笔记（含服务器地址，勿入库）
+docs/ops/
+
 # 运行时数据缓存（SDK adj_factor HDF5 等）
 data/
 

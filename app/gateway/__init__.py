@@ -64,6 +64,7 @@ class AmazingDataGateway(
         self._base_data = None      # ad.BaseData 实例（供 get_code_list）
         self._calendar = None       # 交易日历 list[int]（供 query_snapshot 默认日期）
         self._calendar_set: frozenset = frozenset()  # calendar 的 set 形态（窗口判定 O(1) 成员检查）
+        self._last_calendar_refresh = 0.0  # refresh_calendar 上次执行时间（monotonic，节流用）
         self._subscribe_data = None  # ad.SubscribeData 实例
         self._sub_thread = None      # 订阅 daemon 线程
         self._adj_factor_local_path = resolve_adj_factor_local_path(config.adj_factor_local_path)
@@ -73,6 +74,10 @@ class AmazingDataGateway(
         # 子目录：meta.json + stock/index/etf.json）：每日 9:00 后首次获取刷新一次，
         # 详见 query_market.get_realtime_universe。
         self._universe_cache_dir = self._adj_factor_local_path + "realtime_universe/"
+        # universe 拉取单飞锁：startup universe-refresh 线程与调度器启动订阅会并发调
+        # get_realtime_universe，无锁时双方都 miss 缓存各拉一遍全量代码表（~80s×2）。
+        # 与 _lock（SDK 串行锁）独立，避免与锁内 get_code_list 死锁。
+        self._universe_lock = threading.Lock()
         # 主动重连状态（tgw 断线回调触发，后台线程执行）
         self._reconnect_lock = threading.Lock()
         self._reconnect_in_progress = False

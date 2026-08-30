@@ -45,7 +45,7 @@ _RECONNECT_MAX_INTERVAL_SEC = 300   # 文档性默认值标注，实际读取 Co
 _TGW_NOISE_PATTERNS: tuple[str, ...] = ("HandleFile", "Now use ip", "mdga.json")
 _TGW_NOISE_DEDUP_SEC = 60           # tgw 噪音日志 dedup 窗口
 
-ADJ_FACTOR_TIMEOUT_SEC = 120  # get_adj_factor SDK 调用超时（正常本地 <1s / 远程 ~21s）
+ADJ_FACTOR_TIMEOUT_SEC = 120  # 文档性默认值标注，实际读取 Config.sdk_call_timeout_sec
 
 SDK_LOCK_TIMEOUT_SEC = 30  # gateway._lock 竞争超时；超时说明有 SDK 调用挂起未释放
 
@@ -58,8 +58,9 @@ def _is_connection_error(exc: Exception) -> bool:
 
 # SDK 内部状态损坏关键词（'查询失败' 是 SDK pyc 内硬编码的中文异常消息，
 # 见 market_data.pyc 反汇编；'NoneType' 见于 get_code_list/get_adj_factor 内部状态错乱）。
-# 命中说明 SDK 内部状态机/锁已损坏（SDK 异常路径不释放内部 lock），
-# 必须 _do_login() 重建会话（新实例=新锁），否则后续所有查询永久挂起。
+# 命中说明 SDK 内部状态机/锁已损坏（SDK 异常路径不释放内部 lock）。
+# 注意：SDK 全局查询锁 QueryLock.query_lock 是类属性，新实例仍绑旧锁；
+# _do_login() 开头会 _reset_sdk_query_lock() 更换类属性锁后再重建，新实例才绑新锁。
 _SDK_CORRUPTION_KEYWORDS: tuple[str, ...] = ("查询失败", "NoneType")
 
 

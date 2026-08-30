@@ -126,6 +126,17 @@ def test_query_passes_codes_to_gateway():
     assert gw.adj_factor_query_calls[0]["codes"] == ["000001.SZ", "600000.SH"]
 
 
+def test_query_column_filter_no_match_returns_empty():
+    """SDK 宽表不含请求的 codes（部分重建缓存）→ 返回 []，不兜底全量宽表返回错数据。
+
+    2026-08-28 线上复核：SDK is_local 增量合并失效时宽表只含缓存旧列，
+    旧代码"列过滤未匹配→使用全量宽表"会把不相关 code 的因子行返回给调用方。
+    """
+    gw = FakeGateway(ready=True, adj_factor_result=make_adj_factor_df())
+    svc = AdjFactorService(gw)
+    assert svc.query(["999999.XX"]) == []
+
+
 def test_query_dense_table_filters_all_unit_rows():
     """密集宽表（多日期多 1.0 行）只保留真除权事件，验证 1.0 过滤不误删 <1.0 边界事件。
 

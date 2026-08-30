@@ -30,6 +30,9 @@ class SessionMixin:
             raise GatewayNotReadyError(f"SDK import failed: {e}") from e
 
         self._ad = ad
+        # 换锁先于一切 SDK 对象创建：QueryLock.query_lock 是类属性，新实例在 __init__
+        # 绑定当时的类属性锁；此处换新锁，后续新建的 MarketData/InfoData 才摆脱泄漏的旧锁。
+        self._reset_sdk_query_lock()
         # 钩子/probe 前置：import tgw 后 g_spi 即存在（interface.py 模块级创建），
         # login 前安装可捕获失败全程的 OnLog/OnLogon 事件（真实失败原因）。
         self._install_tgw_event_logger()
@@ -40,16 +43,24 @@ class SessionMixin:
         try:
             if self._ready:
                 self._safe_logout()
-            ad.login(
-                username=self._config.username,
-                password=self._config.password,
-                host=self._config.ip,
-                port=self._config.port,
+            self._call_sdk_with_timeout(
+                lambda: ad.login(
+                    username=self._config.username,
+                    password=self._config.password,
+                    host=self._config.ip,
+                    port=self._config.port,
+                ),
+                self._config.sdk_call_timeout_sec,
+                "login",
             )
             sdk_logged_in = True
             base = ad.BaseData()
             self._base_data = base
-            calendar = base.get_calendar()
+            calendar = self._call_sdk_with_timeout(
+                base.get_calendar,
+                self._config.sdk_call_timeout_sec,
+                "get_calendar",
+            )
             self._calendar = calendar
             self._calendar_set = frozenset(calendar or [])
             self._market_data = ad.MarketData(calendar)
@@ -131,6 +142,12 @@ class SessionMixin:
         """交易日历的 frozenset 形态（O(1) 成员检查）。空日历返回空 frozenset。"""
         return self._calendar_set
 
+    # refresh_calendar 节流：刚刷新过且日历仍不含查询日时，冷却期内不再重复拉取。
+    # 场景：查询 end_date=今天 且服务端日历尚未包含今天（刚收盘/数据未发布），
+    # 上游每个轮询请求都会触发刷新，刷回来最新日不变，造成每请求白打一次
+    # get_calendar()（1~5s SDK 锁占用）。冷却期内视为已知过期，直接放行查询。
+    CALENDAR_REFRESH_COOLDOWN_SEC = 60.0
+
     def refresh_calendar(self) -> list[int]:
         """重新拉取交易日历并热更新到 MarketData.calendar 属性。
 
@@ -141,8 +158,13 @@ class SessionMixin:
         """
         if not self._ready or self._base_data is None:
             raise GatewayNotReadyError("gateway not ready")
+        self._last_calendar_refresh = time.monotonic()
         with self._sdk_lock():
-            calendar = self._base_data.get_calendar()
+            calendar = self._call_sdk_with_timeout(
+                self._base_data.get_calendar,
+                self._config.sdk_call_timeout_sec,
+                "get_calendar",
+            )
             self._calendar = calendar
             self._calendar_set = frozenset(calendar or [])
             if self._market_data is not None:

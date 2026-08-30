@@ -50,9 +50,19 @@ class QueryMarketMixin:
             )
             t0 = time.perf_counter()
             try:
-                result = self._base_data.get_code_list(security_type=security_type)
+                result = self._call_sdk_with_timeout(
+                    lambda: self._base_data.get_code_list(security_type=security_type),
+                    self._config.sdk_call_timeout_sec,
+                    "get_code_list",
+                )
             except Exception as e:
                 logger.error("get_code_list 失败: %s: %s", type(e).__name__, e)
+                if _is_sdk_corruption(e):
+                    logger.warning("检测到 SDK 内部状态损坏，重建会话（含换锁）: %s", e)
+                    try:
+                        self._do_login()
+                    except Exception as e3:
+                        logger.error("SDK 会话重建失败: %s: %s", type(e3).__name__, e3)
                 raise GatewayQueryError(f"get_code_list failed: {e}") from e
             sdk_elapsed = time.perf_counter() - t0
             total_elapsed = time.perf_counter() - t_lock
@@ -80,9 +90,19 @@ class QueryMarketMixin:
             )
             t0 = time.perf_counter()
             try:
-                result = self._base_data.get_code_info(security_type=security_type)
+                result = self._call_sdk_with_timeout(
+                    lambda: self._base_data.get_code_info(security_type=security_type),
+                    self._config.sdk_call_timeout_sec,
+                    "get_code_info",
+                )
             except Exception as e:
                 logger.error("get_code_info 失败: %s: %s", type(e).__name__, e)
+                if _is_sdk_corruption(e):
+                    logger.warning("检测到 SDK 内部状态损坏，重建会话（含换锁）: %s", e)
+                    try:
+                        self._do_login()
+                    except Exception as e3:
+                        logger.error("SDK 会话重建失败: %s: %s", type(e3).__name__, e3)
                 raise GatewayQueryError(f"get_code_info failed: {e}") from e
             sdk_elapsed = time.perf_counter() - t0
             total_elapsed = time.perf_counter() - t_lock
@@ -106,36 +126,41 @@ class QueryMarketMixin:
         等元数据）+ stock/index/etf.json（纯代码数组）。meta.json 最后写，作为提交点——
         中途崩溃残留的部分新文件配旧 meta，refresh_date 仍是昨天，下次获取自动重刷。
         刷新失败且有缓存（哪怕隔日）→ warn 沿用旧缓存；无缓存才抛。
+        并发单飞（2026-08-14）：_universe_lock 串行化整个 查缓存→拉取→写缓存，
+        锁内双检查——startup universe-refresh 线程与调度器并发调用时，
+        后到者等待前者完成后直接命中其刚写入的缓存，避免重复全量拉取（~80s×2）。
         """
-        now = now_cn()
-        today_key = now.strftime("%Y-%m-%d")
-        cached = self._read_universe_cache()
-        if cached is not None:
-            if now.hour < _UNIVERSE_REFRESH_HOUR or cached.get("refresh_date") == today_key:
-                logger.debug(
-                    "实时代码表命中缓存: refresh_date=%s codes=%d",
-                    cached.get("refresh_date"), len(cached.get("universe", {})),
-                )
-                return dict(cached["universe"])
-
-        try:
-            universe = self._fetch_realtime_universe()
-        except Exception as e:
+        with self._universe_lock:
+            # 锁内重新取时间/读缓存：等待期间可能跨 9 点边界，且前者可能已写好缓存
+            now = now_cn()
+            today_key = now.strftime("%Y-%m-%d")
+            cached = self._read_universe_cache()
             if cached is not None:
-                logger.warning(
-                    "实时代码表刷新失败，沿用旧缓存(refresh_date=%s): %s: %s",
-                    cached.get("refresh_date"), type(e).__name__, e,
-                )
-                return dict(cached["universe"])
-            raise
+                if now.hour < _UNIVERSE_REFRESH_HOUR or cached.get("refresh_date") == today_key:
+                    logger.debug(
+                        "实时代码表命中缓存: refresh_date=%s codes=%d",
+                        cached.get("refresh_date"), len(cached.get("universe", {})),
+                    )
+                    return dict(cached["universe"])
 
-        self._write_universe_cache(
-            # 9 点前拉取的缓存不计入"当日已刷新"（表还没更新），9 点后首次获取会再刷一次
-            refresh_date=today_key if now.hour >= _UNIVERSE_REFRESH_HOUR else "",
-            fetched_at=now.isoformat(),
-            universe=universe,
-        )
-        return universe
+            try:
+                universe = self._fetch_realtime_universe()
+            except Exception as e:
+                if cached is not None:
+                    logger.warning(
+                        "实时代码表刷新失败，沿用旧缓存(refresh_date=%s): %s: %s",
+                        cached.get("refresh_date"), type(e).__name__, e,
+                    )
+                    return dict(cached["universe"])
+                raise
+
+            self._write_universe_cache(
+                # 9 点前拉取的缓存不计入"当日已刷新"（表还没更新），9 点后首次获取会再刷一次
+                refresh_date=today_key if now.hour >= _UNIVERSE_REFRESH_HOUR else "",
+                fetched_at=now.isoformat(),
+                universe=universe,
+            )
+            return universe
 
     def _read_universe_cache(self) -> dict | None:
         """读磁盘缓存（realtime_universe/ 子目录）合并为缓存 entry。
@@ -306,7 +331,11 @@ class QueryMarketMixin:
             kwargs["end_time"] = end_time
         with self._sdk_lock():
             try:
-                result = self._market_data.query_snapshot(codes, **kwargs)
+                result = self._call_sdk_with_timeout(
+                    lambda: self._market_data.query_snapshot(codes, **kwargs),
+                    self._config.sdk_call_timeout_sec,
+                    "query_snapshot",
+                )
             except Exception as e:
                 logger.error("query_snapshot 失败: %s: %s (codes=%d, date=%s)",
                              type(e).__name__, e, len(codes), trade_date,
@@ -315,7 +344,11 @@ class QueryMarketMixin:
                     logger.warning("query_snapshot 连接错误，尝试重连: %s", e)
                     try:
                         self._do_login()
-                        result = self._market_data.query_snapshot(codes, **kwargs)
+                        result = self._call_sdk_with_timeout(
+                            lambda: self._market_data.query_snapshot(codes, **kwargs),
+                            self._config.sdk_call_timeout_sec,
+                            "query_snapshot",
+                        )
                         logger.info("query_snapshot 重连后成功")
                     except Exception as e2:
                         logger.error("query_snapshot 重连后仍失败: %s: %s",
@@ -323,7 +356,7 @@ class QueryMarketMixin:
                         raise GatewayQueryError(f"query_snapshot failed after reconnect: {e2}") from e2
                 else:
                     if _is_sdk_corruption(e):
-                        logger.warning("检测到 SDK 内部状态损坏，重建会话释放 SDK 内部锁: %s", e)
+                        logger.warning("检测到 SDK 内部状态损坏，重建会话（含换锁）释放 SDK 内部锁: %s", e)
                         try:
                             self._do_login()
                         except Exception as e3:
@@ -359,12 +392,20 @@ class QueryMarketMixin:
             raise GatewayNotReadyError("gateway not ready")
         # 日历过期防护：end_date 超出日历最后一天时先热刷新，否则 SDK 本地过滤后
         # date_list 为空，0.000s 静默返回空（无网络请求、无异常，极难排查）。
+        # 节流：刚刷新过（冷却期内）说明服务端日历确实还没更新（如刚收盘查今天），
+        # 跳过重复刷新，直接放行查询（SDK 照常返回空，但不再每请求白拉日历）。
         if end_date is not None and self._calendar and end_date > self._calendar[-1]:
-            logger.info(
-                "query_kline end_date=%s 超出日历最后一天 %s，先刷新交易日历",
-                end_date, self._calendar[-1],
-            )
-            self.refresh_calendar()
+            if time.monotonic() - self._last_calendar_refresh >= self.CALENDAR_REFRESH_COOLDOWN_SEC:
+                logger.info(
+                    "query_kline end_date=%s 超出日历最后一天 %s，先刷新交易日历",
+                    end_date, self._calendar[-1],
+                )
+                self.refresh_calendar()
+            else:
+                logger.debug(
+                    "query_kline end_date=%s 超出日历最后一天 %s，冷却期内跳过刷新",
+                    end_date, self._calendar[-1],
+                )
         sdk_period_name = PERIOD_MAP.get(period)
         if sdk_period_name is None:
             raise GatewayQueryError(f"unsupported period: {period}")
@@ -383,7 +424,11 @@ class QueryMarketMixin:
 
         with self._sdk_lock():
             try:
-                result = self._market_data.query_kline(codes, **kwargs)
+                result = self._call_sdk_with_timeout(
+                    lambda: self._market_data.query_kline(codes, **kwargs),
+                    self._config.sdk_call_timeout_sec,
+                    "query_kline",
+                )
                 return result if isinstance(result, dict) else {"_all": result}
             except Exception as e:
                 logger.error(
@@ -398,7 +443,11 @@ class QueryMarketMixin:
                     logger.warning("query_kline 连接错误，尝试重连: %s", e)
                     try:
                         self._do_login()
-                        result = self._market_data.query_kline(codes, **kwargs)
+                        result = self._call_sdk_with_timeout(
+                            lambda: self._market_data.query_kline(codes, **kwargs),
+                            self._config.sdk_call_timeout_sec,
+                            "query_kline",
+                        )
                         logger.info("query_kline 重连后成功")
                         return result if isinstance(result, dict) else {"_all": result}
                     except Exception as e2:
@@ -408,7 +457,7 @@ class QueryMarketMixin:
                 if _is_sdk_corruption(e):
                     # SDK 异常路径不释放内部 lock（market_data.pyc 字节码证实），
                     # 不重建会让后续所有查询在 SDK lock.acquire() 上永久挂起。
-                    logger.warning("检测到 SDK 内部状态损坏，重建会话释放 SDK 内部锁: %s", e)
+                    logger.warning("检测到 SDK 内部状态损坏，重建会话（含换锁）释放 SDK 内部锁: %s", e)
                     try:
                         self._do_login()
                     except Exception as e3:

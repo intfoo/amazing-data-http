@@ -124,11 +124,16 @@ class AdjFactorService:
             if cols_to_keep:
                 df = df[cols_to_keep]
             else:
-                logger.warning(
-                    "列过滤未匹配任何 codes，使用全量宽表（可能影响内存）: "
-                    "codes_sample=%s columns_sample=%s",
+                # 宽表不含任何请求的 codes = SDK 返回数据与请求不符（实测场景：
+                # 本地缓存部分重建，is_local 增量合并失效）。兜底"使用全量宽表"会把
+                # 不相关 code 的因子行返回给调用方（静默错数据，2026-08-28 线上复核
+                # 发现），改为报错日志 + 返回空结果。
+                logger.error(
+                    "列过滤未匹配任何 codes，返回空结果（SDK 宽表缺请求的 codes，"
+                    "疑似本地缓存部分重建）: codes_sample=%s columns_sample=%s",
                     codes[:3], list(df.columns[:3]),
                 )
+                return pd.DataFrame(columns=["code", "trade_date", "adj_factor"])
 
         # 2. 过滤日期行（index = 交易日期），在宽表层面过滤比 melt 后省内存
         df = AdjFactorService._filter_wide_by_date(df, start_dt, end_dt)

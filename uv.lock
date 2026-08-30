@@ -19,6 +19,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "tables" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -36,6 +37,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "tables", specifier = ">=3.11.1" },
+    { name = "tzdata", specifier = ">=2024.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 provides-extras = ["dev"]

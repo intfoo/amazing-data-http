@@ -345,6 +345,100 @@ def test_get_adj_factor_reconnect_none_still_guarded(monkeypatch):
     assert result is expected
 
 
+def test_get_adj_factor_hdf5_corruption_quarantine_and_retry(tmp_path):
+    """is_local=True 抛 HDF5 错误（本地缓存半写损坏）→ 隔离缓存文件 + 回退 is_local=False 重试。
+
+    2026-08-28 线上事故回归：adj_factor.h5 半写截断，tables 抛 HDF5ExtError，
+    旧代码无自愈持续 502。修复后应隔离坏缓存（重命名留证）并远程重试成功。
+    """
+    import pandas as pd
+    from app.config import Config
+    from app.gateway import AmazingDataGateway
+
+    cache_dir = tmp_path / "basedata" / "adj_factor"
+    cache_dir.mkdir(parents=True)
+    cache_file = cache_dir / "adj_factor.h5"
+    cache_file.write_bytes(b"truncated-corrupt")
+
+    cfg = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                 adj_factor_is_local=True, adj_factor_local_path=str(tmp_path))
+    gw = AmazingDataGateway(cfg)
+    gw._ready = True
+    calls = []
+    expected = pd.DataFrame({"000001.SZ": [1.0]})
+
+    class HDF5ExtError(Exception):
+        pass
+
+    class FakeBase:
+        def get_adj_factor(self, codes, local_path=None, is_local=False):
+            calls.append(is_local)
+            if is_local:
+                raise HDF5ExtError(
+                    "HDF5 error back trace ... Unable to open/create file "
+                    "'adj_factor.h5'"
+                )
+            return expected
+
+    gw._base_data = FakeBase()
+    result = gw.get_adj_factor(["000001.SZ"])
+    assert calls == [True, False]
+    assert result is expected
+    # 坏缓存已隔离留证（重命名为 .corrupt-*），原路径文件不存在
+    assert not cache_file.exists()
+    assert len(list(cache_dir.glob("adj_factor.h5.corrupt-*"))) == 1
+
+
+def test_get_adj_factor_hdf5_corruption_retry_fails_raises(tmp_path):
+    """缓存隔离后远程重试仍失败 → GatewayQueryError（不静默、不泄漏原始异常类型）。"""
+    from app.config import Config
+    from app.gateway import AmazingDataGateway, GatewayQueryError
+
+    cfg = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                 adj_factor_is_local=True, adj_factor_local_path=str(tmp_path))
+    gw = AmazingDataGateway(cfg)
+    gw._ready = True
+
+    class FakeBase:
+        def get_adj_factor(self, codes, local_path=None, is_local=False):
+            raise RuntimeError("HDF5 error back trace")
+
+    gw._base_data = FakeBase()
+    with pytest.raises(GatewayQueryError, match="after cache quarantine"):
+        gw.get_adj_factor(["000001.SZ"])
+
+
+def test_get_adj_factor_none_fallback_quarantines_cache(tmp_path):
+    """is_local=True 返回 None（缓存可能损坏）→ 隔离缓存文件再远程重试。"""
+    import pandas as pd
+    from app.config import Config
+    from app.gateway import AmazingDataGateway
+
+    cache_dir = tmp_path / "basedata" / "adj_factor"
+    cache_dir.mkdir(parents=True)
+    cache_file = cache_dir / "adj_factor.h5"
+    cache_file.write_bytes(b"stale")
+
+    cfg = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                 adj_factor_is_local=True, adj_factor_local_path=str(tmp_path))
+    gw = AmazingDataGateway(cfg)
+    gw._ready = True
+    calls = []
+    expected = pd.DataFrame({"000001.SZ": [1.0]})
+
+    class FakeBase:
+        def get_adj_factor(self, codes, local_path=None, is_local=False):
+            calls.append(is_local)
+            return None if is_local else expected
+
+    gw._base_data = FakeBase()
+    result = gw.get_adj_factor(["000001.SZ"])
+    assert calls == [True, False]
+    assert result is expected
+    assert not cache_file.exists()
+    assert len(list(cache_dir.glob("adj_factor.h5.corrupt-*"))) == 1
+
+
 def test_is_sdk_corruption_keywords():
     from app.gateway import _is_sdk_corruption
 
@@ -562,3 +656,46 @@ def test_universe_cache_survives_process_restart(tmp_path, monkeypatch):
     u = gw2.get_realtime_universe()
     assert u == {"000001.SZ": "stock", "000001.SH": "index", "510300.SH": "etf"}
     assert base2.calls == []  # 磁盘命中，零 SDK 调用
+
+
+def test_universe_concurrent_calls_single_flight(tmp_path, monkeypatch):
+    """并发调用单飞去重：两线程同时获取，只拉取一轮（3 次 get_code_list）。
+
+    回归 2026-08-14：startup universe-refresh 线程与调度器启动订阅并发调
+    get_realtime_universe，无锁时双方均 miss 缓存各拉一遍全量代码表（~80s×2）。
+    """
+    import threading
+    import time as _time
+
+    gw, base = _make_universe_gw(tmp_path, monkeypatch, hour=10)
+
+    orig_get = base.get_code_list
+
+    def slow_get(security_type="EXTRA_STOCK_A"):
+        _time.sleep(0.05)  # 模拟 SDK 慢调用，保证两线程窗口重叠
+        return orig_get(security_type)
+
+    base.get_code_list = slow_get
+
+    results: list[dict] = []
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            results.append(gw.get_realtime_universe())
+        except Exception as e:  # pragma: no cover - 失败时断言会捕获
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors
+    assert len(results) == 2
+    assert results[0] == results[1] == {
+        "000001.SZ": "stock", "000001.SH": "index", "510300.SH": "etf",
+    }
+    # 单飞生效：仅一轮拉取（无锁时为 6 次）
+    assert len(base.calls) == 3
