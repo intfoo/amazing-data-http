@@ -23,6 +23,7 @@ class TgwEventMixin:
 
         指数退避：60→120→240→reconnect_max_interval_sec(默认300) 封顶，成功复位。
         故障期降低 ad.login 调用频率（每次失败 native 层疑似泄漏资源，OOM 防护）。
+        失败后自动再武装退避重试（_arm_reconnect_retry），不再依赖新事件驱动。
         """
 
         def _do() -> None:
@@ -32,6 +33,11 @@ class TgwEventMixin:
             with self._reconnect_lock:
                 pass
             try:
+                if self._ready:
+                    # 退避重试 timer 触发时会话已被其他路径恢复
+                    # （查询惰性重连 / 调度器自愈 login），无需重复 login。
+                    logger.info("tgw 重连跳过：会话已恢复（原触发: %s）", reason)
+                    return
                 logger.info("tgw 断线触发主动重连: %s", reason)
                 with self._sdk_lock():
                     self._do_login()
@@ -41,11 +47,13 @@ class TgwEventMixin:
             except Exception as e:
                 with self._reconnect_lock:
                     self._reconnect_failures += 1
+                    failures = self._reconnect_failures
                 err = self._last_login_error or {}
                 logger.error(
                     "tgw 主动重连失败: %s: %s (category=%s)",
                     type(e).__name__, e, err.get("category", "unknown"),
                 )
+                self._arm_reconnect_retry(failures)
             finally:
                 with self._reconnect_lock:
                     self._reconnect_in_progress = False
@@ -66,6 +74,32 @@ class TgwEventMixin:
             # 在持锁状态下启动线程：_do 会先阻塞在 _reconnect_lock 上，
             # 直到本 with 块退出后才开始执行，保证调用方看到 _reconnect_in_progress=True。
             threading.Thread(target=_do, daemon=True, name="tgw-reconnect").start()
+
+    def _arm_reconnect_retry(self, failures: int) -> None:
+        """重连失败后按退避间隔自动再触发 _schedule_reconnect（daemon timer）。
+
+        原实现重连是一次性的：失败后只能等下一个断线事件或 SDK 调用超时再触发。
+        若 SDK 原生会话保活良好（无 disconnect 事件）且查询面 not-ready fail-fast
+        （永不触及 SDK 超时路径），两个触发入口都不会再 firing，重连状态机永久停摆
+        （2026-09-10 事故：重连因 gateway lock 竞争超时失败一次后 _ready 卡死 4 天，
+        reconnect_attempts 定格为 1）。
+        timer 等待时长 = _schedule_reconnect 对当前 failures 要求的冷却间隔，
+        触发时冷却检查自然通过；in_progress 已在 _do 的 finally 中复位。
+        成功路径不再 arm 新 timer，重试链自然终止。
+        """
+        interval = min(
+            _RECONNECT_COOLDOWN_SEC * (2 ** failures),
+            self._config.reconnect_max_interval_sec,
+        )
+        logger.info(
+            "tgw 主动重连将在 %.0fs 后自动重试（连续第 %d 次失败）",
+            interval, failures,
+        )
+        timer = threading.Timer(
+            interval, self._schedule_reconnect, args=("retry after failure",),
+        )
+        timer.daemon = True
+        timer.start()
 
     def _should_log_disconnect(self, msg: str) -> bool:
         """断线 WARNING 去重：相同消息 _DISCONNECT_DEDUP_SEC 内只打一次。

@@ -387,3 +387,35 @@ class TestSchedulerSelfHeal:
         scheduler._tick()
         assert login_call_count[0] == 1  # login 确实被调用了 1 次
         assert gw.sub_start_called == 0
+
+    def test_not_ready_heals_even_when_rt_active(self):
+        """窗口内 + not ready + rt 僵尸活跃（残留推送复活）→ 仍触发自愈 login。
+
+        2026-09-10 事故：stop_subscription 杀不掉 SDK 推送线程（abandon），
+        残留帧让 on_snapshot 窗口内自动复活 rt._active；旧代码先判活性再判
+        ready，自愈被永久跳过，_ready 卡死 4 天（healthcheck 连跪 11000+ 次，
+        查询面全挂但 /realtime 靠僵尸推送维持 200）。
+        """
+        gw = FakeGateway(ready=False, calendar=_today_cal())
+        config = _make_config()
+        rt = RealtimeService(gateway=gw)
+        scheduler = SubscriptionScheduler(gw, rt, config)
+        rt.set_active(True)  # 僵尸推送造成的假活跃
+        scheduler._tick()
+        assert gw.login_called == 1
+        assert gw.sub_start_called == 0
+
+    def test_heal_success_forces_subscription_rebuild(self):
+        """自愈 login 成功后 rt 被强制置 inactive，下轮 tick 走完整订阅重建流程。"""
+        gw = FakeGateway(ready=False, calendar=_today_cal())
+        config = _make_config()
+        rt = RealtimeService(gateway=gw)
+        scheduler = SubscriptionScheduler(gw, rt, config)
+        rt.set_active(True)  # 僵尸假活跃
+        scheduler._tick()
+        assert gw.login_called == 1
+        assert rt.is_active() is False  # 自愈成功后强制置 inactive
+        # FakeGateway.login 已把 _ready 置 True → 下轮 tick 启动订阅重建
+        scheduler._tick()
+        assert gw.sub_start_called == 1
+        assert rt.is_active() is True

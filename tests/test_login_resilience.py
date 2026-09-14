@@ -120,6 +120,58 @@ class TestReconnectBackoff:
         gw._test_release.set()
         self._wait_reconnect_done(gw)
 
+    def test_reconnect_failure_auto_retries_until_success(self, monkeypatch):
+        """重连失败后按退避自动重试直到成功，不再一次性停摆。
+
+        2026-09-10 事故：重连因 gateway lock 竞争超时失败一次后，SDK 原生会话
+        保活良好不再产生断线事件、查询面 not-ready fail-fast 不再触发超时，
+        两个重连触发入口永久停摆（_ready 卡死 4 天，reconnect_attempts 定格 1）。
+        """
+        monkeypatch.setattr(
+            "app.gateway.tgw_events._RECONNECT_COOLDOWN_SEC", 0.02,
+        )
+        config = Config(username="u", password="p", ip="127.0.0.1", port=12345,
+                        auth_required=False, reconnect_max_interval_sec=1)
+        gw = AmazingDataGateway(config)
+        attempts = [0]
+
+        def flaky_do_login():
+            attempts[0] += 1
+            if attempts[0] < 3:
+                raise RuntimeError("boom")
+            gw._ready = True
+
+        gw._do_login = flaky_do_login
+        gw._last_reconnect_attempt = 0.0
+        gw._schedule_reconnect("test")
+        deadline = time.time() + 5
+        while time.time() < deadline and attempts[0] < 3:
+            time.sleep(0.02)
+        assert attempts[0] == 3  # 失败 2 次后自动重试，第 3 次成功
+        assert gw.is_ready() is True
+        assert gw._reconnect_failures == 0  # 成功复位
+        self._wait_reconnect_done(gw)
+
+    def test_reconnect_skipped_when_already_ready(self, monkeypatch):
+        """退避重试触发时会话已被其他路径恢复 → 跳过 login，重试链终止。"""
+        monkeypatch.setattr(
+            "app.gateway.tgw_events._RECONNECT_COOLDOWN_SEC", 0.02,
+        )
+        config = Config(username="u", password="p", ip="127.0.0.1", port=12345,
+                        auth_required=False, reconnect_max_interval_sec=1)
+        gw = AmazingDataGateway(config)
+        calls = [0]
+
+        def counting_do_login():
+            calls[0] += 1
+
+        gw._do_login = counting_do_login
+        gw._ready = True  # 已被调度器自愈 login 等路径恢复
+        gw._last_reconnect_attempt = 0.0
+        gw._schedule_reconnect("test")
+        self._wait_reconnect_done(gw)
+        assert calls[0] == 0  # _do 看到 ready 直接返回，未重复 login
+
 
 class TestNoiseDedup:
     def test_independent_slot(self, monkeypatch):

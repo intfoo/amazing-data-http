@@ -94,10 +94,14 @@ class SubscriptionScheduler:
             calendar_fallback_weekday=self._config.calendar_fallback_weekday,
         )
         if in_window:
+            # not-ready 检查优先于订阅活性判断：SDK 推送线程 abandon 后的残留推送
+            # 会让 rt 假活跃（on_snapshot 窗口内自动复活），若先判活性，
+            # 自愈 login 会被永久跳过（2026-09-10 事故：_ready 卡死 4 天，
+            # 查询面全挂但 /realtime 靠僵尸推送维持 200）。
+            if not self._gw.is_ready():
+                self._self_heal_login()
+                return
             if not self._rt.is_active():
-                if not self._gw.is_ready():
-                    self._self_heal_login()
-                    return
                 # 重启退避：第 n 次失败后等待 _RESTART_BACKOFF_SEC[n-1]（5 分钟封顶）
                 idx = max(0, min(self._restart_failures - 1, len(_RESTART_BACKOFF_SEC) - 1))
                 interval = _RESTART_BACKOFF_SEC[idx]
@@ -142,6 +146,10 @@ class SubscriptionScheduler:
         try:
             self._gw.login()
             logger.info("调度器自愈 login 成功")
+            # 自愈成功后强制下轮 tick 重建订阅：not-ready 期间的残留僵尸推送
+            # 可能让 rt 假活跃（绑定旧会话、无 watchdog 保护）；置 inactive 让下轮
+            # 走正常启动流程（stop 旧资源 + start 新订阅 + 重启 watchdog）。
+            self._rt.set_active(False)
         except Exception as e:
             logger.debug("调度器自愈 login 失败: %s: %s", type(e).__name__, e)
 
