@@ -9,7 +9,8 @@ import types
 import pytest
 
 from app.config import Config
-from app.gateway import AmazingDataGateway, GatewayNotReadyError
+from app.gateway import AmazingDataGateway, GatewayNotReadyError, GatewayQueryError
+from app.gateway.base import WEDGE_EXIT_CODE
 
 
 def _make_config() -> Config:
@@ -184,3 +185,97 @@ class TestNoiseDedup:
         assert gw._should_log_noise("HandleFile | Now use ip <1.2.3.4>") is False
         # 独立槽位：噪音记录不影响断线 WARNING dedup
         assert gw._should_log_disconnect("Push Heartbeat Check") is True
+
+
+class TestWedgeExit:
+    """楔死主动退出：登录路径超时连续 2 次且本进程曾成功登录 → os._exit(71)。
+
+    2026-09-16 事故实证：原生楔死后 8 轮进程内重连全部失败（get_calendar 挂在
+    同一楔死通道 + max_limitation），最终靠 OOM 杀进程才恢复。挂死的 C 层调用
+    只有进程死亡才能清除，故连续楔死签名达到阈值即主动退出交由 restart 拉起。
+    """
+
+    @staticmethod
+    def _make_gw(monkeypatch, exits):
+        monkeypatch.setitem(
+            sys.modules, "AmazingData", _fake_ad_module(lambda **kwargs: None),
+        )
+        gw = AmazingDataGateway(_make_config())
+        monkeypatch.setattr(
+            "app.gateway.session.os._exit", lambda code: exits.append(code),
+        )
+        return gw
+
+    def _timeout_login(self, gw):
+        """模拟登录路径超时：让 _call_sdk_with_timeout 直接抛楔死签名异常。"""
+        err = GatewayQueryError(
+            "get_calendar 超过 120s 无响应（SDK 线程已隔离为 daemon，会话重建中）"
+        )
+
+        def raise_timeout(fn, timeout_sec, label):
+            raise err
+
+        gw._call_sdk_with_timeout = raise_timeout
+        with pytest.raises(GatewayNotReadyError):
+            gw.login()
+
+    def test_double_wedge_timeout_exits(self, monkeypatch):
+        """曾成功登录 + 连续 2 次登录路径超时 → 主动 os._exit(WEDGE_EXIT_CODE)。"""
+        exits = []
+        gw = self._make_gw(monkeypatch, exits)
+        gw._ever_ready = True
+        self._timeout_login(gw)
+        assert exits == []                       # 第 1 次：只计数不退出
+        assert gw._wedge_signature_streak == 1
+        self._timeout_login(gw)
+        assert exits == [WEDGE_EXIT_CODE]        # 第 2 次：主动退出
+        assert gw._wedge_signature_streak == 2
+
+    def test_wedge_exit_guarded_before_first_login_success(self, monkeypatch):
+        """从未成功登录（启动期故障）→ 只计数不退出，避免 crash-loop。"""
+        exits = []
+        gw = self._make_gw(monkeypatch, exits)
+        for _ in range(3):
+            self._timeout_login(gw)
+        assert exits == []
+        assert gw._wedge_signature_streak == 3
+
+    def test_non_timeout_failures_do_not_exit(self, monkeypatch):
+        """SystemExit 路径（max_limitation / SDK 内部 exit(0)）非楔死签名 → 永不退出。"""
+        exits = []
+        monkeypatch.setitem(
+            sys.modules, "AmazingData", _fake_ad_module(lambda **kwargs: exit(0)),
+        )
+        gw = AmazingDataGateway(_make_config())
+        monkeypatch.setattr(
+            "app.gateway.session.os._exit", lambda code: exits.append(code),
+        )
+        gw._ever_ready = True
+        for _ in range(4):
+            with pytest.raises(GatewayNotReadyError):
+                gw.login()
+        assert exits == []
+        assert gw._wedge_signature_streak == 0
+
+    def test_success_resets_streak_and_marks_ever_ready(self, monkeypatch):
+        """成功登录复位楔死计数并置 _ever_ready（此后楔死退出守卫放开）。"""
+        exits = []
+        gw = self._make_gw(monkeypatch, exits)
+        self._timeout_login(gw)
+        assert gw._wedge_signature_streak == 1
+        # 成功登录：绕过超时包装直调 fn，构造完整 fake SDK 面
+        fake = _fake_ad_module(lambda **kwargs: None)
+
+        class _FakeBaseData:
+            def get_calendar(self):
+                return [20260916]
+
+        fake.BaseData = _FakeBaseData
+        fake.MarketData = lambda calendar: None
+        fake.InfoData = lambda: None
+        monkeypatch.setitem(sys.modules, "AmazingData", fake)
+        gw._call_sdk_with_timeout = lambda fn, timeout_sec, label: fn()
+        gw.login()
+        assert gw.is_ready() is True
+        assert gw._ever_ready is True
+        assert gw._wedge_signature_streak == 0

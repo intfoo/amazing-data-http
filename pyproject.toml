@@ -1,6 +1,6 @@
 [project]
 name = "amazingdata-http"
-version = "0.1.1"
+version = "0.1.2"
 description = "AmazingData HTTP adapter service"
 requires-python = ">=3.13"
 dependencies = [

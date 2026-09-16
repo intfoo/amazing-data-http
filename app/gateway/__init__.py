@@ -91,3 +91,6 @@ class AmazingDataGateway(
         self._last_login_spi = None     # set_cfg probe 捕获的 log_spi
         self._login_events: deque = deque(maxlen=20)  # 登录窗口事件环形缓冲（deque 线程安全 append/clear，自动丢弃超限）
         self._login_in_progress = False
+        # 楔死主动退出状态（语义见 base.py WEDGE_EXIT_* 注释）
+        self._ever_ready = False           # 本进程生命周期内是否成功登录过（楔死退出守卫，防启动期 crash-loop）
+        self._wedge_signature_streak = 0   # 连续楔死签名（登录路径超时）计数，仅成功登录复位

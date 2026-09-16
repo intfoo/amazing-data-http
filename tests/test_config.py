@@ -135,3 +135,17 @@ def test_config_reads_sdk_call_timeout(monkeypatch):
     monkeypatch.setenv("SDK_CALL_TIMEOUT_SEC", "180")
     config = Config.from_env()
     assert config.sdk_call_timeout_sec == 180
+
+
+def test_config_default_sdk_session_timeout(monkeypatch):
+    """SDK_SESSION_TIMEOUT_SEC 缺省时默认 120。"""
+    monkeypatch.delenv("SDK_SESSION_TIMEOUT_SEC", raising=False)
+    config = Config.from_env()
+    assert config.sdk_session_timeout_sec == 120
+
+
+def test_config_reads_sdk_session_timeout(monkeypatch):
+    """SDK_SESSION_TIMEOUT_SEC 环境变量覆盖默认值。"""
+    monkeypatch.setenv("SDK_SESSION_TIMEOUT_SEC", "90")
+    config = Config.from_env()
+    assert config.sdk_session_timeout_sec == 90

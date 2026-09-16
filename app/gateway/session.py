@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 
-from app.gateway.base import GatewayNotReadyError, logger
+from app.gateway.base import (
+    WEDGE_EXIT_CODE,
+    WEDGE_EXIT_THRESHOLD,
+    GatewayNotReadyError,
+    _is_wedge_timeout,
+    logger,
+)
 
 
 class SessionMixin:
@@ -50,7 +58,7 @@ class SessionMixin:
                     host=self._config.ip,
                     port=self._config.port,
                 ),
-                self._config.sdk_call_timeout_sec,
+                self._config.sdk_session_timeout_sec,
                 "login",
             )
             sdk_logged_in = True
@@ -58,7 +66,7 @@ class SessionMixin:
             self._base_data = base
             calendar = self._call_sdk_with_timeout(
                 base.get_calendar,
-                self._config.sdk_call_timeout_sec,
+                self._config.sdk_session_timeout_sec,
                 "get_calendar",
             )
             self._calendar = calendar
@@ -67,6 +75,8 @@ class SessionMixin:
             self._info_data = ad.InfoData()
             self._ready = True
             self._last_login_error = None
+            self._ever_ready = True
+            self._wedge_signature_streak = 0
             logger.info("SDK 登录成功")
         except SystemExit as e:
             # SDK login 内部 exit(0) → 进程存活兜底
@@ -77,14 +87,40 @@ class SessionMixin:
             logger.error("SDK 登录失败: %s", self._last_login_error)
             raise GatewayNotReadyError(f"login failed: SDK exit({e.code})") from e
         except Exception as e:
-            self._build_last_login_error("exception", f"{type(e).__name__}: {e}")
+            detail = f"{type(e).__name__}: {e}"
+            self._build_last_login_error("exception", detail)
             if sdk_logged_in:
                 self._safe_logout()
             self._ready = False
             logger.error("SDK 登录失败: %s", self._last_login_error)
+            self._record_wedge_failure(detail)
             raise GatewayNotReadyError(f"login failed: {e}") from e
         finally:
             self._login_in_progress = False
+
+    def _record_wedge_failure(self, detail: str) -> None:
+        """楔死签名计数；达到阈值且本进程曾成功登录过 → 主动退出，交由 restart 策略重建。
+
+        进程内恢复（换锁/重连/调度器自愈 login）对原生楔死结构性无效：挂死的
+        C 层调用只在进程死亡时清除，且幽灵线程的半开连接还会推高服务端连接数
+        （max_limitation）与内存（2026-09-16 事故 RSS 涨至 2.33GB 触发宿主 OOM）。
+        _ever_ready 守卫防止启动期故障（凭据错误/服务端不可达）退化为 crash-loop：
+        那类失败重试是安全的，且重启无收益。
+        计数仅由成功登录复位——非签名失败（如 max_limitation）不证明原生通道
+        恢复，不复位。多入口并发计数竞争最坏少计一次、推迟一轮退出，无害。
+        """
+        if not _is_wedge_timeout(detail):
+            return
+        self._wedge_signature_streak += 1
+        if not self._ever_ready or self._wedge_signature_streak < WEDGE_EXIT_THRESHOLD:
+            return
+        logger.critical(
+            "SDK 原生楔死判定成立：连续 %d 次登录路径超时（最近: %s），"
+            "进程内恢复不可能，主动退出（exit=%d）交由容器 restart 策略重建会话",
+            self._wedge_signature_streak, detail, WEDGE_EXIT_CODE,
+        )
+        sys.stderr.flush()
+        os._exit(WEDGE_EXIT_CODE)
 
     def logout(self) -> None:
         """线程安全的登出入口。shutdown 路径：清空 calendar。"""
@@ -162,7 +198,7 @@ class SessionMixin:
         with self._sdk_lock():
             calendar = self._call_sdk_with_timeout(
                 self._base_data.get_calendar,
-                self._config.sdk_call_timeout_sec,
+                self._config.sdk_session_timeout_sec,
                 "get_calendar",
             )
             self._calendar = calendar

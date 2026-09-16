@@ -48,7 +48,8 @@ class Config:
     reconnect_max_interval_sec: int = 300  # tgw 主动重连退避上限（秒）
     stale_max_age_sec: int = 300           # /realtime 订阅缓存 stale 上限（秒），超过走 fallback
     fund_data_cache_ttl_sec: int = 300  # /etf/share、/etf/nav 结果缓存 TTL（秒），份额/净值 T+1 更新无 freshness 风险
-    sdk_call_timeout_sec: int = 120  # 单次 SDK 调用超时（秒）：超时隔离为 daemon 线程 + 置 not-ready + 退避重建（_do_login 含换锁）
+    sdk_call_timeout_sec: int = 120  # 查询路径单次 SDK 调用超时（秒）：超时隔离为 daemon 线程 + 置 not-ready + 退避重建。重查询（adj_factor 200 codes 实测 22~90s+）走此值
+    sdk_session_timeout_sec: int = 120  # 登录路径（login/get_calendar/refresh_calendar）超时（秒）：正常 <50s，超时即原生楔死强签名，是楔死主动退出的快速通道（见 base.WEDGE_EXIT_*）
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -80,6 +81,7 @@ class Config:
             stale_max_age_sec=_env_int("STALE_MAX_AGE_SEC", 300),
             fund_data_cache_ttl_sec=_env_int("FUND_DATA_CACHE_TTL_SEC", 300),
             sdk_call_timeout_sec=_env_int("SDK_CALL_TIMEOUT_SEC", 120),
+            sdk_session_timeout_sec=_env_int("SDK_SESSION_TIMEOUT_SEC", 120),
         )
 
     def is_configured(self) -> bool:

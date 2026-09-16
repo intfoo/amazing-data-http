@@ -49,6 +49,25 @@ ADJ_FACTOR_TIMEOUT_SEC = 120  # 文档性默认值标注，实际读取 Config.s
 
 SDK_LOCK_TIMEOUT_SEC = 30  # gateway._lock 竞争超时；超时说明有 SDK 调用挂起未释放
 
+# ---- 楔死主动退出（wedge exit）----
+# 登录路径（login/get_calendar）SDK 调用超时是原生查询通道楔死的强签名：挂死的
+# C 层调用只有进程死亡才能清除，进程内重连/换锁结构性无效（2026-09-16 事故：
+# 8 轮重连全部以 get_calendar 超时失败，最终靠 OOM 杀进程重启才恢复，期间内存
+# 膨胀至 2.33GB 还差点连坐宿主上其他容器）。
+# 连续 N 次（未经成功登录中断）楔死签名 → 主动 os._exit 交由容器 restart 策略
+# 拉起全新进程（实测冷启动登录 ~3s，远快于无限重试的楔死期）。
+WEDGE_EXIT_THRESHOLD = 2   # 触发主动退出的连续楔死签名次数
+WEDGE_EXIT_CODE = 71       # 退出码（诊断标识；restart: unless-stopped 对任意退出码均重启）
+
+# _call_sdk_with_timeout 超时异常消息签名（"…超过 Ns 无响应（…）"）。
+# 该消息刻意避开 _CONNECTION_KEYWORDS（英文 timeout 等），此处正好用作楔死指纹。
+_SDK_WEDGE_TIMEOUT_MARKERS: tuple[str, ...] = ("超过", "无响应")
+
+
+def _is_wedge_timeout(detail: str) -> bool:
+    """登录失败 detail 是否为楔死签名（登录路径 SDK 调用超时，非普通网络错误）。"""
+    return all(marker in detail for marker in _SDK_WEDGE_TIMEOUT_MARKERS)
+
 
 def _is_connection_error(exc: Exception) -> bool:
     """判断异常是否可能是网络/连接类错误（应触发重连）。"""
