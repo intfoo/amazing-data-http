@@ -59,6 +59,14 @@ SDK_LOCK_TIMEOUT_SEC = 30  # gateway._lock 竞争超时；超时说明有 SDK �
 WEDGE_EXIT_THRESHOLD = 2   # 触发主动退出的连续楔死签名次数
 WEDGE_EXIT_CODE = 71       # 退出码（诊断标识；restart: unless-stopped 对任意退出码均重启）
 
+# ---- max_limitation 失败即死 ----
+# 2026-09-28 事故实证：SDK 登录因账号在线数超限失败时，失败过程已在服务端
+# 登录成功 2 条推送会话（act_instanceid 两次）且原生层不关闭——TCP 连接由
+# 活着的失败进程永久持有，后续登录全部被拒且每次再泄漏 2 条，自我维持死锁。
+# 进程死亡（内核关 socket 发 FIN）是唯一可靠释放手段，故检测到 max_limitation
+# 立即退出，交由 restart 策略重试：每次尝试自清理、净泄漏为零。
+MAX_LIMITATION_EXIT_CODE = 72  # 退出码（诊断标识，与楔死退出 71 区分告警口径）
+
 # _call_sdk_with_timeout 超时异常消息签名（"…超过 Ns 无响应（…）"）。
 # 该消息刻意避开 _CONNECTION_KEYWORDS（英文 timeout 等），此处正好用作楔死指纹。
 _SDK_WEDGE_TIMEOUT_MARKERS: tuple[str, ...] = ("超过", "无响应")

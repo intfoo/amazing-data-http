@@ -10,9 +10,12 @@
 
 import asyncio
 import logging
+import os
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -194,6 +197,57 @@ async def _run_sdk_endpoint(app: FastAPI, fn, *args, **kwargs) -> dict:
         app.state.sdk_gate.release()
 
 
+SINGLE_INSTANCE_LOCK_EXIT_CODE = 73  # 单实例登录锁竞争失败退出码（诊断标识）
+
+# 本进程已持有的锁 fd 列表（防 GC 关闭 fd 释放锁；同进程重复获取时复用，
+# 避免 TestClient 多次进 lifespan 时自己与自己的 flock 冲突）。
+_held_instance_lock_fds: list = []
+
+
+def _single_instance_lock_path() -> Path:
+    """锁文件路径：项目根 data/ 下（容器内即 compose 挂载的 ./data:/app/data，
+    flock 作用于宿主机同一 inode，跨容器/裸进程互斥）。"""
+    return Path(__file__).resolve().parents[1] / "data" / ".amazing-login.lock"
+
+
+def _flock_exclusive_nb(fd: int) -> None:
+    """非阻塞排他 flock（仅 POSIX；抽成独立函数便于测试替换）。"""
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _acquire_single_instance_lock(lock_path: Path):
+    """单实例登录锁：同账号多进程/容器同时 login 会互相挤占服务端在线名额。
+
+    2026-09-28 事故实证：账号在线数超限（max_limitation）后每次登录尝试都
+    泄漏会话，多实例并发登录会互相把对方顶进锁死。flock 于宿主机共享 data
+    目录，跨容器有效；进程死亡内核自动释放。获取失败立即退出交由 restart
+    重试（占位者是临时故障时自愈；是持久误部署时以退出码 73 暴露告警）。
+    非 POSIX（本地 Windows 开发）无 flock，跳过并返回 None。
+    """
+    if os.name != "posix":
+        logger.debug("非 POSIX 环境，跳过单实例登录锁: %s", lock_path)
+        return None
+    if _held_instance_lock_fds:
+        return _held_instance_lock_fds[0]
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = lock_path.open("a+")
+    try:
+        _flock_exclusive_nb(fd.fileno())
+    except OSError as e:
+        fd.close()
+        logger.critical(
+            "单实例登录锁获取失败: %s（%s: %s）——另一进程/容器持有该账号登录会话，"
+            "继续 login 会互相挤占在线名额（max_limitation），退出（exit=%d）",
+            lock_path, type(e).__name__, e, SINGLE_INSTANCE_LOCK_EXIT_CODE,
+        )
+        sys.stderr.flush()
+        os._exit(SINGLE_INSTANCE_LOCK_EXIT_CODE)
+    _held_instance_lock_fds.append(fd)
+    logger.info("单实例登录锁已获取: %s", lock_path)
+    return fd
+
+
 def create_app(config: Config | None = None, gateway: Gateway | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
@@ -225,6 +279,10 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             logger.error("认证配置无效: %s", e)
             raise  # 进程退出，uvicorn 启动失败
         if config.is_configured():
+            # 单实例登录锁先于一切 login：持有至进程死亡（fd 存模块级列表防 GC 释放）。
+            app.state.login_lock_fd = _acquire_single_instance_lock(
+                _single_instance_lock_path()
+            )
             try:
                 gateway.login()
                 logger.info("启动登录成功")

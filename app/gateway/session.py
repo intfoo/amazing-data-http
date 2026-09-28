@@ -7,6 +7,7 @@ import sys
 import time
 
 from app.gateway.base import (
+    MAX_LIMITATION_EXIT_CODE,
     WEDGE_EXIT_CODE,
     WEDGE_EXIT_THRESHOLD,
     GatewayNotReadyError,
@@ -85,6 +86,7 @@ class SessionMixin:
                 self._safe_logout()
             self._ready = False
             logger.error("SDK 登录失败: %s", self._last_login_error)
+            self._exit_if_max_limitation()
             raise GatewayNotReadyError(f"login failed: SDK exit({e.code})") from e
         except Exception as e:
             detail = f"{type(e).__name__}: {e}"
@@ -94,6 +96,7 @@ class SessionMixin:
             self._ready = False
             logger.error("SDK 登录失败: %s", self._last_login_error)
             self._record_wedge_failure(detail)
+            self._exit_if_max_limitation()
             raise GatewayNotReadyError(f"login failed: {e}") from e
         finally:
             self._login_in_progress = False
@@ -121,6 +124,30 @@ class SessionMixin:
         )
         sys.stderr.flush()
         os._exit(WEDGE_EXIT_CODE)
+
+    def _exit_if_max_limitation(self) -> None:
+        """max_limitation（账号在线数超限）登录失败 → 立即主动退出释放泄漏会话。
+
+        2026-09-28 事故实证：max_limitation 失败登录会泄漏已登录的推送会话
+        （原生线程退出但 TCP 连接仍由本进程持有），活着的失败进程永久抱死
+        泄漏名额 → 后续登录全部被拒且每次再泄漏 → 自我维持死锁。进程死亡
+        （内核关 socket 发 FIN）是唯一可靠的客户端释放手段，故立即退出交由
+        restart 策略重试；每次尝试自清理，净泄漏为零，名额释放后重试自然成功。
+        与楔死退出不同：刻意无 _ever_ready 守卫——启动期锁死正是主场景；
+        重试节奏由"重启 + 登录尝试耗时（36~50s）"天然构成，非高频 crash-loop。
+        其他失败分类（凭据错误/网络不可达等 spi.max_limitation=False）不退出，
+        保持进程存活供重连/自愈重试。
+        """
+        err = self._last_login_error
+        if not err or err.get("category") != "max_limitation":
+            return
+        logger.critical(
+            "账号在线数超限（max_limitation）：失败进程持有泄漏会话，"
+            "立即退出（exit=%d）释放名额，交由容器 restart 策略重试",
+            MAX_LIMITATION_EXIT_CODE,
+        )
+        sys.stderr.flush()
+        os._exit(MAX_LIMITATION_EXIT_CODE)
 
     def logout(self) -> None:
         """线程安全的登出入口。shutdown 路径：清空 calendar。"""

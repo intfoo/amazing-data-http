@@ -772,3 +772,60 @@ def test_startup_universe_refresh_failure_does_not_crash():
         _time.sleep(0.3)  # 给 universe-refresh 线程执行时间（异常应被吞）
         resp = client.get("/health")
         assert resp.status_code in (200, 503)
+
+
+class TestSingleInstanceLock:
+    """单实例登录锁（flock）：同账号多进程/容器同时 login 互相挤占在线名额。"""
+
+    def test_skipped_on_non_posix(self, monkeypatch, tmp_path):
+        """非 POSIX（Windows 开发机）无 flock → 跳过返回 None，不触碰文件系统。"""
+        import app.http_app as http_app
+        monkeypatch.setattr(http_app.os, "name", "nt")
+        lock = tmp_path / ".amazing-login.lock"
+        assert http_app._acquire_single_instance_lock(lock) is None
+        assert not lock.exists()
+
+    def test_conflict_exits_73(self, monkeypatch, tmp_path):
+        """锁被其他进程持有（flock 竞争失败）→ critical + os._exit(73)。"""
+        import app.http_app as http_app
+        monkeypatch.setattr(http_app.os, "name", "posix")
+        monkeypatch.setattr(http_app, "_held_instance_lock_fds", [])
+
+        def raise_conflict(fd):
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+
+        monkeypatch.setattr(http_app, "_flock_exclusive_nb", raise_conflict)
+        exits = []
+        monkeypatch.setattr(http_app.os, "_exit", lambda code: exits.append(code))
+        http_app._acquire_single_instance_lock(tmp_path / ".amazing-login.lock")
+        assert exits == [http_app.SINGLE_INSTANCE_LOCK_EXIT_CODE]
+
+    def test_success_held_and_reused(self, monkeypatch, tmp_path):
+        """获取成功：fd 持有于模块级列表（防 GC 释放锁）；同进程重复获取复用。"""
+        import app.http_app as http_app
+        monkeypatch.setattr(http_app.os, "name", "posix")
+        held = []
+        monkeypatch.setattr(http_app, "_held_instance_lock_fds", held)
+        monkeypatch.setattr(http_app, "_flock_exclusive_nb", lambda fd: None)
+        lock = tmp_path / "sub" / ".amazing-login.lock"  # 目录不存在 → 自动创建
+        fd1 = http_app._acquire_single_instance_lock(lock)
+        assert fd1 is not None
+        assert held == [fd1]
+        assert lock.exists()
+        fd2 = http_app._acquire_single_instance_lock(lock)
+        assert fd2 is fd1
+        fd1.close()
+
+    def test_lifespan_acquires_lock_before_login(self, monkeypatch):
+        """lifespan 在 gateway.login() 之前获取单实例锁。"""
+        import app.http_app as http_app
+        calls = []
+        monkeypatch.setattr(
+            http_app, "_acquire_single_instance_lock",
+            lambda path: calls.append(path) or None,
+        )
+        client = make_test_app()
+        with client:
+            pass
+        assert len(calls) == 1
+        assert calls[0].name == ".amazing-login.lock"

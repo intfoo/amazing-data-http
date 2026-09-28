@@ -10,7 +10,7 @@ import pytest
 
 from app.config import Config
 from app.gateway import AmazingDataGateway, GatewayNotReadyError, GatewayQueryError
-from app.gateway.base import WEDGE_EXIT_CODE
+from app.gateway.base import MAX_LIMITATION_EXIT_CODE, WEDGE_EXIT_CODE
 
 
 def _make_config() -> Config:
@@ -240,8 +240,8 @@ class TestWedgeExit:
         assert exits == []
         assert gw._wedge_signature_streak == 3
 
-    def test_non_timeout_failures_do_not_exit(self, monkeypatch):
-        """SystemExit 路径（max_limitation / SDK 内部 exit(0)）非楔死签名 → 永不退出。"""
+    def test_non_max_limitation_failures_do_not_exit(self, monkeypatch):
+        """非 max_limitation 失败（spi 未置位：凭据错误/网络等）→ 不退出，进程存活重试。"""
         exits = []
         monkeypatch.setitem(
             sys.modules, "AmazingData", _fake_ad_module(lambda **kwargs: exit(0)),
@@ -279,3 +279,47 @@ class TestWedgeExit:
         assert gw.is_ready() is True
         assert gw._ever_ready is True
         assert gw._wedge_signature_streak == 0
+
+
+class TestMaxLimitationExit:
+    """max_limitation（账号在线数超限）失败即死：os._exit(72) 释放泄漏会话。
+
+    2026-09-28 事故实证：max_limitation 失败登录在服务端泄漏已登录推送会话，
+    TCP 连接由活着的失败进程持有 → 后续登录全部被拒且每次再泄漏，自我维持
+    死锁。进程死亡（内核关 socket 发 FIN）是唯一可靠释放手段。刻意无
+    _ever_ready 守卫——启动期锁死正是主场景；重试节奏由重启+登录耗时天然构成。
+    """
+
+    @staticmethod
+    def _make_gw(monkeypatch, exits, login_fn):
+        monkeypatch.setitem(sys.modules, "AmazingData", _fake_ad_module(login_fn))
+        gw = AmazingDataGateway(_make_config())
+        monkeypatch.setattr(
+            "app.gateway.session.os._exit", lambda code: exits.append(code),
+        )
+        # spi 探针确认在线数超限（_build_last_login_error 据此升级 category）
+        gw._last_login_spi = types.SimpleNamespace(max_limitation=True)
+        return gw
+
+    def test_systemexit_path_exits_immediately(self, monkeypatch):
+        """SystemExit 分支 + spi.max_limitation → 立即 os._exit(72)。"""
+        exits = []
+        gw = self._make_gw(monkeypatch, exits, lambda **kwargs: exit(0))
+        with pytest.raises(GatewayNotReadyError):
+            gw.login()
+        assert exits == [MAX_LIMITATION_EXIT_CODE]
+        assert gw.last_login_error["category"] == "max_limitation"
+
+    def test_exception_path_exits_immediately(self, monkeypatch):
+        """Exception 分支 + spi.max_limitation → 立即 os._exit(72)。"""
+        exits = []
+
+        def fake_login(**kwargs):
+            raise RuntimeError("boom")
+
+        gw = self._make_gw(monkeypatch, exits, fake_login)
+        with pytest.raises(GatewayNotReadyError):
+            gw.login()
+        assert exits == [MAX_LIMITATION_EXIT_CODE]
+        assert gw.last_login_error["category"] == "max_limitation"
+        assert gw._wedge_signature_streak == 0  # 非楔死签名，不计数

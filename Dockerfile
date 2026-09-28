@@ -50,4 +50,7 @@ RUN ldd /usr/local/lib/python3.14/site-packages/tgw/linux_py314_x64_package/libt
 ARG HTTP_PORT=3021
 EXPOSE ${HTTP_PORT}
 # 读取 HTTP_HOST/HTTP_PORT 环境变量（.env 注入），默认 0.0.0.0:3021
-CMD ["sh", "-c", "uvicorn app.http_app:app --host ${HTTP_HOST:-0.0.0.0} --port ${HTTP_PORT:-3021}"]
+# exec 关键：sh 作为 PID1 不转发 SIGTERM（podman stop 10s 超时退化为 SIGKILL，
+# netns 销毁导致 FIN 发不出、服务端会话变僵尸）。exec 让 uvicorn 成为 PID1，
+# SIGTERM → uvicorn 优雅停机 → lifespan shutdown 登出 SDK → 连接干净关闭。
+CMD ["sh", "-c", "exec uvicorn app.http_app:app --host ${HTTP_HOST:-0.0.0.0} --port ${HTTP_PORT:-3021}"]
