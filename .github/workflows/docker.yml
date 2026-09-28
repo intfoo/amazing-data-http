@@ -65,5 +65,8 @@ jobs:
           host: ${{ vars.SERVER_HOST }}
           username: deployer
           key: ${{ secrets.SSH_KEY }}
+          # 默认 10m 不够：服务器经 nju 镜像拉取 ghcr 层耗时可能超过 10 分钟
+          # （2026-09-28 v0.1.3 部署在拉取镜像步骤 Run Command Timeout）。
+          timeout: 20m
           script: |
             bash /usr/local/bin/deploy.sh ${{ github.event.repository.name }}
