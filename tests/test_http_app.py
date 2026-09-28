@@ -829,3 +829,34 @@ class TestSingleInstanceLock:
             pass
         assert len(calls) == 1
         assert calls[0].name == ".amazing-login.lock"
+
+
+class TestNoLoginFlag:
+    """维护停靠旗标：data/.no-login 存在 → 启动跳过登录与调度器。"""
+
+    def test_flag_skips_login_and_scheduler(self, monkeypatch, tmp_path):
+        import app.http_app as http_app
+        flag = tmp_path / ".no-login"
+        flag.touch()
+        monkeypatch.setattr(http_app, "_no_login_flag_path", lambda: flag)
+        gw = FakeGateway(ready=False)
+        config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                        auth_required=False)
+        app = create_app(config=config, gateway=gw)
+        with TestClient(app):
+            pass
+        assert gw.login_called == 0
+        assert getattr(app.state, "subscription_scheduler", None) is None
+
+    def test_no_flag_logs_in_normally(self, monkeypatch, tmp_path):
+        import app.http_app as http_app
+        monkeypatch.setattr(
+            http_app, "_no_login_flag_path", lambda: tmp_path / ".no-login",
+        )
+        gw = FakeGateway(ready=True)
+        config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                        auth_required=False)
+        app = create_app(config=config, gateway=gw)
+        with TestClient(app):
+            pass
+        assert gw.login_called == 1

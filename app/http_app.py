@@ -248,6 +248,11 @@ def _acquire_single_instance_lock(lock_path: Path):
     return fd
 
 
+def _no_login_flag_path() -> Path:
+    """维护停靠旗标路径：存在则启动跳过登录（手动停车，见 lifespan）。"""
+    return Path(__file__).resolve().parents[1] / "data" / ".no-login"
+
+
 def create_app(config: Config | None = None, gateway: Gateway | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
@@ -283,36 +288,45 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
             app.state.login_lock_fd = _acquire_single_instance_lock(
                 _single_instance_lock_path()
             )
-            try:
-                gateway.login()
-                logger.info("启动登录成功")
-                # 订阅调度器：后台线程定期检查窗口，自动启动/停止订阅。
-                # 解决 lifespan 只检查一次窗口的问题（非交易时段启动后进入交易时段无自动启动）。
-                scheduler = SubscriptionScheduler(gateway, realtime_service, config)
-                app.state.subscription_scheduler = scheduler
-                scheduler.start()
-                # 启动完成后后台检测刷新一次市场代码表：9 点后首次获取会刷新当日缓存
-                # （调度器盘中重启直接命中），同时验证 get_code_list 链路可用。
-                # 失败只告警不影响启动（调度器 tick 会重试）。
-                def _refresh_universe_once():
-                    try:
-                        t0 = time.monotonic()
-                        universe = gateway.get_realtime_universe()
-                        logger.info(
-                            "启动后市场代码表检测刷新完成: %d 只 (%.3fs)",
-                            len(universe), time.monotonic() - t0,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "启动后市场代码表检测刷新失败（调度器将重试）: %s: %s",
-                            type(e).__name__, e,
-                        )
+            if _no_login_flag_path().exists():
+                # 维护停靠模式：不登录、不起调度器，服务安静提供 /health 诊断。
+                # 用途：账号锁死排查/服务端清理等待期，避免 restart 循环反复尝试。
+                # 恢复：删除该文件后 podman restart。
+                logger.critical(
+                    "维护旗标存在（%s）：跳过启动登录与订阅调度，服务保持 not-ready",
+                    _no_login_flag_path(),
+                )
+            else:
+                try:
+                    gateway.login()
+                    logger.info("启动登录成功")
+                    # 订阅调度器：后台线程定期检查窗口，自动启动/停止订阅。
+                    # 解决 lifespan 只检查一次窗口的问题（非交易时段启动后进入交易时段无自动启动）。
+                    scheduler = SubscriptionScheduler(gateway, realtime_service, config)
+                    app.state.subscription_scheduler = scheduler
+                    scheduler.start()
+                    # 启动完成后后台检测刷新一次市场代码表：9 点后首次获取会刷新当日缓存
+                    # （调度器盘中重启直接命中），同时验证 get_code_list 链路可用。
+                    # 失败只告警不影响启动（调度器 tick 会重试）。
+                    def _refresh_universe_once():
+                        try:
+                            t0 = time.monotonic()
+                            universe = gateway.get_realtime_universe()
+                            logger.info(
+                                "启动后市场代码表检测刷新完成: %d 只 (%.3fs)",
+                                len(universe), time.monotonic() - t0,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "启动后市场代码表检测刷新失败（调度器将重试）: %s: %s",
+                                type(e).__name__, e,
+                            )
 
-                threading.Thread(
-                    target=_refresh_universe_once, daemon=True, name="universe-refresh",
-                ).start()
-            except Exception as e:
-                logger.error("启动登录失败: %s: %s", type(e).__name__, e)
+                    threading.Thread(
+                        target=_refresh_universe_once, daemon=True, name="universe-refresh",
+                    ).start()
+                except Exception as e:
+                    logger.error("启动登录失败: %s: %s", type(e).__name__, e)
         else:
             logger.warning("配置不完整，跳过启动登录")
         yield
