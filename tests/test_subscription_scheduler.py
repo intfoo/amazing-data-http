@@ -7,6 +7,7 @@
 import datetime
 import threading
 import time
+import types
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,7 +15,7 @@ import pytest
 from app.config import Config
 from app.gateway import GatewayNotReadyError
 from app.realtime_service import RealtimeService
-from app.subscription_scheduler import SubscriptionScheduler
+from app.subscription_scheduler import LIVENESS_EXIT_CODE, SubscriptionScheduler
 from tests.conftest import FakeGateway, make_daily_df
 
 
@@ -419,3 +420,122 @@ class TestSchedulerSelfHeal:
         scheduler._tick()
         assert gw.sub_start_called == 1
         assert rt.is_active() is True
+
+
+# ---------------------------------------------------------------------------
+# 死开关：窗口内持续不健康超存活预算 → os._exit(74) 交由容器 restart
+# ---------------------------------------------------------------------------
+
+class TestLivenessBudget:
+    """死开关（dead-man's switch）：进程内恢复的兜底慢通道。
+
+    覆盖一切未知故障模式：任何原因（含恢复机制自身失效/接缝）导致窗口内
+    持续不健康（not ready 或订阅不活跃）超过 liveness_budget_sec，主动
+    退出交由容器 restart 换新进程（2026-09-16 靠 OOM 意外救场、2026-09-29
+    调度器从未创建停摆 26h 靠人工 restart，两起事故恢复手段的制度化）。
+    """
+
+    def _make(self, monkeypatch, exits, budget=900, **cfg):
+        gw = FakeGateway(ready=False, calendar=_today_cal())
+        config = _make_config(liveness_budget_sec=budget, **cfg)
+        rt = RealtimeService(gateway=gw)
+        scheduler = SubscriptionScheduler(gw, rt, config)
+        monkeypatch.setattr(
+            "app.subscription_scheduler.os._exit", lambda code: exits.append(code),
+        )
+
+        def failing_login():
+            gw.login_called += 1
+            raise GatewayNotReadyError("persistent failure")
+
+        gw.login = failing_login  # login 持续失败 → 持续 not ready
+        return scheduler, gw, rt
+
+    def test_budget_exhausted_exits_74(self, monkeypatch):
+        """窗口内持续不健康超预算 → CRITICAL + os._exit(74)。"""
+        exits = []
+        scheduler, gw, rt = self._make(monkeypatch, exits)
+        rt.set_active(False)
+        scheduler._tick()  # 首次：记录不健康起点，不退出
+        assert exits == []
+        assert scheduler._unhealthy_since > 0
+        scheduler._unhealthy_since = time.monotonic() - 901  # 回拨起点越过预算
+        scheduler._tick()
+        assert exits == [LIVENESS_EXIT_CODE]
+
+    def test_no_exit_within_budget(self, monkeypatch):
+        """不健康持续未达预算 → 不退出。"""
+        exits = []
+        scheduler, gw, rt = self._make(monkeypatch, exits)
+        rt.set_active(False)
+        scheduler._tick()
+        scheduler._unhealthy_since = time.monotonic() - 899
+        scheduler._tick()
+        assert exits == []
+
+    def test_recovery_gap_then_healthy_resets_clock(self, monkeypatch):
+        """自愈成功→订阅重建的恢复间隙不清零；真正健康（ready+active）才清零。"""
+        exits = []
+        scheduler, gw, rt = self._make(monkeypatch, exits)
+        rt.set_active(False)
+        scheduler._tick()  # 不健康起点（login 失败）
+        assert scheduler._unhealthy_since > 0
+        del gw.login  # 删实例属性恢复类方法：login 成功
+        scheduler._tick()  # 自愈 login 成功 → ready，rt 被强制 inactive
+        scheduler._tick()  # tick 开头观测：ready 但 rt 仍 inactive → 间隙不清零
+        assert scheduler._unhealthy_since > 0  # 评审点⑧：恢复间隙不误判健康
+        assert rt.is_active() is True          # 本轮已完成订阅重建
+        scheduler._tick()  # tick 开头观测：ready + active → 健康 → 清零
+        assert scheduler._unhealthy_since == 0.0
+        assert exits == []
+
+    def test_out_of_window_resets_clock(self, monkeypatch):
+        """非窗口期 → 不健康计时清零，不退出。"""
+        exits = []
+        scheduler, gw, rt = self._make(
+            monkeypatch, exits,
+            subscription_open="23:58", subscription_close="23:59",
+        )
+        rt.set_active(False)
+        scheduler._unhealthy_since = time.monotonic() - 99999
+        scheduler._tick()
+        assert scheduler._unhealthy_since == 0.0
+        assert exits == []
+
+    def test_stop_subscription_resets_clock(self, monkeypatch):
+        """窗口关闭停止订阅 → 显式清零（与退避状态复位一致，评审点⑦）。"""
+        exits = []
+        scheduler, gw, rt = self._make(
+            monkeypatch, exits,
+            subscription_open="23:58", subscription_close="23:59",
+        )
+        gw._ready = True
+        rt.set_active(True)
+        scheduler._unhealthy_since = time.monotonic() - 99999
+        scheduler._tick()  # 非窗口 + active → _stop_subscription
+        assert gw.sub_stop_called == 1
+        assert scheduler._unhealthy_since == 0.0
+        assert exits == []
+
+    def test_budget_disabled_no_exit(self, monkeypatch):
+        """liveness_budget_sec<=0 → 死开关禁用，永不退出。"""
+        exits = []
+        scheduler, gw, rt = self._make(monkeypatch, exits, budget=0)
+        rt.set_active(False)
+        scheduler._tick()
+        scheduler._tick()
+        assert exits == []
+
+    def test_stderr_flushed_before_exit(self, monkeypatch):
+        """os._exit 前 flush stderr（评审点⑨：os._exit 绕过 atexit/handler flush）。"""
+        exits = []
+        flushed = []
+        fake_stderr = types.SimpleNamespace(flush=lambda: flushed.append(1))
+        monkeypatch.setattr("app.subscription_scheduler.sys.stderr", fake_stderr)
+        scheduler, gw, rt = self._make(monkeypatch, exits)
+        rt.set_active(False)
+        scheduler._tick()
+        scheduler._unhealthy_since = time.monotonic() - 901
+        scheduler._tick()
+        assert flushed == [1]
+        assert exits == [LIVENESS_EXIT_CODE]

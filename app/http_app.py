@@ -300,33 +300,37 @@ def create_app(config: Config | None = None, gateway: Gateway | None = None) -> 
                 try:
                     gateway.login()
                     logger.info("启动登录成功")
-                    # 订阅调度器：后台线程定期检查窗口，自动启动/停止订阅。
-                    # 解决 lifespan 只检查一次窗口的问题（非交易时段启动后进入交易时段无自动启动）。
-                    scheduler = SubscriptionScheduler(gateway, realtime_service, config)
-                    app.state.subscription_scheduler = scheduler
-                    scheduler.start()
-                    # 启动完成后后台检测刷新一次市场代码表：9 点后首次获取会刷新当日缓存
-                    # （调度器盘中重启直接命中），同时验证 get_code_list 链路可用。
-                    # 失败只告警不影响启动（调度器 tick 会重试）。
-                    def _refresh_universe_once():
-                        try:
-                            t0 = time.monotonic()
-                            universe = gateway.get_realtime_universe()
-                            logger.info(
-                                "启动后市场代码表检测刷新完成: %d 只 (%.3fs)",
-                                len(universe), time.monotonic() - t0,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "启动后市场代码表检测刷新失败（调度器将重试）: %s: %s",
-                                type(e).__name__, e,
-                            )
-
-                    threading.Thread(
-                        target=_refresh_universe_once, daemon=True, name="universe-refresh",
-                    ).start()
                 except Exception as e:
                     logger.error("启动登录失败: %s: %s", type(e).__name__, e)
+                # 订阅调度器无条件启动（不依赖启动登录成败）：后台线程定期检查窗口，
+                # 自动启动/停止订阅。启动登录失败时，调度器 tick 的 not-ready 检查
+                # 会触发自愈 login，恢复后自动建订阅——若调度器只在登录成功分支创建，
+                # 启动失败后即使 tgw 重连成功也永不建订阅（2026-09-29 事故：
+                # max_limitation crash-loop 后 08:28 重连登录成功，但调度器从未创建，
+                # 订阅 inactive_not_started 停摆一整天，/realtime 空、/health 503）。
+                scheduler = SubscriptionScheduler(gateway, realtime_service, config)
+                app.state.subscription_scheduler = scheduler
+                scheduler.start()
+                # 启动完成后后台检测刷新一次市场代码表：9 点后首次获取会刷新当日缓存
+                # （调度器盘中重启直接命中），同时验证 get_code_list 链路可用。
+                # 失败只告警不影响启动（调度器 tick 会重试）。
+                def _refresh_universe_once():
+                    try:
+                        t0 = time.monotonic()
+                        universe = gateway.get_realtime_universe()
+                        logger.info(
+                            "启动后市场代码表检测刷新完成: %d 只 (%.3fs)",
+                            len(universe), time.monotonic() - t0,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "启动后市场代码表检测刷新失败（调度器将重试）: %s: %s",
+                            type(e).__name__, e,
+                        )
+
+                threading.Thread(
+                    target=_refresh_universe_once, daemon=True, name="universe-refresh",
+                ).start()
         else:
             logger.warning("配置不完整，跳过启动登录")
         yield

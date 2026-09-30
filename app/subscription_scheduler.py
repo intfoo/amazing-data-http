@@ -6,15 +6,24 @@
 2. 订阅线程崩溃/失活后（on_error / watchdog stale），无自动恢复机制。
 3. SDK 交易日历可能不含今天（数据延迟），is_subscription_window 恒 False
    导致订阅永不启动（由 calendar_fallback_weekday 兜底解决）。
+4. 进程内恢复机制（重连/自愈 login/退避重启）本身失效或存在接缝时，
+   系统安静坏掉等人发现——历次事故（09-16 OOM 意外救场、09-29/30 调度器
+   从未创建停摆 26h 靠人工 restart）的最终恢复手段都是"进程死亡 + 容器
+   restart"。故调度器兼任死开关（dead-man's switch）：窗口内服务持续
+   不健康超过存活预算（liveness_budget_sec）即主动退出，把恢复升级给
+   进程外 supervisor，为一切未知故障模式兜底。
 
 调度器每 SCHEDULE_INTERVAL_SEC（默认 60s）检查一次：
 - 在窗口内且订阅未活跃 → 启动订阅（先 stop 清理旧资源，再 start）
 - 不在窗口内且订阅活跃 → 停止订阅 + 清空缓存
+- 窗口内持续不健康超预算 → os._exit(LIVENESS_EXIT_CODE)
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 import time
 
@@ -32,6 +41,12 @@ SCHEDULE_INTERVAL_SEC = 60  # 调度器检查间隔（秒）
 # （服务端会话堆积会加剧账号在线数超限被踢，与失活互为因果）。
 # 重启后收到数据（last_snapshot_ts 晚于重启时刻）或窗口关闭时复位。
 _RESTART_BACKOFF_SEC = (60, 120, 180, 300)
+
+# 存活预算耗尽退出码（71=楔死、72=max_limitation、73=flock 冲突已占用）。
+# 与 71/72/73 同哲学：进程内恢复限时，超时把恢复升级给进程外 supervisor
+# （容器 restart 策略）；71/72/73 是已知故障强签名的快速通道，74 是兜底
+# 通用慢通道——为一切未知故障模式（含恢复机制自身失效/接缝）兜底。
+LIVENESS_EXIT_CODE = 74
 
 
 class SubscriptionScheduler:
@@ -55,6 +70,9 @@ class SubscriptionScheduler:
         self._restart_failures = 0        # 连续"重启后未收到数据"次数
         self._last_restart_attempt = 0.0  # time.monotonic()，退避计时用
         self._last_restart_wall = 0.0     # time.time()，与 last_snapshot_ts 比较用
+        # 死开关状态（仅 _tick 单线程访问，无需锁）：
+        # time.monotonic() 窗口内持续不健康起点，0.0=当前健康/非窗口
+        self._unhealthy_since = 0.0
 
     def start(self) -> None:
         """启动调度线程。幂等（已启动则跳过）。"""
@@ -93,6 +111,10 @@ class SubscriptionScheduler:
             close_time=self._config.subscription_close,
             calendar_fallback_weekday=self._config.calendar_fallback_weekday,
         )
+        # 死开关放在 tick 开头（基于上 tick 至今的观测，衡量"持续性"不健康）：
+        # universe 构建期间 _tick 未返回不会重复计时；恢复间隙（自愈成功→下轮
+        # 重建订阅的 ~60s）会累计进预算，相对 900s 预算可忽略。
+        self._track_liveness(in_window)
         if in_window:
             # not-ready 检查优先于订阅活性判断：SDK 推送线程 abandon 后的残留推送
             # 会让 rt 假活跃（on_snapshot 窗口内自动复活），若先判活性，
@@ -131,6 +153,44 @@ class SubscriptionScheduler:
             if self._rt.is_active():
                 logger.info("调度器：不在订阅窗口，停止订阅")
                 self._stop_subscription()
+
+    def _track_liveness(self, in_window: bool) -> None:
+        """死开关：窗口内服务持续不健康超存活预算 → 主动退出，交由容器 restart 换新进程。
+
+        进程内恢复（重连/自愈 login/退避重启）是快路径，只覆盖已知故障模式；
+        本机制是兜底慢通道：任何原因（含恢复机制自身失效/接缝，如 2026-09-29
+        调度器从未创建停摆 26h、2026-09-16 靠 OOM 意外救场）导致窗口内持续
+        不健康，限时升级到进程外 supervisor。
+        健康口径与 /health is_ok 一致：窗口内 SDK ready + 订阅活跃。
+        liveness_budget_sec <= 0 禁用。
+        """
+        if not in_window or (self._gw.is_ready() and self._rt.is_active()):
+            self._unhealthy_since = 0.0
+            return
+        budget = self._config.liveness_budget_sec
+        if budget <= 0:
+            return
+        now = time.monotonic()
+        if not self._unhealthy_since:
+            self._unhealthy_since = now
+            return
+        elapsed = now - self._unhealthy_since
+        if elapsed < budget:
+            return
+        # 绝对时间戳便于区分"持续故障"与"反复恢复尝试间隙"（恢复间隙也累计）
+        since_wall = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - elapsed),
+        )
+        logger.critical(
+            "存活预算耗尽：窗口内服务持续不健康 %.0fs（预算 %ds，起点 %s，"
+            "ready=%s rt_active=%s）。进程内恢复已限时耗尽，主动退出（exit=%d）"
+            "交由容器 restart 换新进程。若为节假日日历误判（fallback_weekday "
+            "把节假日当交易日）属预期温和重启循环，无需人工干预",
+            elapsed, budget, since_wall,
+            self._gw.is_ready(), self._rt.is_active(), LIVENESS_EXIT_CODE,
+        )
+        sys.stderr.flush()  # os._exit 绕过 atexit/handler flush，与 exit(71/72/73) 一致
+        os._exit(LIVENESS_EXIT_CODE)
 
     def _self_heal_login(self) -> None:
         """启动失败自愈：not ready 时每 tick（60s 天然限频）重试 login。
@@ -209,8 +269,9 @@ class SubscriptionScheduler:
             self._rt.stop_watchdog()
             self._rt.set_active(False)
             self._rt.clear_cache()
-            # 窗口关闭：退避状态复位，下一窗口从第 1 次重启重新开始
+            # 窗口关闭：退避/死开关状态复位，下一窗口从第 1 次重启重新开始
             self._restart_failures = 0
             self._last_restart_attempt = 0.0
             self._last_restart_wall = 0.0
+            self._unhealthy_since = 0.0
             logger.info("调度器已停止订阅并清空缓存")

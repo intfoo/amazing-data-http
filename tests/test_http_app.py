@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Config
+from app.gateway import GatewayNotReadyError
 from app.http_app import create_app
 from tests.conftest import FakeGateway, make_daily_df
 
@@ -772,6 +773,34 @@ def test_startup_universe_refresh_failure_does_not_crash():
         _time.sleep(0.3)  # 给 universe-refresh 线程执行时间（异常应被吞）
         resp = client.get("/health")
         assert resp.status_code in (200, 503)
+
+
+def test_startup_login_failure_still_starts_scheduler():
+    """启动登录失败不阻断调度器创建：恢复后由调度器自愈自动建订阅。
+
+    2026-09-29 事故：调度器只在"启动登录成功"分支创建；max_limitation
+    crash-loop 后 tgw 重连 08:28 登录成功，但调度器从未存在，订阅
+    inactive_not_started 停摆 26h（/realtime 空、/health 503）。
+    """
+    gw = FakeGateway(ready=False, calendar=_today_cal())
+
+    def failing_login():
+        gw.login_called += 1
+        raise GatewayNotReadyError("simulated startup login failure")
+
+    gw.login = failing_login
+    config = Config(username="u", password="p", ip="1.2.3.4", port=3021,
+                    subscription_open="00:00", subscription_close="23:59")
+    app = create_app(config=config, gateway=gw)
+    with TestClient(app):
+        scheduler = getattr(app.state, "subscription_scheduler", None)
+        assert scheduler is not None
+        assert scheduler._thread is not None
+        assert scheduler._first_tick_done.wait(timeout=5)
+        # 自愈路径在线：lifespan 1 次 + 调度器首个 tick 自愈 >=1 次
+        assert gw.login_called >= 2
+    # shutdown 后调度线程已停止
+    assert not scheduler._thread.is_alive()
 
 
 class TestSingleInstanceLock:

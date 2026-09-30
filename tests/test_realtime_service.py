@@ -509,7 +509,9 @@ def test_start_watchdog_idempotent():
 def test_on_snapshot_does_not_reactivate_outside_window():
     """窗口外收到残留帧：数据照收（last_snapshot_ts 更新），但不复活 _active。"""
     svc = RealtimeService(gateway=None)
-    svc.set_window_params(calendar=None)  # calendar=None → is_subscription_window 恒 False
+    # calendar=None + fallback 关 → is_subscription_window 恒 False
+    # （fallback 默认 True 会在工作日走 weekday 兜底判为窗口内，与本用例意图相悖）
+    svc.set_window_params(calendar=None, calendar_fallback_weekday=False)
     svc.set_active(False)
     svc.on_snapshot(_snap(last=10.0, code="000001.SZ"))
     assert svc.is_active() is False
